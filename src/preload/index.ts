@@ -21,8 +21,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   isWindowMaximized: () => ipcRenderer.invoke("window:isMaximized"),
 
   // Session management
-  createSession: (name: string, targetUrl: string) =>
-    ipcRenderer.invoke("session:create", name, targetUrl),
+  createSession: (name: string, targetUrl: string, options?: unknown) =>
+    ipcRenderer.invoke("session:create", name, targetUrl, options),
   listSessions: () => ipcRenderer.invoke("session:list"),
   startCapture: (sessionId: string) =>
     ipcRenderer.invoke("session:start", sessionId),
@@ -32,8 +32,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("session:resume", sessionId),
   stopCapture: (sessionId: string) =>
     ipcRenderer.invoke("session:stop", sessionId),
-  deleteSession: (sessionId: string) =>
-    ipcRenderer.invoke("session:delete", sessionId),
+  setCaptureMode: (sessionId: string, mode: string) =>
+    ipcRenderer.invoke("session:setCaptureMode", sessionId, mode),
+  deleteSession: (sessionId: string, options?: { retainProfile?: boolean }) =>
+    ipcRenderer.invoke("session:delete", sessionId, options),
 
   // Browser control
   navigate: (url: string) => ipcRenderer.invoke("browser:navigate", url),
@@ -45,6 +47,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
   setTargetViewVisible: (visible: boolean) =>
     ipcRenderer.invoke("browser:setVisible", visible),
   toggleDevTools: () => ipcRenderer.invoke("browser:toggleDevTools"),
+  focusBrowser: (sessionId?: string) =>
+    ipcRenderer.invoke("browser:focus", sessionId),
+  getBrowserSessionStatus: (sessionId?: string) =>
+    ipcRenderer.invoke("browser:status", sessionId),
   exportFile: (defaultName: string, content: string) =>
     ipcRenderer.invoke("dialog:exportFile", defaultName, content),
 
@@ -128,11 +134,20 @@ contextBridge.exposeInMainWorld("electronAPI", {
 
   // Proxy
   getProxyConfig: () => ipcRenderer.invoke("proxy:get"),
+  getProxyRestartImpact: () => ipcRenderer.invoke("proxy:restartImpact"),
   saveProxyConfig: (config: unknown) =>
     ipcRenderer.invoke("proxy:save", config),
 
   // Browser environment
-  clearBrowserEnv: () => ipcRenderer.invoke("browser:clearEnv"),
+  clearBrowserEnv: (sessionId?: string) => ipcRenderer.invoke("browser:clearEnv", sessionId),
+
+  // CloakBrowser runtime and retained profiles
+  getCloakStatus: () => ipcRenderer.invoke("cloak:status"),
+  prepareCloakRuntime: (policy?: string) => ipcRenderer.invoke("cloak:prepare", policy),
+  setCloakRuntimePolicy: (policy: string) => ipcRenderer.invoke("cloak:setPolicy", policy),
+  listRetainedBrowserProfiles: () => ipcRenderer.invoke("browser-profiles:listRetained"),
+  restoreBrowserProfile: (profileId: string) => ipcRenderer.invoke("browser-profiles:restore", profileId),
+  deleteBrowserProfile: (profileId: string) => ipcRenderer.invoke("browser-profiles:delete", profileId),
 
   // MCP Server
   getMCPServerConfig: () => ipcRenderer.invoke("mcp-server:getConfig"),
@@ -186,6 +201,9 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
   onTabUpdated: (callback: (data: unknown) => void) => {
     ipcRenderer.on("tabs:updated", (_event, data) => callback(data));
+  },
+  onTabsReset: (callback: (data: unknown) => void) => {
+    ipcRenderer.on("tabs:reset", (_event, data) => callback(data));
   },
 
   // Events from main process

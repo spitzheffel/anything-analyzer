@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import { Modal } from '../ui'
 import { IconApp, IconRobot, IconGlobe, IconBolt, IconShield, IconCode } from '../ui/Icons'
 import GeneralSection from './settings/GeneralSection'
@@ -7,8 +7,15 @@ import ProxySection from './settings/ProxySection'
 import MCPServerSection from './settings/MCPServerSection'
 import MitmProxySection from './settings/MitmProxySection'
 import FingerprintSection from './settings/FingerprintSection'
+import CloakBrowserSection from './settings/CloakBrowserSection'
+import type { BrowserBackendKind } from '@shared/types'
 
-type SettingsSection = 'general' | 'llm' | 'proxy' | 'mcp-server' | 'mitm-proxy' | 'fingerprint'
+declare const __AA_BUILD_CHANNEL__: 'public' | 'internal'
+const cloakBuildAvailable =
+  typeof __AA_BUILD_CHANNEL__ !== 'undefined' &&
+  __AA_BUILD_CHANNEL__ === 'internal'
+
+type SettingsSection = 'general' | 'llm' | 'proxy' | 'mcp-server' | 'mitm-proxy' | 'fingerprint' | 'cloak'
 
 const menuItems: { key: SettingsSection; icon: React.FC<{ size?: number | string }>; label: string }[] = [
   { key: 'general', icon: IconApp, label: '通用' },
@@ -17,6 +24,9 @@ const menuItems: { key: SettingsSection; icon: React.FC<{ size?: number | string
   { key: 'mcp-server', icon: IconBolt, label: 'MCP Server' },
   { key: 'mitm-proxy', icon: IconShield, label: 'MITM 代理' },
   { key: 'fingerprint', icon: IconCode, label: '指纹' },
+  ...(cloakBuildAvailable
+    ? [{ key: 'cloak' as const, icon: IconGlobe, label: 'CloakBrowser' }]
+    : []),
 ]
 
 const sectionComponents: Record<SettingsSection, React.ComponentType> = {
@@ -26,12 +36,34 @@ const sectionComponents: Record<SettingsSection, React.ComponentType> = {
   'mcp-server': MCPServerSection,
   'mitm-proxy': MitmProxySection,
   'fingerprint': FingerprintSection as React.ComponentType,
+  'cloak': CloakBrowserSection as React.ComponentType,
 }
 
-interface Props { open: boolean; onClose: () => void; currentSessionId?: string | null }
+interface Props {
+  open: boolean
+  onClose: () => void
+  currentSessionId?: string | null
+  currentSessionBackend?: BrowserBackendKind
+  onProfileRestored?: () => void | Promise<void>
+}
 
-export default function SettingsModal({ open, onClose, currentSessionId }: Props) {
+export default function SettingsModal({
+  open,
+  onClose,
+  currentSessionId,
+  currentSessionBackend,
+  onProfileRestored,
+}: Props) {
   const [activeSection, setActiveSection] = useState<SettingsSection>('general')
+  const visibleMenuItems = currentSessionBackend === 'cloak'
+    ? menuItems.filter(item => item.key !== 'fingerprint')
+    : menuItems
+
+  useEffect(() => {
+    if (currentSessionBackend === 'cloak' && activeSection === 'fingerprint') {
+      setActiveSection('general')
+    }
+  }, [activeSection, currentSessionBackend])
 
   const ActiveComponent = sectionComponents[activeSection]
 
@@ -53,7 +85,7 @@ export default function SettingsModal({ open, onClose, currentSessionId }: Props
           flexShrink: 0,
           overflow: 'auto',
         }}>
-          {menuItems.map(item => {
+          {visibleMenuItems.map(item => {
             const Icon = item.icon
             const isActive = activeSection === item.key
             return (
@@ -89,10 +121,16 @@ export default function SettingsModal({ open, onClose, currentSessionId }: Props
 
         {/* Right content area */}
         <div style={{ flex: 1, padding: 24, overflowY: 'auto' }}>
-          {activeSection === 'fingerprint'
-            ? <FingerprintSection currentSessionId={currentSessionId} />
-            : <ActiveComponent />
-          }
+          {activeSection === 'fingerprint' ? (
+            <FingerprintSection
+              currentSessionId={currentSessionId}
+              backend={currentSessionBackend}
+            />
+          ) : activeSection === 'cloak' ? (
+            <CloakBrowserSection onProfileRestored={onProfileRestored} />
+          ) : (
+            <ActiveComponent />
+          )}
         </div>
       </div>
     </Modal>

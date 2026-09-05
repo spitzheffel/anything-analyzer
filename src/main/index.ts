@@ -1,6 +1,12 @@
-import { app, BrowserWindow, crashReporter } from "electron";
+import { app, BrowserWindow, crashReporter, dialog } from "electron";
 import { initLogger } from "./logger";
-import { getDatabase, closeDatabase } from "./db/database";
+import {
+  getDatabase,
+  closeDatabase,
+  backupBeforeBrowserMigration,
+  databasePathFor,
+  importDatabaseSnapshot,
+} from "./db/database";
 import { runMigrations } from "./db/migrations";
 import {
   SessionsRepo,
@@ -12,6 +18,9 @@ import {
   ChatMessagesRepo,
   AiRequestLogRepo,
   InteractionEventsRepo,
+  SessionBrowserConfigRepo,
+  BrowserProfilesRepo,
+  BrowserTabsRepo,
 } from "./db/repositories";
 import { CaptureEngine } from "./capture/capture-engine";
 import { SessionManager } from "./session/session-manager";
@@ -21,7 +30,13 @@ import {
   ensureTokenCalibrationLoaded,
   flushTokenCalibration,
 } from "./ai/token-calibration-store";
-import { registerIpcHandlers, loadProxyConfig, applyProxy, loadMCPServerConfig } from "./ipc";
+import {
+  registerIpcHandlers,
+  loadProxyConfig,
+  applyProxy,
+  loadMCPServerConfig,
+  loadCloakRuntimePolicy,
+} from "./ipc";
 import { Updater } from "./updater";
 import { MCPClientManager } from "./mcp/mcp-manager";
 import { initMCPServer, stopMCPServer } from "./mcp/mcp-server";
@@ -30,7 +45,30 @@ import { MitmProxyServer } from "./proxy/mitm-proxy-server";
 import { loadMitmProxyConfig, saveMitmProxyConfig } from "./proxy/mitm-proxy-config";
 import { SystemProxy } from "./proxy/system-proxy";
 import { ProfileStore } from "./fingerprint/profile-store";
-import { join } from "path";
+import { join, resolve } from "path";
+import { existsSync, mkdirSync, writeFileSync } from "fs";
+import { BUILD_CHANNEL, CLOAK_BACKEND_AVAILABLE } from "./build-flavor";
+import { BrowserCoordinator } from "./browser/browser-coordinator";
+import { ElectronBrowserBackend } from "./browser/electron-backend";
+import type { CloakRuntime } from "./browser/cloak-runtime";
+
+const originalUserDataPath = app.getPath("userData");
+const packagedSmoke = process.argv.includes("--aa-packaged-smoke");
+const packagedUiSmoke = process.argv.includes("--aa-packaged-ui-smoke");
+const packagedTest = packagedSmoke || packagedUiSmoke;
+const packagedSmokeUserData = process.argv
+  .find((argument) => argument.startsWith("--aa-smoke-user-data="))
+  ?.slice("--aa-smoke-user-data=".length);
+
+if (packagedTest) {
+  if (!packagedSmokeUserData) {
+    throw new Error("--aa-packaged-smoke requires --aa-smoke-user-data");
+  }
+  app.setPath("userData", resolve(packagedSmokeUserData));
+} else if (BUILD_CHANNEL === "internal") {
+  app.setName("Anything Analyzer Internal");
+  app.setPath("userData", join(app.getPath("appData"), "Anything Analyzer Internal"));
+}
 
 const windowManager = new WindowManager();
 const mcpManager = new MCPClientManager();
@@ -58,8 +96,10 @@ app.whenReady().then(async () => {
   // Initialize MITM CA & proxy (requires app.getPath)
   caManager = new CaManager(join(app.getPath("userData"), "mitm-ca"));
   mitmProxy = new MitmProxyServer(caManager);
+  if (!packagedTest) await offerPublicDatabaseImport();
   // Initialize database
   const db = getDatabase();
+  await backupBeforeBrowserMigration(db);
   runMigrations(db);
 
   // Initialize repositories
@@ -72,7 +112,58 @@ app.whenReady().then(async () => {
   const fingerprintRepo = new FingerprintProfilesRepo(db);
   const aiRequestLogRepo = new AiRequestLogRepo(db);
   const interactionEventsRepo = new InteractionEventsRepo(db);
+  const browserConfigRepo = new SessionBrowserConfigRepo(db);
+  const browserProfilesRepo = new BrowserProfilesRepo(db);
+  const browserTabsRepo = new BrowserTabsRepo(db);
   const profileStore = new ProfileStore(fingerprintRepo);
+
+  // WindowManager owns only the Electron shell and embedded view layout.
+  windowManager.createMainWindow();
+  const tabManager = windowManager.initTabs();
+
+  const browserCoordinator = new BrowserCoordinator();
+  browserCoordinator.registerBackend(
+    new ElectronBrowserBackend(windowManager, tabManager),
+  );
+
+  let cloakRuntime: CloakRuntime | undefined;
+  if (CLOAK_BACKEND_AVAILABLE) {
+    const { CloakBrowserBackend } = await import("./browser/cloak-backend");
+    const cloakBackend = new CloakBrowserBackend({
+      policy: loadCloakRuntimePolicy(),
+      resolveProfile: (options) => {
+        const profile = options.profileId
+          ? browserProfilesRepo.findById(options.profileId)
+          : null;
+        if (!profile) {
+          throw new Error(
+            `Cloak Profile for Session ${options.sessionId} was not found`,
+          );
+        }
+        return {
+          profileId: profile.id,
+          profileKey: profile.profile_key,
+          seed: profile.cloak_seed,
+        };
+      },
+      onProfileTouched: (touch) => {
+        if (touch.profileId) {
+          browserProfilesRepo.touchLastUsed(touch.profileId, touch.lastUsedAt);
+        }
+      },
+      onBrowserVersionResolved: (resolution) => {
+        const config = browserConfigRepo.findBySessionId(resolution.sessionId);
+        if (!config) return;
+        browserConfigRepo.upsert({
+          ...config,
+          last_browser_version: resolution.version,
+          updated_at: Date.now(),
+        });
+      },
+    });
+    cloakRuntime = cloakBackend.getRuntime();
+    browserCoordinator.registerBackend(cloakBackend);
+  }
 
   // Initialize capture engine
   const captureEngine = new CaptureEngine(
@@ -82,7 +173,17 @@ app.whenReady().then(async () => {
   );
 
   // Initialize session manager
-  const sessionManager = new SessionManager(sessionsRepo, captureEngine, profileStore, interactionEventsRepo);
+  const sessionManager = new SessionManager(
+    sessionsRepo,
+    captureEngine,
+    profileStore,
+    interactionEventsRepo,
+    browserCoordinator,
+    browserConfigRepo,
+    browserProfilesRepo,
+    browserTabsRepo,
+    cloakRuntime,
+  );
   sessionManagerRef = sessionManager;
 
   // Recover from potential crash
@@ -98,12 +199,6 @@ app.whenReady().then(async () => {
     aiRequestLogRepo,
     interactionEventsRepo,
   );
-
-  // Create main window
-  windowManager.createMainWindow();
-
-  // Initialize tab manager with first tab
-  windowManager.initTabs();
 
   // Apply proxy config from saved settings (before IPC handlers)
   const proxyConfig = loadProxyConfig();
@@ -154,16 +249,27 @@ app.whenReady().then(async () => {
     profileStore,
     aiRequestLogRepo,
     interactionEventsRepo,
+    browserCoordinator,
   });
 
   // Check for updates on startup (non-blocking, delayed 3s)
-  setTimeout(() => updater.checkForUpdates(), 3000);
+  if (!packagedTest) setTimeout(() => updater.checkForUpdates(), 3000);
 
   // Start MCP Server if enabled
   const mcpServerConfig = loadMCPServerConfig();
   if (mcpServerConfig.enabled) {
     initMCPServer(
-      { sessionManager, aiAnalyzer, windowManager, requestsRepo, jsHooksRepo, storageSnapshotsRepo, reportsRepo, interactionEventsRepo },
+      {
+        sessionManager,
+        aiAnalyzer,
+        windowManager,
+        browserCoordinator,
+        requestsRepo,
+        jsHooksRepo,
+        storageSnapshotsRepo,
+        reportsRepo,
+        interactionEventsRepo,
+      },
       mcpServerConfig.port,
       mcpServerConfig.authEnabled,
       mcpServerConfig.authToken,
@@ -181,6 +287,13 @@ app.whenReady().then(async () => {
 
   // Wire proxy captured events → CaptureEngine (same data shape as CDP)
   mitmProxy.on("response-captured", (data) => {
+    const activeCaptureId = sessionManager.getCurrentSessionId();
+    if (
+      !activeCaptureId ||
+      sessionManager.getSession(activeCaptureId)?.browser_backend === "cloak"
+    ) {
+      return;
+    }
     captureEngine.handleResponseCaptured({ ...data, source: "proxy" });
   });
 
@@ -219,7 +332,72 @@ app.whenReady().then(async () => {
       if (win) updater.setMainWindow(win);
     }
   });
+
+  if (packagedSmoke) app.quit();
 });
+
+async function offerPublicDatabaseImport(): Promise<void> {
+  if (BUILD_CHANNEL !== "internal") return;
+
+  const internalUserData = app.getPath("userData");
+  const destination = databasePathFor(internalUserData);
+  const decisionPath = join(
+    internalUserData,
+    "data",
+    "public-database-import-v1.json",
+  );
+  if (existsSync(destination) || existsSync(decisionPath)) return;
+
+  const appData = app.getPath("appData");
+  const source = [
+    originalUserDataPath,
+    join(appData, "anything-analyzer"),
+    join(appData, "Anything Analyzer"),
+  ]
+    .map(databasePathFor)
+    .find((candidate, index, candidates) =>
+      candidates.indexOf(candidate) === index &&
+      candidate !== destination &&
+      existsSync(candidate),
+    );
+  if (!source) return;
+
+  const choice = await dialog.showMessageBox({
+    type: "question",
+    title: "导入公开版数据",
+    message: "检测到 Anything Analyzer 公开版数据库",
+    detail:
+      "是否一次性导入 Session、抓包和报告？浏览器 Binary、凭据和 Profile 目录不会被复制。",
+    buttons: ["导入数据库", "使用全新数据库"],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  });
+
+  if (choice.response === 0) {
+    try {
+      await importDatabaseSnapshot(source, destination);
+    } catch (error) {
+      await dialog.showMessageBox({
+        type: "error",
+        title: "数据库导入失败",
+        message: error instanceof Error ? error.message : String(error),
+        detail: "本次不会写入导入决定，下次启动仍可重试。",
+      });
+      return;
+    }
+  }
+
+  mkdirSync(join(internalUserData, "data"), { recursive: true });
+  writeFileSync(
+    decisionPath,
+    JSON.stringify({
+      decision: choice.response === 0 ? "imported" : "fresh",
+      decidedAt: Date.now(),
+    }),
+    "utf-8",
+  );
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
@@ -240,11 +418,10 @@ app.on("before-quit", (event) => {
       // Mark shutdown state early so tab destroy handlers don't recreate tabs.
       windowManager.setShuttingDown(true);
 
-      // 1) Stop capture pipelines first, so no new DB writes are produced.
-      const currentSessionId = sessionManagerRef?.getCurrentSessionId();
-      if (sessionManagerRef && currentSessionId) {
-        await sessionManagerRef.stopCapture(currentSessionId);
-      }
+      // 1) Drain capture, persist profiles, then close all browser contexts.
+      await sessionManagerRef?.shutdown().catch((error) => {
+        console.error("[Main] Browser shutdown failed:", error);
+      });
 
       // 2) Disable system proxy and persist state.
       await SystemProxy.disable().catch(() => {});

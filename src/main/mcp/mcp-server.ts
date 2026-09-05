@@ -9,10 +9,15 @@ import {
 } from "node:http";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { session } from "electron";
 import type { SessionManager } from "../session/session-manager";
 import type { AiAnalyzer } from "../ai/ai-analyzer";
 import type { WindowManager } from "../window";
+import type { BrowserCoordinator } from "../browser/browser-coordinator";
+import {
+  BrowserBackendError,
+  type BrowserContext,
+  type BrowserTarget,
+} from "../browser/contracts";
 import type {
   RequestsRepo,
   JsHooksRepo,
@@ -21,12 +26,13 @@ import type {
   InteractionEventsRepo,
 } from "../db/repositories";
 import type { ChatMessage, InteractionType } from "@shared/types";
-import { loadLLMConfig } from "../ipc";
+import { loadLLMConfig, loadProxyConfig } from "../ipc";
 import { ReplayEngine } from "../capture/replay-engine";
 import { formatMCPServerUrl, normalizeMCPListenHost } from "./mcp-server-listen";
 
-interface MCPServerDeps {
+export interface MCPServerDeps {
   sessionManager: SessionManager;
+  browserCoordinator: BrowserCoordinator;
   aiAnalyzer: AiAnalyzer;
   windowManager: WindowManager;
   requestsRepo: RequestsRepo;
@@ -44,6 +50,19 @@ const mcpServers = new Map<string, McpServer>();
 const chatHistories = new Map<string, ChatMessage[]>();
 let currentDeps: MCPServerDeps | null = null;
 
+const browserSessionIdSchema = z
+  .string()
+  .optional()
+  .describe("Browser Session ID (defaults to the active browser Session)");
+const browserTabIdSchema = z
+  .string()
+  .optional()
+  .describe("Browser tab ID (defaults to the active tab in the selected Session)");
+const browserTargetScopeShape = {
+  sessionId: browserSessionIdSchema,
+  tabId: browserTabIdSchema,
+};
+
 /**
  * Check if the body (single or batch JSON-RPC) contains an initialize request.
  */
@@ -57,7 +76,7 @@ function isInitRequest(body: unknown): boolean {
 /**
  * Create a new McpServer instance with tools and resources registered.
  */
-function createMcpServerInstance(deps: MCPServerDeps): McpServer {
+export function createMcpServerInstance(deps: MCPServerDeps): McpServer {
   const server = new McpServer({
     name: "anything-analyzer",
     version: "1.0.0",
@@ -267,6 +286,7 @@ export function isMCPServerRunning(): boolean {
 function registerTools(server: McpServer, deps: MCPServerDeps): void {
   const {
     sessionManager,
+    browserCoordinator,
     aiAnalyzer,
     windowManager,
     requestsRepo,
@@ -297,10 +317,21 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
       inputSchema: z.object({
         name: z.string().describe("Session name"),
         targetUrl: z.string().describe("Target URL to analyze"),
+        backend: z
+          .enum(["electron", "cloak"])
+          .optional()
+          .describe("Browser backend (defaults to electron)"),
+        captureMode: z
+          .enum(["passive", "deep"])
+          .optional()
+          .describe("Capture mode (defaults according to the selected backend)"),
       }),
     },
-    async ({ name, targetUrl }) => {
-      const s = sessionManager.createSession(name, targetUrl);
+    async ({ name, targetUrl, backend, captureMode }) => {
+      const s = sessionManager.createSession(name, targetUrl, {
+        backend,
+        captureMode,
+      });
       return text(s);
     },
   );
@@ -309,19 +340,22 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "start_capture",
     {
       description:
-        "Start capturing HTTP requests for a session. The embedded browser must be open.",
+        "Start capturing HTTP requests in the selected browser context.",
       inputSchema: z.object({
         sessionId: z.string().describe("Session ID"),
       }),
     },
     async ({ sessionId }) => {
-      const tabManager = windowManager.getTabManager();
       const mainWin = windowManager.getMainWindow();
-      if (!tabManager || !mainWin) throw new Error("Browser not ready");
+      if (!mainWin || mainWin.isDestroyed()) {
+        throw new Error("Main renderer is not ready");
+      }
+      // The compatibility TabManager parameter is no longer used by SessionManager.
       await sessionManager.startCapture(
         sessionId,
-        tabManager,
+        undefined,
         mainWin.webContents,
+        loadProxyConfig(),
       );
       return text({ success: true });
     },
@@ -367,10 +401,16 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "delete_session",
     {
       description: "Delete a session and all its data",
-      inputSchema: z.object({ sessionId: z.string() }),
+      inputSchema: z.object({
+        sessionId: z.string(),
+        retainProfile: z
+          .boolean()
+          .optional()
+          .describe("Retain the persistent browser profile for later recovery"),
+      }),
     },
-    async ({ sessionId }) => {
-      await sessionManager.deleteSession(sessionId);
+    async ({ sessionId, retainProfile }) => {
+      await sessionManager.deleteSession(sessionId, undefined, { retainProfile });
       return text({ success: true });
     },
   );
@@ -380,48 +420,55 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
   server.registerTool(
     "navigate",
     {
-      description: "Navigate the active browser tab to a URL",
-      inputSchema: z.object({ url: z.string().describe("URL to navigate to") }),
+      description: "Navigate a browser tab to a URL",
+      inputSchema: z.object({
+        url: z.string().describe("URL to navigate to"),
+        ...browserTargetScopeShape,
+      }),
     },
-    async ({ url }) => {
-      await windowManager.navigateTo(url);
-      return text({ success: true, url });
+    async ({ url, sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      await target.navigate(url);
+      return text({ success: true, target: browserTargetState(target) });
     },
   );
 
   server.registerTool(
     "browser_back",
     {
-      description: "Go back in the active browser tab",
-      inputSchema: z.object({}),
+      description: "Go back in a browser tab",
+      inputSchema: z.object(browserTargetScopeShape),
     },
-    async () => {
-      windowManager.goBack();
-      return text({ success: true });
+    async ({ sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      await target.goBack();
+      return text({ success: true, target: browserTargetState(target) });
     },
   );
 
   server.registerTool(
     "browser_forward",
     {
-      description: "Go forward in the active browser tab",
-      inputSchema: z.object({}),
+      description: "Go forward in a browser tab",
+      inputSchema: z.object(browserTargetScopeShape),
     },
-    async () => {
-      windowManager.goForward();
-      return text({ success: true });
+    async ({ sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      await target.goForward();
+      return text({ success: true, target: browserTargetState(target) });
     },
   );
 
   server.registerTool(
     "browser_reload",
     {
-      description: "Reload the active browser tab",
-      inputSchema: z.object({}),
+      description: "Reload a browser tab",
+      inputSchema: z.object(browserTargetScopeShape),
     },
-    async () => {
-      windowManager.reload();
-      return text({ success: true });
+    async ({ sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      await target.reload();
+      return text({ success: true, target: browserTargetState(target) });
     },
   );
 
@@ -431,13 +478,20 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
       description: "Create a new browser tab",
       inputSchema: z.object({
         url: z.string().optional().describe("Optional URL to open"),
+        ...browserTargetScopeShape,
       }),
     },
-    async ({ url }) => {
-      const tabManager = windowManager.getTabManager();
-      if (!tabManager) throw new Error("Browser not ready");
-      const tab = tabManager.createTab(url);
-      return text({ id: tab.id, url: tab.url, title: tab.title });
+    async ({ url, sessionId, tabId }) => {
+      const context = resolveBrowserContext(
+        browserCoordinator,
+        sessionId,
+        tabId,
+      );
+      const target = await sessionManager.createBrowserTab(
+        url,
+        context.sessionId,
+      );
+      return text(target);
     },
   );
 
@@ -445,13 +499,31 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "close_tab",
     {
       description: "Close a browser tab",
-      inputSchema: z.object({ tabId: z.string() }),
+      inputSchema: z.object({
+        sessionId: browserSessionIdSchema,
+        tabId: z.string().describe("Browser tab ID"),
+      }),
     },
-    async ({ tabId }) => {
-      const tabManager = windowManager.getTabManager();
-      if (!tabManager) throw new Error("Browser not ready");
-      tabManager.closeTab(tabId);
-      return text({ success: true });
+    async ({ sessionId, tabId }) => {
+      const context = resolveBrowserContext(browserCoordinator, sessionId, tabId);
+      await context.closeTarget(tabId);
+      return text({ success: true, sessionId: context.sessionId, tabId });
+    },
+  );
+
+  server.registerTool(
+    "switch_tab",
+    {
+      description: "Activate a browser tab",
+      inputSchema: z.object({
+        sessionId: browserSessionIdSchema,
+        tabId: z.string().describe("Browser tab ID"),
+      }),
+    },
+    async ({ sessionId, tabId }) => {
+      const context = resolveBrowserContext(browserCoordinator, sessionId, tabId);
+      const target = await browserCoordinator.setActiveTarget(context.sessionId, tabId);
+      return text(browserTargetState(target));
     },
   );
 
@@ -459,17 +531,14 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "list_tabs",
     {
       description: "List all browser tabs with their URLs and titles",
-      inputSchema: z.object({}),
+      inputSchema: z.object(browserTargetScopeShape),
     },
-    async () => {
-      const tabManager = windowManager.getTabManager();
-      if (!tabManager) throw new Error("Browser not ready");
-      const tabs = tabManager.getAllTabs().map((t) => ({
-        id: t.id,
-        url: t.url,
-        title: t.title,
-      }));
-      return text(tabs);
+    async ({ sessionId, tabId }) => {
+      const context = resolveBrowserContext(browserCoordinator, sessionId, tabId);
+      const targets = tabId
+        ? [browserCoordinator.resolveTarget(context.sessionId, tabId)]
+        : await context.targets();
+      return text(targets.map(browserTargetState));
     },
   );
 
@@ -478,14 +547,12 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     {
       description:
         "Clear all browser data (cookies, localStorage, sessionStorage, cache). Current login state will be lost.",
-      inputSchema: z.object({}),
+      inputSchema: z.object(browserTargetScopeShape),
     },
-    async () => {
-      await session.defaultSession.clearStorageData();
-      await session.defaultSession.clearCache();
-      const wc = windowManager.getTabManager()?.getActiveWebContents();
-      if (wc && !wc.isDestroyed()) wc.reload();
-      return text({ success: true });
+    async ({ sessionId, tabId }) => {
+      const context = resolveBrowserContext(browserCoordinator, sessionId, tabId);
+      await context.clearData({ storage: true, cache: true, reloadTargets: true });
+      return text({ success: true, sessionId: context.sessionId });
     },
   );
 
@@ -493,14 +560,12 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "browser_screenshot",
     {
       description:
-        "Capture a screenshot of the current active browser tab. Returns a PNG image.",
-      inputSchema: z.object({}),
+        "Capture a screenshot of a browser tab. Returns a PNG image.",
+      inputSchema: z.object(browserTargetScopeShape),
     },
-    async () => {
-      const webContents = windowManager.getTabManager()?.getActiveWebContents();
-      if (!webContents || webContents.isDestroyed()) throw new Error("Browser not ready");
-      const image = await webContents.capturePage();
-      const base64 = image.toPNG().toString("base64");
+    async ({ sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      const base64 = (await target.captureScreenshot()).toString("base64");
       return {
         content: [{ type: "image" as const, data: base64, mimeType: "image/png" }],
       };
@@ -508,21 +573,40 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
   );
 
   server.registerTool(
+    "get_page_info",
+    {
+      description: "Get the URL, title, loading state, and history state of a browser tab",
+      inputSchema: z.object(browserTargetScopeShape),
+    },
+    async ({ sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      return text(browserTargetState(target));
+    },
+  );
+
+  server.registerTool(
     "cdp_send_command",
     {
       description:
-        "Send a raw Chrome DevTools Protocol (CDP) command to the active browser tab. " +
-        "Requires an active capture session with CDP attached. " +
+        "Send a raw Chrome DevTools Protocol (CDP) command to a browser tab. " +
         "Supports all CDP domains: Page, DOM, Runtime, Network, Emulation, Input, etc. " +
         "See https://chromedevtools.github.io/devtools-protocol/ for available methods.",
       inputSchema: z.object({
         method: z.string().describe("CDP method name, e.g. 'Page.captureScreenshot', 'Runtime.evaluate', 'DOM.getDocument'"),
         params: z.record(z.string(), z.unknown()).optional().describe("CDP method parameters as a JSON object"),
+        ...browserTargetScopeShape,
       }),
     },
-    async ({ method, params }) => {
-      const result = await sessionManager.sendCdpCommand(method, params as Record<string, unknown> | undefined);
-      return text(result);
+    async ({ method, params, sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      const lease = await target.getCdpTransport().then((transport) =>
+        transport.acquire(`mcp:${randomUUID()}`),
+      );
+      try {
+        return text(await lease.send(method, params));
+      } finally {
+        await lease.release();
+      }
     },
   );
 
@@ -860,25 +944,39 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
         "Replay recorded user interactions in the browser via CDP Input simulation. " +
         "Reproduces clicks, inputs, scrolls in the original sequence.",
       inputSchema: z.object({
-        sessionId: z.string().describe("Session ID with recorded interactions"),
+        sessionId: browserSessionIdSchema.describe(
+          "Session ID with recorded interactions (defaults to the active browser Session)",
+        ),
+        tabId: browserTabIdSchema,
         speed: z.number().default(2).describe("Playback speed multiplier (2 = 2x faster)"),
         fromSequence: z.number().optional().describe("Start from this sequence number"),
         toSequence: z.number().optional().describe("Stop at this sequence number"),
         skipMoves: z.boolean().default(true).describe("Skip mouse movement events"),
       }),
     },
-    async ({ sessionId, speed, fromSequence, toSequence, skipMoves }) => {
-      const webContents = windowManager.getTabManager()?.getActiveWebContents();
-      if (!webContents || webContents.isDestroyed()) throw new Error("Browser not ready");
-
-      let events = interactionEventsRepo.findBySession(sessionId, 10000);
+    async ({ sessionId, tabId, speed, fromSequence, toSequence, skipMoves }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      const sourceSessionId = sessionId ?? target.sessionId;
+      let events = interactionEventsRepo.findBySession(sourceSessionId, 10000);
       if (fromSequence != null) events = events.filter(e => e.sequence >= fromSequence);
       if (toSequence != null) events = events.filter(e => e.sequence <= toSequence);
 
       if (events.length === 0) return text({ error: "No interactions to replay" });
 
-      const result = await replayEngine.replay(webContents, events, { speed, skipMoves });
+      const result = await replayEngine.replay(target, events, { speed, skipMoves });
       return text(result);
+    },
+  );
+
+  server.registerTool(
+    "cancel_replay",
+    {
+      description: "Cancel the currently running interaction replay, if any.",
+      inputSchema: z.object({}),
+    },
+    async () => {
+      replayEngine.abort();
+      return text({ success: true });
     },
   );
 
@@ -896,12 +994,12 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
         x: z.number().optional().describe("X coordinate (for click without selector)"),
         y: z.number().optional().describe("Y coordinate (for click without selector)"),
         scrollDelta: z.number().optional().describe("Scroll delta in pixels (for 'scroll' action, positive=down)"),
+        ...browserTargetScopeShape,
       }),
     },
-    async ({ action, selector, text: inputText, url, x, y, scrollDelta }) => {
-      const webContents = windowManager.getTabManager()?.getActiveWebContents();
-      if (!webContents || webContents.isDestroyed()) throw new Error("Browser not ready");
-      const result = await replayEngine.executeAction(webContents, {
+    async ({ action, selector, text: inputText, url, x, y, scrollDelta, sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
+      const result = await replayEngine.executeAction(target, {
         type: action, selector, text: inputText, url, x, y, scrollDelta,
       });
       return text(result);
@@ -917,12 +1015,11 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
       inputSchema: z.object({
         filter: z.enum(['all', 'clickable', 'inputs', 'links', 'buttons']).default('clickable')
           .describe("Element filter: 'clickable' for buttons/links/interactive, 'inputs' for form fields"),
+        ...browserTargetScopeShape,
       }),
     },
-    async ({ filter }) => {
-      const webContents = windowManager.getTabManager()?.getActiveWebContents();
-      if (!webContents || webContents.isDestroyed()) throw new Error("Browser not ready");
-
+    async ({ filter, sessionId, tabId }) => {
+      const target = resolveBrowserTarget(browserCoordinator, sessionId, tabId);
       const selectorMap: Record<string, string> = {
         all: 'a, button, input, select, textarea, [role="button"], [onclick], [tabindex]',
         clickable: 'a, button, [role="button"], [onclick], [tabindex]:not(input):not(textarea)',
@@ -931,7 +1028,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
         buttons: 'button, [role="button"], input[type="submit"], input[type="button"]',
       };
 
-      const result = await webContents.executeJavaScript(`
+      const result = await target.evaluate(`
         (function() {
           const selector = ${JSON.stringify(selectorMap[filter] || selectorMap.clickable)};
           const elements = Array.from(document.querySelectorAll(selector)).slice(0, 50);
@@ -956,7 +1053,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
             };
           }).filter(Boolean);
         })()
-      `, true);
+      `);
 
       return text(result);
     },
@@ -966,7 +1063,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
 // ---- Resource Registration ----
 
 function registerResources(server: McpServer, deps: MCPServerDeps): void {
-  const { sessionManager, windowManager } = deps;
+  const { sessionManager, browserCoordinator } = deps;
 
   server.registerResource(
     "sessions",
@@ -1017,15 +1114,8 @@ function registerResources(server: McpServer, deps: MCPServerDeps): void {
       description: "Current browser tabs",
     },
     async (uri) => {
-      const tabs =
-        windowManager
-          .getTabManager()
-          ?.getAllTabs()
-          .map((t) => ({
-            id: t.id,
-            url: t.url,
-            title: t.title,
-          })) || [];
+      const context = resolveBrowserContext(browserCoordinator);
+      const tabs = (await context.targets()).map(browserTargetState);
       return {
         contents: [
           {
@@ -1040,6 +1130,61 @@ function registerResources(server: McpServer, deps: MCPServerDeps): void {
 }
 
 // ---- Helpers ----
+
+function resolveBrowserContext(
+  browserCoordinator: BrowserCoordinator,
+  sessionId?: string,
+  tabId?: string,
+): BrowserContext {
+  const context = sessionId
+    ? browserCoordinator.resolveContext(sessionId)
+    : browserCoordinator.getActiveContext();
+  if (!context) {
+    throw new BrowserBackendError(
+      "CONTEXT_NOT_FOUND",
+      "No browser Session is active; pass sessionId or activate a Session first",
+    );
+  }
+  if (tabId) browserCoordinator.resolveTarget(context.sessionId, tabId);
+  return context;
+}
+
+function resolveBrowserTarget(
+  browserCoordinator: BrowserCoordinator,
+  sessionId?: string,
+  tabId?: string,
+): BrowserTarget {
+  if (sessionId) return browserCoordinator.resolveTarget(sessionId, tabId);
+  if (tabId) {
+    const context = resolveBrowserContext(browserCoordinator);
+    return browserCoordinator.resolveTarget(context.sessionId, tabId);
+  }
+  const target = browserCoordinator.getActiveTarget();
+  if (!target) {
+    const context = browserCoordinator.getActiveContext();
+    throw new BrowserBackendError(
+      "TARGET_NOT_FOUND",
+      context
+        ? `Session ${context.sessionId} has no active browser tab`
+        : "No browser Session is active; pass sessionId or activate a Session first",
+      context
+        ? {
+            backendKind: context.backendKind,
+            sessionId: context.sessionId,
+            contextId: context.id,
+          }
+        : {},
+    );
+  }
+  return target;
+}
+
+function browserTargetState(target: BrowserTarget) {
+  return {
+    ...target.getState(),
+    backendKind: target.backendKind,
+  };
+}
 
 function text(data: unknown) {
   return {

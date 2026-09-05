@@ -162,6 +162,8 @@ export const en = {
   'interaction.clear': 'Clear',
   'interaction.clearConfirm': 'Clear all interaction recordings for this session?',
   'interaction.recording': 'Recording',
+  'capture.deepRequiredHooks': 'Page hooks require Deep capture. Passive mode does not modify page APIs.',
+  'capture.deepRequiredInteractions': 'Interaction recording requires Deep capture. Passive mode leaves page interaction APIs untouched.',
   'interaction.points': '{count} points',
 
   // AI Request Log

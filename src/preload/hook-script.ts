@@ -15,7 +15,7 @@
     return new Error().stack?.split('\n').slice(2).join('\n') || ''
   }
 
-  function arrayBufferToHex(buffer: ArrayBuffer): string {
+  function arrayBufferToHex(buffer: ArrayBufferLike): string {
     return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('')
   }
 

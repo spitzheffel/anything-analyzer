@@ -14,6 +14,7 @@ interface TitlebarProps {
   onLocaleToggle: () => void
   activeView: AppView
   onViewChange: (view: AppView) => void
+  onOverlayVisibilityChange?: (open: boolean) => void
   requestCount?: number
 }
 
@@ -30,12 +31,18 @@ const Titlebar: React.FC<TitlebarProps> = ({
   onLocaleToggle,
   activeView,
   onViewChange,
+  onOverlayVisibilityChange,
   requestCount = 0,
 }) => {
   const { t } = useLocale()
   const [isMaximized, setIsMaximized] = useState(false)
   const [themeOpen, setThemeOpen] = useState(false)
   const themeRef = useRef<HTMLDivElement>(null)
+
+  const setThemePopoverOpen = useCallback((open: boolean) => {
+    setThemeOpen(open)
+    onOverlayVisibilityChange?.(open)
+  }, [onOverlayVisibilityChange])
 
   useEffect(() => {
     window.electronAPI.isWindowMaximized().then(setIsMaximized)
@@ -46,12 +53,12 @@ const Titlebar: React.FC<TitlebarProps> = ({
     if (!themeOpen) return
     const handleClick = (e: MouseEvent) => {
       if (themeRef.current && !themeRef.current.contains(e.target as Node)) {
-        setThemeOpen(false)
+        setThemePopoverOpen(false)
       }
     }
     document.addEventListener('mousedown', handleClick)
     return () => document.removeEventListener('mousedown', handleClick)
-  }, [themeOpen])
+  }, [themeOpen, setThemePopoverOpen])
 
   const handleMinimize = useCallback(() => {
     window.electronAPI.minimizeWindow()
@@ -110,7 +117,7 @@ const Titlebar: React.FC<TitlebarProps> = ({
         <div ref={themeRef} style={{ position: 'relative' }}>
           <button
             className={styles.actionBtn}
-            onClick={() => setThemeOpen(prev => !prev)}
+            onClick={() => setThemePopoverOpen(!themeOpen)}
             title={locale === 'zh' ? '切换主题' : 'Switch theme'}
           >
             <span
@@ -131,7 +138,7 @@ const Titlebar: React.FC<TitlebarProps> = ({
                 <button
                   key={t.id}
                   className={`${styles.themeItem} ${theme === t.id ? styles.themeItemActive : ''}`}
-                  onClick={() => { onThemeChange(t.id); setThemeOpen(false) }}
+                  onClick={() => { onThemeChange(t.id); setThemePopoverOpen(false) }}
                 >
                   <span
                     className={styles.themeDot}

@@ -1,9 +1,15 @@
 import { EventEmitter } from 'events'
-import type { WebContents } from 'electron'
+import type { CaptureMode } from '@shared/types'
+import type {
+  BrowserTarget,
+  CdpLease,
+  CdpMessage,
+  Unsubscribe,
+} from '../browser/contracts'
 
 const MAX_BODY_SIZE = 1024 * 1024 // 1MB
+const STATIC_EXTENSIONS = /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|map)(\?|$)/i
 
-// Binary content types that should not have their body stored
 const BINARY_CONTENT_TYPES = [
   'image/', 'font/', 'audio/', 'video/',
   'application/octet-stream', 'application/pdf', 'application/zip'
@@ -19,101 +25,243 @@ interface RequestInfo {
   isOptions: boolean
 }
 
-/**
- * CdpManager — Chrome DevTools Protocol manager for network interception.
- * Attaches to a WebContents debugger and intercepts all Fetch/XHR requests.
- */
+interface ResponseInfo {
+  statusCode: number
+  headers: Record<string, string>
+  contentType: string | null
+}
+
+type ManagedDomain = 'Network' | 'Page' | 'Fetch'
+const DOMAIN_DISABLE_ORDER: readonly ManagedDomain[] = ['Fetch', 'Page', 'Network']
+
+let nextManagerId = 1
+
+function normalizeHeaders(
+  value: unknown,
+  lowercaseNames = true
+): Record<string, string> {
+  const headers: Record<string, string> = {}
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!entry || typeof entry !== 'object') continue
+      const { name, value: headerValue } = entry as { name?: unknown; value?: unknown }
+      if (typeof name === 'string') {
+        headers[lowercaseNames ? name.toLowerCase() : name] = String(headerValue ?? '')
+      }
+    }
+    return headers
+  }
+  if (!value || typeof value !== 'object') return headers
+  for (const [name, headerValue] of Object.entries(value)) {
+    headers[lowercaseNames ? name.toLowerCase() : name] = String(headerValue ?? '')
+  }
+  return headers
+}
+
+function isBinaryContent(contentType: string | null): boolean {
+  if (!contentType) return false
+  const normalized = contentType.toLowerCase()
+  return BINARY_CONTENT_TYPES.some(type => normalized.includes(type))
+}
+
+function decodeBody(result: Record<string, unknown>): { body: string | null; truncated: boolean } {
+  if (typeof result.body !== 'string') return { body: null, truncated: false }
+  let body = result.base64Encoded
+    ? Buffer.from(result.body, 'base64').toString('utf-8')
+    : result.body
+  if (body.length <= MAX_BODY_SIZE) return { body, truncated: false }
+  body = `${body.substring(0, MAX_BODY_SIZE)}\n[TRUNCATED]`
+  return { body, truncated: true }
+}
+
+/** Browser-neutral CDP network capture using a ref-counted target lease. */
 export class CdpManager extends EventEmitter {
-  private webContents: WebContents | null = null
+  private readonly ownerId = nextManagerId++
+  private target: BrowserTarget | null = null
+  private lease: CdpLease | null = null
+  private captureMode: CaptureMode = 'deep'
   private pendingRequests = new Map<string, RequestInfo>()
+  private pendingResponses = new Map<string, ResponseInfo>()
+  private readonly enabledDomains = new Set<ManagedDomain>()
   private running = false
-  private messageHandler: ((event: Electron.Event, method: string, params: Record<string, unknown>) => void) | null = null
-  private detachedHandler: (() => void) | null = null
+  private unsubscribeMessage: Unsubscribe | null = null
+  private unsubscribeDisconnect: Unsubscribe | null = null
+  private readonly inFlightHandlers = new Set<Promise<void>>()
+  private stopPromise: Promise<void> | null = null
 
-  async start(webContents: WebContents): Promise<void> {
-    this.webContents = webContents
+  async start(target: BrowserTarget, captureMode: CaptureMode = 'deep'): Promise<void> {
+    if (this.lease || this.stopPromise) await this.stop()
+    if (target.isClosed()) throw new Error('Cannot start CDP on a closed browser target')
 
-    if (webContents.isDestroyed()) {
-      throw new Error('Cannot start CDP on destroyed WebContents')
-    }
+    const transport = await target.getCdpTransport()
+    const lease = await transport.acquire(
+      `capture:network:${target.sessionId}:${target.tabId}:${this.ownerId}`
+    )
 
-    // Detach if already attached (e.g. leftover from a previous session)
-    if (webContents.debugger.isAttached()) {
-      try { webContents.debugger.detach() } catch { /* ignore */ }
-    }
+    this.target = target
+    this.lease = lease
+    this.captureMode = captureMode
 
     try {
-      webContents.debugger.attach('1.3')
-    } catch (err) {
-      throw new Error(`Failed to attach CDP debugger: ${(err as Error).message}`)
-    }
-
-    this.messageHandler = (_event, method, params) => {
-      this.handleCdpMessage(method, params)
-    }
-    this.detachedHandler = () => {
+      this.unsubscribeMessage = lease.onMessage(message => this.queueMessage(message))
+      this.unsubscribeDisconnect = lease.onDisconnect(reason => {
+        if (this.lease !== lease) return
+        this.running = false
+        this.pendingRequests.clear()
+        this.pendingResponses.clear()
+        void this.stop().catch(error => {
+          console.warn('[CdpManager] Failed to release disconnected lease:', (error as Error).message)
+        })
+        this.emit('detached', reason)
+      })
+      this.running = true
+      if (captureMode === 'passive') {
+        // Passive capture deliberately avoids Fetch: no interception or page pausing.
+        await this.enableDomain(lease, 'Network')
+      } else {
+        await this.enableDomain(lease, 'Network')
+        await this.enableDomain(lease, 'Page')
+        // Enable interception last so a partial startup cannot leave requests paused.
+        await this.enableDomain(lease, 'Fetch', {
+          patterns: [
+            { urlPattern: '*', requestStage: 'Request' },
+            { urlPattern: '*', requestStage: 'Response' }
+          ]
+        })
+      }
+    } catch (error) {
       this.running = false
-      this.emit('detached')
+      this.removeSubscriptions()
+      await this.waitForHandlers()
+      await this.disableOwnedDomains(lease)
+      if (!lease.released) await lease.release().catch(() => undefined)
+      if (this.lease === lease) this.resetState()
+      throw error
     }
-
-    webContents.debugger.on('message', this.messageHandler)
-    webContents.debugger.on('detach', this.detachedHandler)
-
-    await Promise.all([
-      this.send('Fetch.enable', {
-        patterns: [
-          { urlPattern: '*', requestStage: 'Request' },
-          { urlPattern: '*', requestStage: 'Response' }
-        ]
-      }),
-      this.send('Network.enable', {}),
-      this.send('Page.enable', {})
-    ])
-
-    this.running = true
   }
 
   async stop(): Promise<void> {
-    if (!this.running || !this.webContents) return
-    this.running = false
-    if (this.webContents.isDestroyed()) return
-    try {
-      await this.send('Fetch.disable', {})
-    } catch { /* ignore */ }
-  }
-
-  detach(): void {
-    if (!this.webContents) return
-    if (!this.webContents.isDestroyed()) {
-      if (this.messageHandler) {
-        this.webContents.debugger.removeListener('message', this.messageHandler)
-      }
-      if (this.detachedHandler) {
-        this.webContents.debugger.removeListener('detach', this.detachedHandler)
-      }
-      try { this.webContents.debugger.detach() } catch { /* already detached */ }
+    if (this.stopPromise) return this.stopPromise
+    const lease = this.lease
+    if (!lease) {
+      this.resetState()
+      return
     }
+
+    this.stopPromise = this.stopLease(lease)
+    try {
+      await this.stopPromise
+    } finally {
+      this.stopPromise = null
+    }
+  }
+
+  /** Send a raw command through this manager's active lease. */
+  async sendCommand(
+    method: string,
+    params: Record<string, unknown> = {}
+  ): Promise<Record<string, unknown>> {
+    const lease = this.lease
+    if (!lease || lease.released) throw new Error('No active CDP lease')
+    return lease.send(method, params)
+  }
+
+  private async stopLease(lease: CdpLease): Promise<void> {
+    this.running = false
+    this.removeSubscriptions()
+    try {
+      // Finish already-observed Fetch responses before disabling interception,
+      // otherwise their request IDs can become invalid before body collection.
+      await this.waitForHandlers()
+      await this.disableOwnedDomains(lease)
+      this.pendingRequests.clear()
+      this.pendingResponses.clear()
+      if (!lease.released) await lease.release()
+    } finally {
+      if (this.lease === lease) this.resetState()
+    }
+  }
+
+  private resetState(): void {
+    this.running = false
+    this.removeSubscriptions()
     this.pendingRequests.clear()
-    this.webContents = null
+    this.pendingResponses.clear()
+    this.enabledDomains.clear()
+    this.target = null
+    this.lease = null
   }
 
-  /**
-   * Send a raw CDP command. Exposed for advanced use cases (e.g. stealth injection).
-   */
-  async sendCommand(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (!this.webContents || this.webContents.isDestroyed()) throw new Error('No WebContents attached')
-    return this.webContents.debugger.sendCommand(method, params) as Promise<Record<string, unknown>>
+  private removeSubscriptions(): void {
+    this.unsubscribeMessage?.()
+    this.unsubscribeDisconnect?.()
+    this.unsubscribeMessage = null
+    this.unsubscribeDisconnect = null
   }
 
-  private async send(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    return this.sendCommand(method, params)
+  private async enableDomain(
+    lease: CdpLease,
+    domain: ManagedDomain,
+    params: Record<string, unknown> = {}
+  ): Promise<void> {
+    await lease.send(`${domain}.enable`, params)
+    this.enabledDomains.add(domain)
   }
 
-  private handleCdpMessage(method: string, params: Record<string, unknown>): void {
+  private async disableOwnedDomains(lease: CdpLease): Promise<void> {
+    if (!lease.connected || lease.released) return
+    for (const domain of DOMAIN_DISABLE_ORDER) {
+      if (!this.enabledDomains.has(domain)) continue
+      try {
+        await lease.send(`${domain}.disable`, {})
+        this.enabledDomains.delete(domain)
+      } catch {
+        // A conflicting lease still owns the domain, or the target closed.
+      }
+    }
+  }
+
+  private async waitForHandlers(): Promise<void> {
+    while (this.inFlightHandlers.size > 0) {
+      await Promise.allSettled([...this.inFlightHandlers])
+    }
+  }
+
+  private queueMessage(message: CdpMessage): void {
+    if (!this.running) return
+    const task = this.handleCdpMessage(message.method, message.params).catch(error => {
+      console.warn(`[CdpManager] ${message.method} handling failed:`, (error as Error).message)
+    })
+    this.inFlightHandlers.add(task)
+    void task.finally(() => this.inFlightHandlers.delete(task))
+  }
+
+  private async handleCdpMessage(
+    method: string,
+    params: Record<string, unknown>
+  ): Promise<void> {
+    if (this.captureMode === 'deep' && method === 'Fetch.requestPaused') {
+      await this.handleRequestPaused(params)
+      return
+    }
+    if (this.captureMode === 'passive') {
+      switch (method) {
+        case 'Network.requestWillBeSent':
+          this.handleNetworkRequest(params)
+          return
+        case 'Network.responseReceived':
+          this.handleNetworkResponse(params)
+          return
+        case 'Network.loadingFinished':
+          await this.handleNetworkLoadingFinished(params)
+          return
+        case 'Network.loadingFailed':
+          this.clearNetworkRequest(params.requestId as string)
+          return
+      }
+    }
+
     switch (method) {
-      case 'Fetch.requestPaused':
-        this.handleRequestPaused(params)
-        break
       case 'Network.webSocketFrameSent':
         this.emit('websocket-frame', { direction: 'sent', ...params })
         break
@@ -135,7 +283,6 @@ export class CdpManager extends EventEmitter {
   private async handleRequestPaused(params: Record<string, unknown>): Promise<void> {
     const requestId = params.requestId as string
     const responseStatusCode = params.responseStatusCode as number | undefined
-
     if (responseStatusCode === undefined) {
       await this.handleRequestStage(requestId, params)
     } else {
@@ -143,91 +290,181 @@ export class CdpManager extends EventEmitter {
     }
   }
 
-  private async handleRequestStage(requestId: string, params: Record<string, unknown>): Promise<void> {
+  private async handleRequestStage(
+    requestId: string,
+    params: Record<string, unknown>
+  ): Promise<void> {
     const request = params.request as Record<string, unknown>
-    const method = (request.method as string) || 'GET'
-    const url = (request.url as string) || ''
-    const headers = (request.headers as Record<string, string>) || {}
-    const postData = (request.postData as string) || null
-    const isOptions = method.toUpperCase() === 'OPTIONS'
-
-    const info: RequestInfo = {
-      method, url, headers, postData,
-      timestamp: Date.now(),
-      initiator: params.initiator || null,
-      isOptions
-    }
+    const info = this.readRequest(request, params.initiator)
     this.pendingRequests.set(requestId, info)
-
-    this.emit('request-captured', {
-      requestId, method, url,
-      headers: JSON.stringify(headers),
-      body: postData,
-      timestamp: info.timestamp,
-      initiator: params.initiator ? JSON.stringify(params.initiator) : null,
-      isOptions
-    })
-
+    this.emitRequest(requestId, info)
     try { await this.send('Fetch.continueRequest', { requestId }) } catch { /* cancelled */ }
   }
 
-  private async handleResponseStage(requestId: string, params: Record<string, unknown>): Promise<void> {
+  private async handleResponseStage(
+    requestId: string,
+    params: Record<string, unknown>
+  ): Promise<void> {
     const requestInfo = this.pendingRequests.get(requestId)
-    const statusCode = params.responseStatusCode as number
-    const responseHeaders = (params.responseHeaders as Array<{ name: string; value: string }>) || []
-
-    const headersObj: Record<string, string> = {}
-    for (const h of responseHeaders) {
-      headersObj[h.name.toLowerCase()] = h.value
-    }
-
-    const contentType = headersObj['content-type'] || null
-    const isBinary = contentType ? BINARY_CONTENT_TYPES.some(t => contentType.includes(t)) : false
-
+    const headers = normalizeHeaders(params.responseHeaders)
+    const contentType = headers['content-type'] || null
     let responseBody: string | null = null
     let truncated = false
 
-    if (!isBinary) {
+    if (!isBinaryContent(contentType)) {
       try {
-        const bodyResult = await this.send('Fetch.getResponseBody', { requestId })
-        const body = bodyResult.body as string
-        const base64Encoded = bodyResult.base64Encoded as boolean
-        responseBody = base64Encoded ? Buffer.from(body, 'base64').toString('utf-8') : body
-
-        if (responseBody && responseBody.length > MAX_BODY_SIZE) {
-          responseBody = responseBody.substring(0, MAX_BODY_SIZE) + '\n[TRUNCATED]'
-          truncated = true
-        }
-      } catch { responseBody = null }
+        const result = await this.send('Fetch.getResponseBody', { requestId })
+        const decoded = decodeBody(result)
+        responseBody = decoded.body
+        truncated = decoded.truncated
+      } catch { /* body unavailable */ }
     }
 
-    const durationMs = requestInfo ? Date.now() - requestInfo.timestamp : null
-    const STATIC_EXTENSIONS = /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|map)(\?|$)/i
+    if (requestInfo) {
+      this.emitResponse(requestId, requestInfo, {
+        statusCode: params.responseStatusCode as number,
+        headers,
+        contentType,
+      }, responseBody, truncated)
+    }
+    this.clearNetworkRequest(requestId)
+    try { await this.send('Fetch.continueResponse', { requestId }) } catch { /* cancelled */ }
+  }
 
-    const isStreaming = contentType ? contentType.includes('text/event-stream') : false
-    const isWebSocket = requestInfo
-      ? Object.entries(requestInfo.headers).some(([key, value]) =>
-          key.toLowerCase() === 'upgrade' && value.toLowerCase() === 'websocket')
-      : false
+  private handleNetworkRequest(params: Record<string, unknown>): void {
+    const requestId = params.requestId as string
+    if (!requestId) return
+
+    const previous = this.pendingRequests.get(requestId)
+    const redirect = params.redirectResponse
+    if (previous && redirect && typeof redirect === 'object') {
+      this.emitResponse(
+        requestId,
+        previous,
+        this.readNetworkResponse(redirect as Record<string, unknown>),
+        null,
+        false
+      )
+    }
+
+    const request = params.request as Record<string, unknown> | undefined
+    if (!request) return
+    const info = this.readRequest(request, params.initiator)
+    this.pendingRequests.set(requestId, info)
+    this.pendingResponses.delete(requestId)
+    this.emitRequest(requestId, info)
+  }
+
+  private handleNetworkResponse(params: Record<string, unknown>): void {
+    const requestId = params.requestId as string
+    const response = params.response as Record<string, unknown> | undefined
+    if (!requestId || !response) return
+    this.pendingResponses.set(requestId, this.readNetworkResponse(response))
+  }
+
+  private async handleNetworkLoadingFinished(params: Record<string, unknown>): Promise<void> {
+    const requestId = params.requestId as string
+    const requestInfo = this.pendingRequests.get(requestId)
+    const responseInfo = this.pendingResponses.get(requestId)
+    if (!requestInfo || !responseInfo) {
+      this.clearNetworkRequest(requestId)
+      return
+    }
+
+    let responseBody: string | null = null
+    let truncated = false
+    if (!isBinaryContent(responseInfo.contentType)) {
+      try {
+        const result = await this.send('Network.getResponseBody', { requestId })
+        const decoded = decodeBody(result)
+        responseBody = decoded.body
+        truncated = decoded.truncated
+      } catch { /* cached, streamed, or otherwise unavailable */ }
+    }
+
+    this.emitResponse(requestId, requestInfo, responseInfo, responseBody, truncated)
+    this.clearNetworkRequest(requestId)
+  }
+
+  private readRequest(request: Record<string, unknown>, initiator: unknown): RequestInfo {
+    const method = typeof request.method === 'string' ? request.method : 'GET'
+    return {
+      method,
+      url: typeof request.url === 'string' ? request.url : '',
+      headers: normalizeHeaders(request.headers, false),
+      postData: typeof request.postData === 'string' ? request.postData : null,
+      timestamp: Date.now(),
+      initiator: initiator ?? null,
+      isOptions: method.toUpperCase() === 'OPTIONS',
+    }
+  }
+
+  private readNetworkResponse(response: Record<string, unknown>): ResponseInfo {
+    const headers = normalizeHeaders(response.headers)
+    return {
+      statusCode: typeof response.status === 'number' ? response.status : 0,
+      headers,
+      contentType: headers['content-type']
+        || (typeof response.mimeType === 'string' ? response.mimeType : null),
+    }
+  }
+
+  private emitRequest(requestId: string, info: RequestInfo): void {
+    this.emit('request-captured', {
+      requestId,
+      method: info.method,
+      url: info.url,
+      headers: JSON.stringify(info.headers),
+      body: info.postData,
+      timestamp: info.timestamp,
+      initiator: info.initiator ? JSON.stringify(info.initiator) : null,
+      isOptions: info.isOptions,
+    })
+  }
+
+  private emitResponse(
+    requestId: string,
+    requestInfo: RequestInfo,
+    responseInfo: ResponseInfo,
+    responseBody: string | null,
+    truncated: boolean
+  ): void {
+    const contentType = responseInfo.contentType
+    const isStreaming = contentType?.includes('text/event-stream') ?? false
+    const isWebSocket = Object.entries(requestInfo.headers).some(([key, value]) =>
+      key.toLowerCase() === 'upgrade' && value.toLowerCase() === 'websocket'
+    )
 
     this.emit('response-captured', {
       requestId,
-      method: requestInfo?.method || 'UNKNOWN',
-      url: requestInfo?.url || '',
-      requestHeaders: requestInfo ? JSON.stringify(requestInfo.headers) : '{}',
-      requestBody: requestInfo?.postData || null,
-      statusCode, responseHeaders: JSON.stringify(headersObj),
-      responseBody, contentType,
-      initiator: requestInfo?.initiator ? JSON.stringify(requestInfo.initiator) : null,
-      durationMs,
-      isOptions: requestInfo?.isOptions || false,
-      isStatic: requestInfo ? STATIC_EXTENSIONS.test(requestInfo.url) : false,
+      method: requestInfo.method,
+      url: requestInfo.url,
+      requestHeaders: JSON.stringify(requestInfo.headers),
+      requestBody: requestInfo.postData,
+      statusCode: responseInfo.statusCode,
+      responseHeaders: JSON.stringify(responseInfo.headers),
+      responseBody,
+      contentType,
+      initiator: requestInfo.initiator ? JSON.stringify(requestInfo.initiator) : null,
+      durationMs: Date.now() - requestInfo.timestamp,
+      isOptions: requestInfo.isOptions,
+      isStatic: STATIC_EXTENSIONS.test(requestInfo.url),
       isStreaming,
       isWebSocket,
-      truncated, timestamp: requestInfo?.timestamp || Date.now()
+      truncated,
+      timestamp: requestInfo.timestamp,
     })
+  }
 
+  private clearNetworkRequest(requestId: string): void {
     this.pendingRequests.delete(requestId)
-    try { await this.send('Fetch.continueResponse', { requestId }) } catch { /* cancelled */ }
+    this.pendingResponses.delete(requestId)
+  }
+
+  private async send(
+    method: string,
+    params: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    return this.sendCommand(method, params)
   }
 }

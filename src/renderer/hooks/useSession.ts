@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useMemo } from 'react'
-import type { Session } from '../../shared/types'
+import type { CaptureMode, CreateSessionOptions, Session } from '../../shared/types'
 
 export interface UseSessionReturn {
   sessions: Session[]
@@ -7,9 +7,10 @@ export interface UseSessionReturn {
   currentSession: Session | null
   loading: boolean
   loadSessions: () => Promise<void>
-  createSession: (name: string, url: string) => Promise<void>
+  createSession: (name: string, url: string, options?: CreateSessionOptions) => Promise<void>
   selectSession: (id: string | null) => void
-  deleteSession: (id: string) => Promise<void>
+  deleteSession: (id: string, retainProfile?: boolean) => Promise<void>
+  setCaptureMode: (id: string, mode: CaptureMode) => Promise<void>
   startCapture: () => Promise<void>
   resumeCapture: () => Promise<void>
   pauseCapture: () => Promise<void>
@@ -38,9 +39,9 @@ export function useSession(): UseSessionReturn {
     }
   }, [])
 
-  const createSession = useCallback(async (name: string, url: string) => {
+  const createSession = useCallback(async (name: string, url: string, options?: CreateSessionOptions) => {
     try {
-      const session = await window.electronAPI.createSession(name, url)
+      const session = await window.electronAPI.createSession(name, url, options)
       setSessions((prev) => [...prev, session])
       setCurrentSessionId(session.id)
     } catch (err) {
@@ -54,9 +55,9 @@ export function useSession(): UseSessionReturn {
   }, [])
 
   const deleteSession = useCallback(
-    async (id: string) => {
+    async (id: string, retainProfile = false) => {
       try {
-        await window.electronAPI.deleteSession(id)
+        await window.electronAPI.deleteSession(id, { retainProfile })
         setSessions((prev) => prev.filter((s) => s.id !== id))
         if (currentSessionId === id) {
           setCurrentSessionId(null)
@@ -68,6 +69,13 @@ export function useSession(): UseSessionReturn {
     },
     [currentSessionId]
   )
+
+  const setCaptureMode = useCallback(async (id: string, mode: CaptureMode) => {
+    const updated = await window.electronAPI.setCaptureMode(id, mode)
+    setSessions((previous) =>
+      previous.map((session) => session.id === id ? updated : session)
+    )
+  }, [])
 
   const startCapture = useCallback(async () => {
     if (!currentSessionId) return
@@ -128,6 +136,7 @@ export function useSession(): UseSessionReturn {
     createSession,
     selectSession,
     deleteSession,
+    setCaptureMode,
     startCapture,
     resumeCapture,
     pauseCapture,

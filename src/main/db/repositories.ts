@@ -9,6 +9,10 @@ import type {
   AiRequestLog,
   InteractionEvent,
   InteractionType,
+  SessionBrowserConfig,
+  BrowserProfile,
+  BrowserProfileState,
+  BrowserTabState,
 } from '@shared/types'
 
 // ============================================================
@@ -30,8 +34,26 @@ export class SessionsRepo {
         `INSERT INTO sessions (id, name, target_url, status, created_at, stopped_at)
          VALUES (@id, @name, @target_url, @status, @created_at, @stopped_at)`
       ),
-      findById: db.prepare('SELECT * FROM sessions WHERE id = ?'),
-      findAll: db.prepare('SELECT * FROM sessions ORDER BY created_at DESC'),
+      findById: db.prepare(`
+        SELECT sessions.*,
+               COALESCE(config.browser_backend, 'electron') AS browser_backend,
+               COALESCE(config.capture_mode, 'deep') AS capture_mode,
+               config.profile_id AS browser_profile_id,
+               config.last_browser_version AS last_browser_version
+        FROM sessions
+        LEFT JOIN session_browser_config AS config ON config.session_id = sessions.id
+        WHERE sessions.id = ?
+      `),
+      findAll: db.prepare(`
+        SELECT sessions.*,
+               COALESCE(config.browser_backend, 'electron') AS browser_backend,
+               COALESCE(config.capture_mode, 'deep') AS capture_mode,
+               config.profile_id AS browser_profile_id,
+               config.last_browser_version AS last_browser_version
+        FROM sessions
+        LEFT JOIN session_browser_config AS config ON config.session_id = sessions.id
+        ORDER BY sessions.created_at DESC
+      `),
       updateStatus: db.prepare(
         'UPDATE sessions SET status = @status, stopped_at = @stopped_at WHERE id = @id'
       ),
@@ -57,6 +79,58 @@ export class SessionsRepo {
 
   delete(id: string): void {
     this.stmts.delete.run(id)
+  }
+
+  transaction<T>(operation: () => T): T {
+    return this.db.transaction(operation)()
+  }
+}
+
+// ============================================================
+// Session Browser Config Repository
+// ============================================================
+
+export class SessionBrowserConfigRepo {
+  private stmts: {
+    upsert: Database.Statement
+    findBySessionId: Database.Statement
+    delete: Database.Statement
+  }
+
+  constructor(private db: Database.Database) {
+    this.stmts = {
+      upsert: db.prepare(`
+        INSERT INTO session_browser_config (
+          session_id, browser_backend, capture_mode, profile_id,
+          last_browser_version, created_at, updated_at
+        ) VALUES (
+          @session_id, @browser_backend, @capture_mode, @profile_id,
+          @last_browser_version, @created_at, @updated_at
+        )
+        ON CONFLICT(session_id) DO UPDATE SET
+          browser_backend = excluded.browser_backend,
+          capture_mode = excluded.capture_mode,
+          profile_id = excluded.profile_id,
+          last_browser_version = excluded.last_browser_version,
+          updated_at = excluded.updated_at
+      `),
+      findBySessionId: db.prepare(
+        'SELECT * FROM session_browser_config WHERE session_id = ?'
+      ),
+      delete: db.prepare('DELETE FROM session_browser_config WHERE session_id = ?'),
+    }
+  }
+
+  upsert(config: SessionBrowserConfig): void {
+    this.stmts.upsert.run(config)
+  }
+
+  findBySessionId(sessionId: string): SessionBrowserConfig | null {
+    return (this.stmts.findBySessionId.get(sessionId) as SessionBrowserConfig | undefined) ?? null
+  }
+
+  delete(sessionId: string): void {
+    this.stmts.delete.run(sessionId)
   }
 }
 
@@ -357,6 +431,237 @@ export class FingerprintProfilesRepo {
 
   delete(sessionId: string): void {
     this.stmts.delete.run(sessionId)
+  }
+}
+
+// ============================================================
+// External Browser Profiles Repository
+// ============================================================
+
+export class BrowserProfilesRepo {
+  private stmts: {
+    insert: Database.Statement
+    upsert: Database.Statement
+    findById: Database.Statement
+    findByProfileKey: Database.Statement
+    findAll: Database.Statement
+    findByState: Database.Statement
+    update: Database.Statement
+    updateState: Database.Statement
+    touchLastUsed: Database.Statement
+    delete: Database.Statement
+  }
+
+  constructor(private db: Database.Database) {
+    const columns = `
+      id, display_name, profile_key, cloak_seed, state, last_used_at,
+      retained_at, last_error, created_at, updated_at
+    `
+    this.stmts = {
+      insert: db.prepare(`
+        INSERT INTO browser_profiles (${columns}) VALUES (
+          @id, @display_name, @profile_key, @cloak_seed, @state,
+          @last_used_at, @retained_at, @last_error, @created_at, @updated_at
+        )
+      `),
+      upsert: db.prepare(`
+        INSERT INTO browser_profiles (${columns}) VALUES (
+          @id, @display_name, @profile_key, @cloak_seed, @state,
+          @last_used_at, @retained_at, @last_error, @created_at, @updated_at
+        )
+        ON CONFLICT(id) DO UPDATE SET
+          display_name = excluded.display_name,
+          profile_key = excluded.profile_key,
+          cloak_seed = excluded.cloak_seed,
+          state = excluded.state,
+          last_used_at = excluded.last_used_at,
+          retained_at = excluded.retained_at,
+          last_error = excluded.last_error,
+          updated_at = excluded.updated_at
+      `),
+      findById: db.prepare('SELECT * FROM browser_profiles WHERE id = ?'),
+      findByProfileKey: db.prepare('SELECT * FROM browser_profiles WHERE profile_key = ?'),
+      findAll: db.prepare('SELECT * FROM browser_profiles ORDER BY created_at ASC'),
+      findByState: db.prepare(
+        'SELECT * FROM browser_profiles WHERE state = ? ORDER BY last_used_at DESC, created_at ASC'
+      ),
+      update: db.prepare(`
+        UPDATE browser_profiles SET
+          display_name = @display_name,
+          profile_key = @profile_key,
+          cloak_seed = @cloak_seed,
+          state = @state,
+          last_used_at = @last_used_at,
+          retained_at = @retained_at,
+          last_error = @last_error,
+          updated_at = @updated_at
+        WHERE id = @id
+      `),
+      updateState: db.prepare(`
+        UPDATE browser_profiles
+        SET state = @state,
+            retained_at = CASE
+              WHEN @state = 'retained' THEN @updated_at
+              WHEN @state = 'attached' THEN NULL
+              ELSE retained_at
+            END,
+            last_error = @last_error,
+            updated_at = @updated_at
+        WHERE id = @id
+      `),
+      touchLastUsed: db.prepare(`
+        UPDATE browser_profiles
+        SET last_used_at = @last_used_at, updated_at = @updated_at
+        WHERE id = @id
+      `),
+      delete: db.prepare('DELETE FROM browser_profiles WHERE id = ?'),
+    }
+  }
+
+  insert(profile: BrowserProfile): void {
+    this.stmts.insert.run(profile)
+  }
+
+  upsert(profile: BrowserProfile): void {
+    this.stmts.upsert.run(profile)
+  }
+
+  findById(id: string): BrowserProfile | null {
+    return (this.stmts.findById.get(id) as BrowserProfile | undefined) ?? null
+  }
+
+  findByProfileKey(profileKey: string): BrowserProfile | null {
+    return (this.stmts.findByProfileKey.get(profileKey) as BrowserProfile | undefined) ?? null
+  }
+
+  findAll(): BrowserProfile[] {
+    return this.stmts.findAll.all() as BrowserProfile[]
+  }
+
+  findByState(state: BrowserProfileState): BrowserProfile[] {
+    return this.stmts.findByState.all(state) as BrowserProfile[]
+  }
+
+  update(profile: BrowserProfile): void {
+    this.stmts.update.run(profile)
+  }
+
+  updateState(
+    id: string,
+    state: BrowserProfileState,
+    lastError: string | null = null,
+    updatedAt: number = Date.now(),
+  ): void {
+    this.stmts.updateState.run({
+      id,
+      state,
+      last_error: lastError,
+      updated_at: updatedAt,
+    })
+  }
+
+  touchLastUsed(id: string, lastUsedAt: number = Date.now()): void {
+    this.stmts.touchLastUsed.run({
+      id,
+      last_used_at: lastUsedAt,
+      updated_at: lastUsedAt,
+    })
+  }
+
+  delete(id: string): void {
+    this.stmts.delete.run(id)
+  }
+}
+
+// ============================================================
+// Persisted Browser Tabs Repository
+// ============================================================
+
+type BrowserTabRow = Omit<BrowserTabState, 'active'> & { active: number }
+
+function mapBrowserTab(row: BrowserTabRow): BrowserTabState {
+  return { ...row, active: row.active === 1 }
+}
+
+export class BrowserTabsRepo {
+  private stmts: {
+    upsert: Database.Statement
+    findById: Database.Statement
+    findByProfileId: Database.Statement
+    clearActive: Database.Statement
+    markActive: Database.Statement
+    delete: Database.Statement
+    deleteByProfileId: Database.Statement
+  }
+
+  constructor(private db: Database.Database) {
+    this.stmts = {
+      upsert: db.prepare(`
+        INSERT INTO browser_tabs (
+          profile_id, id, url, title, position, active, updated_at
+        ) VALUES (
+          @profile_id, @id, @url, @title, @position, @active, @updated_at
+        )
+        ON CONFLICT(profile_id, id) DO UPDATE SET
+          url = excluded.url,
+          title = excluded.title,
+          position = excluded.position,
+          active = excluded.active,
+          updated_at = excluded.updated_at
+      `),
+      findById: db.prepare(
+        'SELECT * FROM browser_tabs WHERE profile_id = ? AND id = ?'
+      ),
+      findByProfileId: db.prepare(
+        'SELECT * FROM browser_tabs WHERE profile_id = ? ORDER BY position ASC, id ASC'
+      ),
+      clearActive: db.prepare('UPDATE browser_tabs SET active = 0 WHERE profile_id = ?'),
+      markActive: db.prepare(
+        'UPDATE browser_tabs SET active = 1, updated_at = ? WHERE profile_id = ? AND id = ?'
+      ),
+      delete: db.prepare('DELETE FROM browser_tabs WHERE profile_id = ? AND id = ?'),
+      deleteByProfileId: db.prepare('DELETE FROM browser_tabs WHERE profile_id = ?'),
+    }
+  }
+
+  upsert(tab: BrowserTabState): void {
+    this.stmts.upsert.run({ ...tab, active: tab.active ? 1 : 0 })
+  }
+
+  replaceForProfile(profileId: string, tabs: BrowserTabState[]): void {
+    this.db.transaction(() => {
+      this.stmts.deleteByProfileId.run(profileId)
+      for (const tab of tabs) {
+        if (tab.profile_id !== profileId) {
+          throw new Error(`Browser tab ${tab.id} belongs to a different profile`)
+        }
+        this.upsert(tab)
+      }
+    })()
+  }
+
+  findById(profileId: string, id: string): BrowserTabState | null {
+    const row = this.stmts.findById.get(profileId, id) as BrowserTabRow | undefined
+    return row ? mapBrowserTab(row) : null
+  }
+
+  findByProfileId(profileId: string): BrowserTabState[] {
+    return (this.stmts.findByProfileId.all(profileId) as BrowserTabRow[]).map(mapBrowserTab)
+  }
+
+  setActive(profileId: string, id: string, updatedAt: number = Date.now()): void {
+    this.db.transaction(() => {
+      this.stmts.clearActive.run(profileId)
+      this.stmts.markActive.run(updatedAt, profileId, id)
+    })()
+  }
+
+  delete(profileId: string, id: string): void {
+    this.stmts.delete.run(profileId, id)
+  }
+
+  deleteByProfileId(profileId: string): void {
+    this.stmts.deleteByProfileId.run(profileId)
   }
 }
 

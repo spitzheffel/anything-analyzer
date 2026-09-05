@@ -1,6 +1,17 @@
 import { ipcMain, dialog, app, session, shell } from "electron";
 import { networkInterfaces } from "os";
-import type { LLMProviderConfig, MCPServerConfig, MCPServerSettings, MitmProxyConfig, ProxyConfig, PromptTemplate } from "@shared/types";
+import type {
+  CloakRuntimePolicy,
+  ChatMessage,
+  CreateSessionOptions,
+  DeleteSessionOptions,
+  LLMProviderConfig,
+  MCPServerConfig,
+  MCPServerSettings,
+  MitmProxyConfig,
+  ProxyConfig,
+  PromptTemplate,
+} from "@shared/types";
 import type { SessionManager } from "./session/session-manager";
 import type { AiAnalyzer } from "./ai/ai-analyzer";
 import type { WindowManager } from "./window";
@@ -34,7 +45,13 @@ import type {
   AiRequestLogRepo,
   InteractionEventsRepo,
 } from "./db/repositories";
-import { readFileSync, writeFileSync, existsSync } from "fs";
+import {
+  existsSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import { join } from "path";
 import { randomUUID } from "node:crypto";
 import {
@@ -42,6 +59,7 @@ import {
   normalizeMCPListenHost,
 } from "./mcp/mcp-server-listen";
 import { applyModelOverride, fetchLLMModels } from "./ai/model-catalog";
+import type { BrowserCoordinator } from "./browser/browser-coordinator";
 
 /**
  * Register all IPC handlers for communication between renderer and main process.
@@ -70,6 +88,7 @@ export function registerIpcHandlers(deps: {
   profileStore: ProfileStore;
   aiRequestLogRepo: AiRequestLogRepo;
   interactionEventsRepo: InteractionEventsRepo;
+  browserCoordinator: BrowserCoordinator;
 }): void {
   const {
     sessionManager,
@@ -88,14 +107,20 @@ export function registerIpcHandlers(deps: {
     profileStore,
     aiRequestLogRepo,
     interactionEventsRepo,
+    browserCoordinator,
   } = deps;
 
   // ---- Session Management ----
 
   ipcMain.handle(
     "session:create",
-    async (_event, name: string, targetUrl: string) => {
-      return sessionManager.createSession(name, targetUrl);
+    async (
+      _event,
+      name: string,
+      targetUrl: string,
+      options?: CreateSessionOptions,
+    ) => {
+      return sessionManager.createSession(name, targetUrl, options);
     },
   );
 
@@ -114,6 +139,7 @@ export function registerIpcHandlers(deps: {
       mainWin.webContents,
       proxyConfig,
     );
+    await sendTabsReset();
   });
 
   ipcMain.handle("session:pause", async (_event, sessionId: string) => {
@@ -128,7 +154,18 @@ export function registerIpcHandlers(deps: {
     await sessionManager.stopCapture(sessionId);
   });
 
-  ipcMain.handle("session:delete", async (_event, sessionId: string) => {
+  ipcMain.handle(
+    "session:setCaptureMode",
+    async (_event, sessionId: string, mode: "passive" | "deep") => {
+      return sessionManager.setCaptureMode(sessionId, mode);
+    },
+  );
+
+  ipcMain.handle("session:delete", async (
+    _event,
+    sessionId: string,
+    options?: DeleteSessionOptions,
+  ) => {
     // Check if any reports in this session have in-flight chat calls
     const sessionReports = reportsRepo.findBySession(sessionId);
     const hasActiveChat = sessionReports.some(r => activeChatReports.has(r.id));
@@ -136,7 +173,11 @@ export function registerIpcHandlers(deps: {
       throw new Error("Cannot delete session while AI chat is in progress. Please wait for the response to complete.");
     }
     const tabManager = windowManager.getTabManager();
-    await sessionManager.deleteSession(sessionId, tabManager ?? undefined);
+    await sessionManager.deleteSession(
+      sessionId,
+      tabManager ?? undefined,
+      options,
+    );
   });
 
   // ---- Window Control (frameless window) ----
@@ -165,27 +206,23 @@ export function registerIpcHandlers(deps: {
   // ---- Browser Control ----
 
   ipcMain.handle("browser:navigate", async (_event, url: string) => {
-    await windowManager.navigateTo(url);
+    await sessionManager.navigate(url);
   });
 
   ipcMain.handle("browser:back", async () => {
-    windowManager.goBack();
+    await sessionManager.goBack();
   });
 
   ipcMain.handle("browser:forward", async () => {
-    windowManager.goForward();
+    await sessionManager.goForward();
   });
 
   ipcMain.handle("browser:reload", async () => {
-    windowManager.reload();
+    await sessionManager.reload();
   });
 
-  ipcMain.handle("browser:clearEnv", async () => {
-    const elSession = sessionManager.getActiveElectronSession() ?? session.defaultSession;
-    await elSession.clearStorageData();
-    await elSession.clearCache();
-    const wc = windowManager.getTabManager()?.getActiveWebContents();
-    if (wc && !wc.isDestroyed()) wc.reload();
+  ipcMain.handle("browser:clearEnv", async (_event, sessionId?: string) => {
+    await sessionManager.clearBrowserEnvironment(sessionId);
   });
 
   ipcMain.handle("browser:setRatio", async (_event, ratio: number) => {
@@ -194,91 +231,109 @@ export function registerIpcHandlers(deps: {
 
   // Renderer reports exact browser placeholder bounds (fire-and-forget)
   ipcMain.on("browser:syncBounds", (_event, bounds: { x: number; y: number; width: number; height: number }) => {
-    windowManager.syncBrowserBounds(bounds);
+    if (browserCoordinator.getActiveContext()?.backendKind === "electron") {
+      windowManager.syncBrowserBounds(bounds);
+    }
   });
 
   ipcMain.handle("browser:setVisible", async (_event, visible: boolean) => {
-    windowManager.setTargetViewVisible(visible);
+    const hasActiveElectronContext =
+      browserCoordinator.getActiveContext()?.backendKind === "electron";
+    // Hiding must always reach WindowManager. In particular, startup has no
+    // active Coordinator context but already owns a default WebContentsView.
+    windowManager.setTargetViewVisible(visible && hasActiveElectronContext);
   });
 
   ipcMain.handle("browser:toggleDevTools", async () => {
-    const wc = windowManager.getTabManager()?.getActiveWebContents();
-    if (!wc || wc.isDestroyed()) return;
-    if (wc.isDevToolsOpened()) {
-      wc.closeDevTools();
-    } else {
-      wc.openDevTools({ mode: 'detach' });
-    }
+    await sessionManager.toggleDevTools();
+  });
+
+  ipcMain.handle("browser:focus", async (_event, sessionId?: string) => {
+    await sessionManager.focusBrowser(sessionId);
+  });
+
+  ipcMain.handle("browser:status", async (_event, sessionId?: string) => {
+    return sessionManager.getBrowserSessionStatus(sessionId);
   });
 
   // ---- Tab Management ----
 
   ipcMain.handle("tabs:create", async (_event, url?: string) => {
-    const tabManager = windowManager.getTabManager();
-    if (!tabManager) throw new Error("Tab manager not ready");
-    const tab = tabManager.createTab(url);
-    return { id: tab.id, url: tab.url, title: tab.title, isActive: true };
+    return sessionManager.createBrowserTab(url);
   });
 
   ipcMain.handle("tabs:close", async (_event, tabId: string) => {
-    const tabManager = windowManager.getTabManager();
-    if (!tabManager) throw new Error("Tab manager not ready");
-    tabManager.closeTab(tabId);
+    await sessionManager.closeBrowserTab(tabId);
   });
 
   ipcMain.handle("tabs:activate", async (_event, tabId: string) => {
-    const tabManager = windowManager.getTabManager();
-    if (!tabManager) throw new Error("Tab manager not ready");
-    tabManager.activateTab(tabId);
+    await sessionManager.activateBrowserTab(tabId);
   });
 
   ipcMain.handle("tabs:list", async () => {
-    const tabManager = windowManager.getTabManager();
-    if (!tabManager) return [];
-    const activeTab = tabManager.getActiveTab();
-    return tabManager.getAllTabs().map((t) => ({
-      id: t.id,
-      url: t.url,
-      title: t.title,
-      isActive: t.id === activeTab?.id,
-      isLoading: t.isLoading,
-    }));
+    if (!browserCoordinator.getActiveContext()) return [];
+    return sessionManager.listBrowserTabs();
   });
 
-  // Forward TabManager events to the renderer
-  const tabManager = windowManager.getTabManager();
+  // Forward only the active Session's scoped backend events.
   const mainWin = windowManager.getMainWindow();
-  if (tabManager && mainWin) {
-    tabManager.on(
-      "tab-created",
-      (tabInfo: { id: string; url: string; title: string }) => {
-        if (mainWin.isDestroyed()) return;
-        mainWin.webContents.send("tabs:created", {
-          id: tabInfo.id,
-          url: tabInfo.url,
-          title: tabInfo.title,
-          isActive: true,
-        });
-      },
-    );
-    tabManager.on("tab-closed", (data: { tabId: string }) => {
-      if (mainWin.isDestroyed()) return;
-      mainWin.webContents.send("tabs:closed", data);
+  const sendTabsReset = async (): Promise<void> => {
+    if (!mainWin || mainWin.isDestroyed()) return;
+    const context = browserCoordinator.getActiveContext();
+    const tabs = context ? await sessionManager.listBrowserTabs() : [];
+    mainWin.webContents.send("tabs:reset", {
+      sessionId: context?.sessionId ?? null,
+      contextId: context?.id ?? null,
+      tabId: null,
+      tabs,
     });
-    tabManager.on(
-      "tab-activated",
-      (data: { tabId: string; url: string; title: string }) => {
-        if (mainWin.isDestroyed()) return;
-        mainWin.webContents.send("tabs:activated", data);
-      },
-    );
-    tabManager.on(
-      "tab-updated",
-      (data: { tabId: string; url?: string; title?: string; isLoading?: boolean }) => {
-        if (mainWin.isDestroyed()) return;
-        mainWin.webContents.send("tabs:updated", data);
-      },
-    );
+  };
+  if (mainWin) {
+    browserCoordinator.onEvent((browserEvent) => {
+      if (
+        mainWin.isDestroyed() ||
+        browserEvent.sessionId !== browserCoordinator.getActiveSessionId()
+      ) {
+        return;
+      }
+      const scope = {
+        sessionId: browserEvent.sessionId,
+        contextId: browserEvent.contextId,
+        tabId: browserEvent.tabId,
+      };
+      if (browserEvent.type === "target-created") {
+        mainWin.webContents.send("tabs:created", {
+          ...scope,
+          ...browserEvent.target.getState(),
+          id: browserEvent.tabId,
+        });
+      } else if (browserEvent.type === "target-closed") {
+        mainWin.webContents.send("tabs:closed", scope);
+      } else if (browserEvent.type === "target-activated") {
+        const target = browserCoordinator
+          .resolveContext(browserEvent.sessionId)
+          .getTarget(browserEvent.tabId);
+        mainWin.webContents.send("tabs:activated", {
+          ...scope,
+          url: target?.url ?? "",
+          title: target?.title ?? "",
+        });
+      } else if (browserEvent.type === "target-updated") {
+        mainWin.webContents.send("tabs:updated", {
+          ...scope,
+          url: browserEvent.target.url,
+          title: browserEvent.target.title,
+          isLoading: browserEvent.target.isLoading,
+        });
+      } else if (browserEvent.type === "disconnected") {
+        mainWin.webContents.send("tabs:reset", {
+          sessionId: browserEvent.sessionId,
+          contextId: browserEvent.contextId,
+          tabId: null,
+          tabs: [],
+        });
+      }
+    });
   }
 
   // ---- Data Queries ----
@@ -368,7 +423,7 @@ export function registerIpcHandlers(deps: {
       _event,
       sessionId: string,
       reportId: string,
-      history: Array<{ role: string; content: string }>,
+      history: ChatMessage[],
       userMessage: string,
     ) => {
       const savedConfig = loadLLMConfig();
@@ -560,17 +615,82 @@ export function registerIpcHandlers(deps: {
     return loadProxyConfig();
   });
 
+  ipcMain.handle("proxy:restartImpact", async () => {
+    return sessionManager.getOpenCloakSessions().map((item) => ({
+      id: item.id,
+      name: item.name,
+      status: item.status,
+    }));
+  });
+
   ipcMain.handle("proxy:save", async (_event, config: ProxyConfig) => {
-    saveProxyConfigFile(config);
-    // Sync upstream proxy to MITM proxy first (synchronous, won't fail)
-    deps.mitmProxy.setUpstreamProxy(config);
-    await applyProxy(config);
-    // Also apply to the active session's partition if one exists
-    const activeElSession = sessionManager.getActiveElectronSession();
-    if (activeElSession) {
-      await applyProxy(config, activeElSession);
+    const next = validateProxyConfig(config);
+    const previous = loadProxyConfig();
+    await sessionManager.restartOpenCloakContexts(next, previous);
+    try {
+      await applyProxy(next);
+      await browserCoordinator.updateOpenContextProxies(
+        "electron",
+        next,
+        previous,
+      );
+      saveProxyConfigFile(next);
+      deps.mitmProxy.setUpstreamProxy(next);
+    } catch (error) {
+      await sessionManager
+        .restartOpenCloakContexts(previous, next)
+        .catch(() => undefined);
+      await applyProxy(previous).catch(() => undefined);
+      await browserCoordinator
+        .updateOpenContextProxies("electron", previous, next)
+        .catch(() => undefined);
+      deps.mitmProxy.setUpstreamProxy(previous);
+      restoreProxyConfigFile(previous);
+      throw error;
     }
   });
+
+  // ---- CloakBrowser Runtime / Retained Profiles ----
+
+  ipcMain.handle("cloak:status", async () => {
+    return await sessionManager.getCloakStatus();
+  });
+
+  ipcMain.handle(
+    "cloak:prepare",
+    async (_event, policy?: CloakRuntimePolicy) => {
+      const status = await sessionManager.prepareCloakRuntime(policy);
+      if (policy) saveCloakRuntimePolicy(policy);
+      return status;
+    },
+  );
+
+  ipcMain.handle(
+    "cloak:setPolicy",
+    async (_event, policy: CloakRuntimePolicy) => {
+      const status = await sessionManager.setCloakRuntimePolicy(policy);
+      saveCloakRuntimePolicy(policy);
+      return status;
+    },
+  );
+
+  ipcMain.handle("browser-profiles:listRetained", async () => {
+    return sessionManager.listRetainedProfiles();
+  });
+
+  ipcMain.handle(
+    "browser-profiles:restore",
+    async (_event, profileId: string) => {
+      return sessionManager.restoreBrowserProfile(profileId);
+    },
+  );
+
+  ipcMain.handle(
+    "browser-profiles:delete",
+    async (_event, profileId: string) => {
+      await sessionManager.deleteBrowserProfile(profileId);
+    },
+  );
 
   // ---- MCP Server Config ----
 
@@ -588,7 +708,17 @@ export function registerIpcHandlers(deps: {
     const { initMCPServer, stopMCPServer, isMCPServerRunning } = await import("./mcp/mcp-server");
     if (normalizedConfig.enabled) {
       await initMCPServer(
-        { sessionManager, aiAnalyzer, windowManager, requestsRepo, jsHooksRepo, storageSnapshotsRepo, reportsRepo, interactionEventsRepo },
+        {
+          sessionManager,
+          aiAnalyzer,
+          windowManager,
+          browserCoordinator,
+          requestsRepo,
+          jsHooksRepo,
+          storageSnapshotsRepo,
+          reportsRepo,
+          interactionEventsRepo,
+        },
         normalizedConfig.port,
         normalizedConfig.authEnabled,
         normalizedConfig.authToken,
@@ -734,22 +864,35 @@ export function registerIpcHandlers(deps: {
 
   ipcMain.handle("fingerprint:update", async (_event, profileJson: string) => {
     const profile = JSON.parse(profileJson);
+    if (sessionManager.getSession(profile.sessionId)?.browser_backend === "cloak") {
+      throw new Error("CloakBrowser manages its own fingerprint Profile");
+    }
     profileStore.update(profile);
   });
 
   ipcMain.handle("fingerprint:regenerate", async (_event, sessionId: string) => {
+    if (sessionManager.getSession(sessionId)?.browser_backend === "cloak") {
+      throw new Error("CloakBrowser manages its own fingerprint Profile");
+    }
     return profileStore.regenerate(sessionId) ?? null;
   });
 
-  ipcMain.handle("fingerprint:enable", async (_event, sessionId: string) => {
+  ipcMain.handle("fingerprint:enable", async (event, sessionId: string) => {
     const tabManager = windowManager.getTabManager();
     if (!tabManager) throw new Error("Browser not ready");
     const proxyConfig = loadProxyConfig();
-    await sessionManager.enableStealth(sessionId, tabManager, proxyConfig);
+    await sessionManager.enableStealth(
+      sessionId,
+      tabManager,
+      proxyConfig,
+      event.sender,
+    );
+    await sendTabsReset();
   });
 
   ipcMain.handle("fingerprint:disable", async () => {
     await sessionManager.disableStealth();
+    await sendTabsReset();
   });
 
   // ---- Interaction Recording ----
@@ -812,6 +955,36 @@ function saveLLMConfig(config: LLMProviderConfig): void {
   writeFileSync(getConfigPath(), JSON.stringify(config, null, 2), "utf-8");
 }
 
+// ---- Cloak runtime policy (contains no credentials) ----
+
+function getCloakRuntimeConfigPath(): string {
+  return join(app.getPath("userData"), "cloak-runtime-config.json");
+}
+
+export function loadCloakRuntimePolicy(): CloakRuntimePolicy {
+  const path = getCloakRuntimeConfigPath();
+  if (!existsSync(path)) return "strict";
+  try {
+    const value = JSON.parse(readFileSync(path, "utf-8")) as {
+      policy?: unknown;
+    };
+    return value.policy === "free-latest" ? "free-latest" : "strict";
+  } catch {
+    return "strict";
+  }
+}
+
+function saveCloakRuntimePolicy(policy: CloakRuntimePolicy): void {
+  if (policy !== "strict" && policy !== "free-latest") {
+    throw new Error("Invalid Cloak runtime policy");
+  }
+  writeFileSync(
+    getCloakRuntimeConfigPath(),
+    JSON.stringify({ policy }, null, 2),
+    "utf-8",
+  );
+}
+
 // ---- Proxy config persistence ----
 
 function getProxyConfigPath(): string {
@@ -829,7 +1002,59 @@ export function loadProxyConfig(): ProxyConfig | null {
 }
 
 function saveProxyConfigFile(config: ProxyConfig): void {
-  writeFileSync(getProxyConfigPath(), JSON.stringify(config, null, 2), "utf-8");
+  const path = getProxyConfigPath();
+  const temporaryPath = `${path}.tmp-${process.pid}`;
+  try {
+    writeFileSync(temporaryPath, JSON.stringify(config, null, 2), "utf-8");
+    renameSync(temporaryPath, path);
+  } finally {
+    if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+  }
+}
+
+function restoreProxyConfigFile(config: ProxyConfig | null): void {
+  try {
+    if (config) saveProxyConfigFile(config);
+    else if (existsSync(getProxyConfigPath())) unlinkSync(getProxyConfigPath());
+  } catch (error) {
+    console.error("Failed to restore the previous proxy configuration:", error);
+  }
+}
+
+function validateProxyConfig(value: unknown): ProxyConfig {
+  if (!value || typeof value !== "object") {
+    throw new Error("Invalid proxy configuration");
+  }
+  const config = value as Record<string, unknown>;
+  if (!["none", "http", "https", "socks5"].includes(String(config.type))) {
+    throw new Error("Invalid proxy type");
+  }
+  const type = config.type as ProxyConfig["type"];
+  if (type === "none") return { type, host: "", port: 0 };
+  const host = typeof config.host === "string" ? config.host.trim() : "";
+  const port = config.port;
+  if (
+    !host ||
+    typeof port !== "number" ||
+    !Number.isInteger(port) ||
+    port < 1 ||
+    port > 65_535
+  ) {
+    throw new Error("Invalid proxy host or port");
+  }
+  if (
+    (config.username !== undefined && typeof config.username !== "string") ||
+    (config.password !== undefined && typeof config.password !== "string")
+  ) {
+    throw new Error("Invalid proxy credentials");
+  }
+  return {
+    type,
+    host,
+    port,
+    ...(config.username ? { username: config.username } : {}),
+    ...(config.password ? { password: config.password } : {}),
+  };
 }
 
 export async function applyProxy(

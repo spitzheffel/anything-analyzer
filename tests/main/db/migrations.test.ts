@@ -2,7 +2,19 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   runMigrations,
   migrateAddStreamingAndWebSocketFlags,
+  migrateAddBrowserPersistenceTables,
 } from "../../../src/main/db/migrations";
+import {
+  BrowserProfilesRepo,
+  BrowserTabsRepo,
+  SessionBrowserConfigRepo,
+  SessionsRepo,
+} from "../../../src/main/db/repositories";
+import type {
+  BrowserProfile,
+  BrowserTabState,
+  SessionBrowserConfig,
+} from "../../../src/shared/types";
 import path from "path";
 import fs from "fs";
 import os from "os";
@@ -36,6 +48,7 @@ describeDatabaseMigrations("Database Migrations", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "test-db-"));
     dbPath = path.join(tmpDir, "test.db");
     db = new Database!(dbPath);
+    db.pragma("foreign_keys = ON");
 
     // Run initial migrations to set up schema
     runMigrations(db);
@@ -161,6 +174,264 @@ describeDatabaseMigrations("Database Migrations", () => {
       .get(sessionId) as { prompt_tokens: number; completion_tokens: number };
     expect(log.prompt_tokens).toBe(15_555);
     expect(log.completion_tokens).toBe(1_335);
+  });
+
+  it("应该以幂等方式创建浏览器持久化表", () => {
+    expect(() => migrateAddBrowserPersistenceTables(db!)).not.toThrow();
+    expect(() => migrateAddBrowserPersistenceTables(db!)).not.toThrow();
+
+    const tables = db!
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+      .all() as Array<{ name: string }>;
+    const tableNames = tables.map((row) => row.name);
+
+    expect(tableNames).toContain("session_browser_config");
+    expect(tableNames).toContain("browser_profiles");
+    expect(tableNames).toContain("browser_tabs");
+
+    const configColumns = db!
+      .prepare("PRAGMA table_info(session_browser_config)")
+      .all() as Array<{ name: string; dflt_value: string | null }>;
+    expect(configColumns.find((column) => column.name === "browser_backend")?.dflt_value)
+      .toBe("'electron'");
+    expect(configColumns.find((column) => column.name === "capture_mode")?.dflt_value)
+      .toBe("'deep'");
+  });
+
+  it("应该为没有浏览器配置的历史会话返回 electron/deep 默认值", () => {
+    const now = Date.now();
+    db!.prepare(
+      "INSERT INTO sessions (id, name, target_url, status, created_at, stopped_at) VALUES (?, ?, ?, ?, ?, NULL)",
+    ).run("legacy-session", "Legacy", "https://example.com", "stopped", now);
+
+    const session = new SessionsRepo(db!).findById("legacy-session");
+
+    expect(session).toMatchObject({
+      id: "legacy-session",
+      browser_backend: "electron",
+      capture_mode: "deep",
+      browser_profile_id: null,
+      last_browser_version: null,
+    });
+  });
+
+  it("应该持久化会话配置并通过 Session 公共字段返回", () => {
+    const now = Date.now();
+    const sessions = new SessionsRepo(db!);
+    const profiles = new BrowserProfilesRepo(db!);
+    const configs = new SessionBrowserConfigRepo(db!);
+
+    sessions.insert({
+      id: "cloak-session",
+      name: "Cloak",
+      target_url: "https://example.com",
+      status: "stopped",
+      created_at: now,
+      stopped_at: null,
+    });
+    profiles.insert({
+      id: "profile-1",
+      display_name: "Cloak",
+      profile_key: "profile_01HXYZ",
+      cloak_seed: "0x123456789abcdef0",
+      state: "attached",
+      last_used_at: now,
+      retained_at: null,
+      last_error: null,
+      created_at: now,
+      updated_at: now,
+    });
+    const config: SessionBrowserConfig = {
+      session_id: "cloak-session",
+      browser_backend: "cloak",
+      capture_mode: "passive",
+      profile_id: "profile-1",
+      last_browser_version: "cloak-1.2.3",
+      created_at: now,
+      updated_at: now,
+    };
+    configs.upsert(config);
+
+    expect(configs.findBySessionId("cloak-session")).toEqual(config);
+    expect(sessions.findById("cloak-session")).toMatchObject({
+      browser_backend: "cloak",
+      capture_mode: "passive",
+      browser_profile_id: "profile-1",
+      last_browser_version: "cloak-1.2.3",
+    });
+  });
+
+  it("应该跨会话、Profile 和配置仓储回滚事务", () => {
+    const now = Date.now();
+    const sessions = new SessionsRepo(db!);
+    const profiles = new BrowserProfilesRepo(db!);
+    const configs = new SessionBrowserConfigRepo(db!);
+
+    expect(() =>
+      sessions.transaction(() => {
+        sessions.insert({
+          id: "transaction-session",
+          name: "Transaction",
+          target_url: "https://example.com",
+          status: "stopped",
+          created_at: now,
+          stopped_at: null,
+        });
+        profiles.insert({
+          id: "transaction-profile",
+          display_name: "Transaction",
+          profile_key: "transaction-profile-key",
+          cloak_seed: "1234",
+          state: "attached",
+          last_used_at: null,
+          retained_at: null,
+          last_error: null,
+          created_at: now,
+          updated_at: now,
+        });
+        configs.upsert({
+          session_id: "transaction-session",
+          browser_backend: "cloak",
+          capture_mode: "passive",
+          profile_id: "transaction-profile",
+          last_browser_version: null,
+          created_at: now,
+          updated_at: now,
+        });
+        throw new Error("transaction failed");
+      }),
+    ).toThrow("transaction failed");
+
+    expect(sessions.findById("transaction-session")).toBeUndefined();
+    expect(profiles.findById("transaction-profile")).toBeNull();
+    expect(configs.findBySessionId("transaction-session")).toBeNull();
+  });
+
+  it("应该在删除会话后保留 retained profile 及其标签页", () => {
+    const now = Date.now();
+    const sessions = new SessionsRepo(db!);
+    const profiles = new BrowserProfilesRepo(db!);
+    const configs = new SessionBrowserConfigRepo(db!);
+    const tabs = new BrowserTabsRepo(db!);
+    const profile: BrowserProfile = {
+      id: "profile-retained",
+      display_name: "Delete me",
+      profile_key: "profile_01HRETAINED",
+      cloak_seed: "18446744073709551615",
+      state: "attached",
+      last_used_at: now,
+      retained_at: null,
+      last_error: null,
+      created_at: now,
+      updated_at: now,
+    };
+    const tab: BrowserTabState = {
+      id: "tab-1",
+      profile_id: profile.id,
+      url: "https://example.com/account",
+      title: "Account",
+      position: 0,
+      active: true,
+      updated_at: now,
+    };
+
+    sessions.insert({
+      id: "session-to-delete",
+      name: "Delete me",
+      target_url: "https://example.com",
+      status: "stopped",
+      created_at: now,
+      stopped_at: now,
+    });
+    profiles.insert(profile);
+    configs.upsert({
+      session_id: "session-to-delete",
+      browser_backend: "cloak",
+      capture_mode: "deep",
+      profile_id: profile.id,
+      last_browser_version: null,
+      created_at: now,
+      updated_at: now,
+    });
+    tabs.upsert(tab);
+    profiles.updateState(profile.id, "retained", null, now + 1);
+
+    sessions.delete("session-to-delete");
+
+    expect(configs.findBySessionId("session-to-delete")).toBeNull();
+    expect(profiles.findById(profile.id)).toMatchObject({
+      id: profile.id,
+      state: "retained",
+      retained_at: now + 1,
+      cloak_seed: "18446744073709551615",
+    });
+    expect(tabs.findByProfileId(profile.id)).toEqual([tab]);
+  });
+
+  it("应该支持 profile 状态和标签页 CRUD", () => {
+    const profiles = new BrowserProfilesRepo(db!);
+    const tabs = new BrowserTabsRepo(db!);
+    const now = Date.now();
+    const profile: BrowserProfile = {
+      id: "profile-crud",
+      display_name: "CRUD profile",
+      profile_key: "profile_01HCRUD",
+      cloak_seed: "seed-v1",
+      state: "retained",
+      last_used_at: null,
+      retained_at: now,
+      last_error: null,
+      created_at: now,
+      updated_at: now,
+    };
+
+    profiles.insert(profile);
+    expect(profiles.findByProfileKey(profile.profile_key)).toEqual(profile);
+    expect(profiles.findByState("retained")).toEqual([profile]);
+
+    profiles.updateState(profile.id, "delete_failed", "provider timeout", now + 1);
+    expect(profiles.findById(profile.id)).toMatchObject({
+      state: "delete_failed",
+      last_error: "provider timeout",
+      updated_at: now + 1,
+    });
+
+    tabs.replaceForProfile(profile.id, [
+      {
+        id: "tab-b",
+        profile_id: profile.id,
+        url: "https://example.com/b",
+        title: "B",
+        position: 1,
+        active: false,
+        updated_at: now,
+      },
+      {
+        id: "tab-a",
+        profile_id: profile.id,
+        url: "https://example.com/a",
+        title: "A",
+        position: 0,
+        active: true,
+        updated_at: now,
+      },
+    ]);
+    expect(tabs.findByProfileId(profile.id).map((tab) => tab.id)).toEqual([
+      "tab-a",
+      "tab-b",
+    ]);
+    expect(tabs.findById(profile.id, "tab-a")?.active).toBe(true);
+
+    tabs.setActive(profile.id, "tab-b", now + 2);
+    expect(tabs.findById(profile.id, "tab-a")?.active).toBe(false);
+    expect(tabs.findById(profile.id, "tab-b")?.active).toBe(true);
+
+    tabs.delete(profile.id, "tab-a");
+    expect(tabs.findById(profile.id, "tab-a")).toBeNull();
+
+    profiles.delete(profile.id);
+    expect(profiles.findById(profile.id)).toBeNull();
+    expect(tabs.findByProfileId(profile.id)).toEqual([]);
   });
 
 });

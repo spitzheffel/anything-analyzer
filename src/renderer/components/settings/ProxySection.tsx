@@ -20,6 +20,7 @@ export default function ProxySection() {
   const [port, setPort] = useState(1080)
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     window.electronAPI.getProxyConfig().then(config => {
@@ -39,8 +40,23 @@ export default function ProxySection() {
       return
     }
     const config: ProxyConfig = { type: proxyType, host, port, username, password }
-    await window.electronAPI.saveProxyConfig(config)
-    toast.success('代理设置已保存并生效')
+    const impacted = await window.electronAPI.getProxyRestartImpact()
+    if (impacted.length > 0) {
+      const names = impacted.map(session => session.name).join('、')
+      const confirmed = window.confirm(
+        `保存代理将重启以下 CloakBrowser Session：${names}。是否继续？`,
+      )
+      if (!confirmed) return
+    }
+    setSaving(true)
+    try {
+      await window.electronAPI.saveProxyConfig(config)
+      toast.success('代理设置已保存并生效')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : String(error))
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
@@ -102,7 +118,7 @@ export default function ProxySection() {
         </>
       )}
 
-      <Button variant="primary" block onClick={handleSave}>
+      <Button variant="primary" block loading={saving} onClick={handleSave}>
         保存代理设置
       </Button>
     </div>

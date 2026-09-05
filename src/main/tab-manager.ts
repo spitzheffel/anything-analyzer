@@ -1,12 +1,21 @@
 import { EventEmitter } from "events";
 import { v4 as uuidv4 } from "uuid";
 import { BrowserWindow, WebContentsView } from "electron";
-import type { WebContents, Session as ElectronSession } from "electron";
+import type {
+  BrowserWindowConstructorOptions,
+  HandlerDetails,
+  WebContents,
+  Session as ElectronSession,
+} from "electron";
 import { join } from "path";
+import { resolveOwnedTabMap } from "./tab-group-routing";
 
 interface TabInfo {
   id: string;
   view: WebContentsView;
+  /** Fixed at creation; never inferred from whichever Session is visible later. */
+  groupId: string | null;
+  openerTabId?: string;
   url: string;
   title: string;
   isLoading: boolean;
@@ -17,6 +26,17 @@ interface SessionTabGroup {
   tabs: Map<string, TabInfo>;
   activeTabId: string | null;
   electronSession: ElectronSession;
+}
+
+interface CreateOwnedTabOptions {
+  groupId: string | null;
+  electronSession: ElectronSession | null;
+  url?: string;
+  activate: boolean;
+  browserWindowOptions?: BrowserWindowConstructorOptions;
+  openerTabId?: string;
+  /** Popup navigation is completed by Electron to preserve POST and opener state. */
+  loadUrl?: boolean;
 }
 
 /**
@@ -85,19 +105,19 @@ export class TabManager extends EventEmitter {
 
       // Tell renderer to clear its tab list (emit close for every visible tab)
       for (const [, tab] of this.tabs) {
-        this.emit("tab-closed", { tabId: tab.id });
+        this.emit("tab-closed", { tabId: tab.id, groupId: tab.groupId });
       }
     } else if (this.tabs.size > 0) {
       // First-ever switch: there may be initial default-session tabs.
       // Stash them under a special key so they don't leak.
       this.detachAllViews();
       for (const [, tab] of this.tabs) {
-        this.emit("tab-closed", { tabId: tab.id });
+        this.emit("tab-closed", { tabId: tab.id, groupId: tab.groupId });
       }
       // Destroy default-session tabs — they can't be reused in a partition
       for (const [tabId, tab] of this.tabs) {
-        try { tab.view.webContents.close(); } catch { /* ignore */ }
         this.destroyedTabs.add(tabId);
+        try { tab.view.webContents.close(); } catch { /* ignore */ }
       }
     }
 
@@ -129,7 +149,13 @@ export class TabManager extends EventEmitter {
 
       // Notify renderer about restored tabs
       for (const [, tab] of this.tabs) {
-        this.emit("tab-created", { id: tab.id, url: tab.url, title: tab.title });
+        this.emit("tab-created", {
+          id: tab.id,
+          url: tab.url,
+          title: tab.title,
+          groupId: tab.groupId,
+          ...(tab.openerTabId ? { openerTabId: tab.openerTabId } : {}),
+        });
       }
 
       // Activate the tab that was active before
@@ -164,11 +190,11 @@ export class TabManager extends EventEmitter {
     // Otherwise destroy the stashed group
     const group = this.sessionGroups.get(groupId);
     if (group) {
-      for (const [tabId, tab] of group.tabs) {
-        try { tab.view.webContents.close(); } catch { /* ignore */ }
-        this.destroyedTabs.add(tabId);
-      }
       this.sessionGroups.delete(groupId);
+      for (const [tabId, tab] of group.tabs) {
+        this.destroyedTabs.add(tabId);
+        try { tab.view.webContents.close(); } catch { /* ignore */ }
+      }
     }
   }
 
@@ -181,49 +207,12 @@ export class TabManager extends EventEmitter {
    */
   createTab(url?: string): TabInfo {
     if (!this.mainWindow) throw new Error("TabManager not initialized");
-
-    const id = uuidv4();
-    const view = new WebContentsView({
-      webPreferences: {
-        sandbox: true,
-        contextIsolation: true,
-        nodeIntegration: false,
-        preload: join(__dirname, "../preload/target-preload.js"),
-        ...(this.activeElectronSession
-          ? { session: this.activeElectronSession }
-          : {}),
-      },
+    return this.createOwnedTab({
+      groupId: this.currentGroupId,
+      electronSession: this.activeElectronSession,
+      url,
+      activate: true,
     });
-
-    // Set dark background to avoid white flash while loading
-    view.setBackgroundColor("#1a1a2e");
-
-    const tab: TabInfo = { id, view, url: url || "", title: "New Tab", isLoading: false };
-    this.tabs.set(id, tab);
-
-    // Raise max listeners — our code + stealth/capture/injector + Electron internals
-    // easily exceed the default 10 for a single WebContents.
-    view.webContents.setMaxListeners(30);
-
-    // Add view as a child immediately (hidden). activateTab will show it.
-    // We keep ALL tab views as children to avoid native widget detach/reattach
-    // which triggers blink.mojom.WidgetHost crashes.
-    view.setBounds(TabManager.HIDDEN_BOUNDS);
-    try {
-      this.mainWindow.contentView.addChildView(view);
-    } catch { /* window may be destroyed */ }
-
-    this.setupTabListeners(tab);
-    this.activateTab(id);
-
-    if (url) {
-      view.webContents.loadURL(url).catch(() => {
-        // Navigation might fail for invalid URLs
-      });
-    }
-
-    this.emit("tab-created", { id: tab.id, url: tab.url, title: tab.title });
-    return tab;
   }
 
   /**
@@ -263,7 +252,7 @@ export class TabManager extends EventEmitter {
       tab.view.webContents.close();
     } catch { /* already destroyed */ }
 
-    this.emit("tab-closed", { tabId });
+    this.emit("tab-closed", { tabId, groupId: tab.groupId });
   }
 
   /**
@@ -300,7 +289,12 @@ export class TabManager extends EventEmitter {
       } catch { /* view destroyed */ }
     }
 
-    this.emit("tab-activated", { tabId, url: tab.url, title: tab.title });
+    this.emit("tab-activated", {
+      tabId,
+      url: tab.url,
+      title: tab.title,
+      groupId: tab.groupId,
+    });
   }
 
   /**
@@ -350,15 +344,16 @@ export class TabManager extends EventEmitter {
    * Destroy all tabs and clean up (current visible group only).
    */
   destroyAllTabs(): void {
-    for (const [tabId, tab] of this.tabs) {
+    const tabs = [...this.tabs.entries()];
+    this.tabs.clear();
+    this.activeTabId = null;
+    for (const [tabId, tab] of tabs) {
+      this.destroyedTabs.add(tabId);
       if (this.mainWindow) {
         try { this.mainWindow.contentView.removeChildView(tab.view); } catch { /* ignore */ }
       }
       try { tab.view.webContents.close(); } catch { /* ignore */ }
-      this.destroyedTabs.add(tabId);
     }
-    this.tabs.clear();
-    this.activeTabId = null;
   }
 
   /**
@@ -366,13 +361,14 @@ export class TabManager extends EventEmitter {
    */
   destroyEverything(): void {
     this.destroyAllTabs();
-    for (const [, group] of this.sessionGroups) {
+    const groups = [...this.sessionGroups.values()];
+    this.sessionGroups.clear();
+    for (const group of groups) {
       for (const [tabId, tab] of group.tabs) {
-        try { tab.view.webContents.close(); } catch { /* ignore */ }
         this.destroyedTabs.add(tabId);
+        try { tab.view.webContents.close(); } catch { /* ignore */ }
       }
     }
-    this.sessionGroups.clear();
   }
 
   // ---- Internal helpers ----
@@ -391,16 +387,177 @@ export class TabManager extends EventEmitter {
     }
   }
 
+  private createOwnedTab(options: CreateOwnedTabOptions): TabInfo {
+    if (!this.mainWindow) throw new Error("TabManager not initialized");
+    const route = resolveOwnedTabMap(
+      options.groupId,
+      this.currentGroupId,
+      this.tabs,
+      this.sessionGroups,
+    );
+    if (!route) {
+      throw new Error(`Browser Session group ${options.groupId ?? "default"} no longer exists`);
+    }
+
+    const inheritedPreferences = options.browserWindowOptions?.webPreferences ?? {};
+    const view = new WebContentsView({
+      webPreferences: {
+        ...inheritedPreferences,
+        sandbox: true,
+        contextIsolation: true,
+        nodeIntegration: false,
+        preload: join(__dirname, "../preload/target-preload.js"),
+        ...(options.electronSession ? { session: options.electronSession } : {}),
+      },
+    });
+    view.setBackgroundColor("#1a1a2e");
+
+    const tab: TabInfo = {
+      id: uuidv4(),
+      view,
+      groupId: options.groupId,
+      ...(options.openerTabId ? { openerTabId: options.openerTabId } : {}),
+      url: options.url ?? "",
+      title: options.browserWindowOptions?.title || "New Tab",
+      isLoading: false,
+    };
+    route.tabs.set(tab.id, tab);
+
+    // Capture, stealth, and Electron internals legitimately exceed Node's default.
+    view.webContents.setMaxListeners(30);
+    view.setBounds(TabManager.HIDDEN_BOUNDS);
+    if (route.isCurrent) {
+      try {
+        this.mainWindow.contentView.addChildView(view);
+      } catch {
+        // The main window may be closing.
+      }
+    }
+
+    this.setupTabListeners(tab);
+    if (options.activate) {
+      if (route.isCurrent) {
+        this.activateTab(tab.id);
+      } else if (options.groupId !== null) {
+        const group = this.sessionGroups.get(options.groupId);
+        if (group) group.activeTabId = tab.id;
+      }
+    }
+
+    // Hidden Session tabs are announced when their group is restored. Publishing
+    // them now would insert them into the currently visible Session's tab strip.
+    if (route.isCurrent) {
+      this.emit("tab-created", {
+        id: tab.id,
+        url: tab.url,
+        title: tab.title,
+        groupId: tab.groupId,
+        ...(options.openerTabId ? { openerTabId: options.openerTabId } : {}),
+      });
+    }
+
+    if (options.url && (options.loadUrl ?? true)) {
+      view.webContents.loadURL(options.url).catch(() => {
+        // The normal did-fail-load path renders a useful error page.
+      });
+    }
+    return tab;
+  }
+
+  private createPopupTab(
+    opener: TabInfo,
+    details: HandlerDetails,
+    browserWindowOptions: BrowserWindowConstructorOptions,
+  ): TabInfo {
+    return this.createOwnedTab({
+      groupId: opener.groupId,
+      electronSession: opener.view.webContents.session,
+      url: details.url,
+      activate: details.disposition !== "background-tab",
+      browserWindowOptions,
+      openerTabId: opener.id,
+      loadUrl: false,
+    });
+  }
+
+  private handleNativeTabDestroyed(tab: TabInfo): void {
+    if (this.destroyedTabs.has(tab.id)) return;
+    const route = resolveOwnedTabMap(
+      tab.groupId,
+      this.currentGroupId,
+      this.tabs,
+      this.sessionGroups,
+    );
+    if (!route || route.tabs.get(tab.id) !== tab) return;
+
+    const group = tab.groupId === null ? null : this.sessionGroups.get(tab.groupId);
+    const wasActive = route.isCurrent
+      ? this.activeTabId === tab.id
+      : group?.activeTabId === tab.id;
+    route.tabs.delete(tab.id);
+    this.destroyedTabs.add(tab.id);
+
+    if (route.isCurrent && this.mainWindow) {
+      try {
+        this.mainWindow.contentView.removeChildView(tab.view);
+      } catch {
+        // The native view may already have been detached.
+      }
+    }
+
+    if (wasActive) {
+      if (route.isCurrent) this.activeTabId = null;
+      else if (group) group.activeTabId = null;
+    }
+
+    if (!this.isShuttingDown) {
+      if (route.tabs.size === 0) {
+        this.createOwnedTab({
+          groupId: tab.groupId,
+          electronSession: route.isCurrent
+            ? this.activeElectronSession
+            : group?.electronSession ?? null,
+          activate: true,
+        });
+      } else if (wasActive) {
+        const nextId = route.tabs.keys().next().value as string | undefined;
+        if (nextId) {
+          if (route.isCurrent) this.activateTab(nextId);
+          else if (group) group.activeTabId = nextId;
+        }
+      }
+    }
+
+    // Close events are ID-based, so publishing a hidden close cannot mutate the
+    // visible group; it does let capture/backend owners release tab resources.
+    this.emit("tab-closed", {
+      tabId: tab.id,
+      groupId: tab.groupId,
+      isCurrentGroup: route.isCurrent,
+    });
+  }
+
+  private emitTabUpdated(
+    tab: TabInfo,
+    update: { url?: string; title?: string; isLoading?: boolean },
+  ): void {
+    if (tab.groupId !== this.currentGroupId || this.tabs.get(tab.id) !== tab) return;
+    this.emit("tab-updated", {
+      tabId: tab.id,
+      groupId: tab.groupId,
+      ...update,
+    });
+  }
+
   /**
    * Set up event listeners on a tab's WebContents.
    */
   private setupTabListeners(tab: TabInfo): void {
     const wc = tab.view.webContents;
 
-    // Prevent page scripts from closing the window via window.close()
-    // This avoids crashes when the WebContentsView is destroyed unexpectedly.
+    // Ignore a page's beforeunload veto when the app explicitly closes a tab.
     wc.on("will-prevent-unload", (event) => {
-      // Always prevent the close — do not show the "Leave site?" dialog
+      // Ignore the veto and do not show the "Leave site?" dialog.
       event.preventDefault();
     });
 
@@ -408,8 +565,7 @@ export class TabManager extends EventEmitter {
     wc.on("did-start-loading", () => {
       if (wc.isDestroyed()) return;
       tab.isLoading = true;
-      this.emit("tab-updated", {
-        tabId: tab.id,
+      this.emitTabUpdated(tab, {
         url: tab.url,
         title: tab.title,
         isLoading: true,
@@ -418,8 +574,7 @@ export class TabManager extends EventEmitter {
     wc.on("did-stop-loading", () => {
       if (wc.isDestroyed()) return;
       tab.isLoading = false;
-      this.emit("tab-updated", {
-        tabId: tab.id,
+      this.emitTabUpdated(tab, {
         url: tab.url,
         title: tab.title,
         isLoading: false,
@@ -460,29 +615,32 @@ export class TabManager extends EventEmitter {
       wc.loadURL(errorPage).catch(() => {});
     });
 
-    // Override window.close() in page context to make it a no-op
-    wc.on("did-finish-load", () => {
-      if (wc.isDestroyed()) return;
-      wc.executeJavaScript("window.close = function() {};").catch(() => {});
-    });
-    wc.on("did-navigate-in-page", () => {
-      if (wc.isDestroyed()) return;
-      wc.executeJavaScript("window.close = function() {};").catch(() => {});
-    });
-
-    // Intercept window.open / target="_blank" — open as new internal tab
+    // Let Electron create a real child WebContents inside our view. Returning a
+    // custom WebContents preserves opener, POST body, referrer, frameName, and
+    // parsed window features; manually loading details.url would discard them.
     wc.setWindowOpenHandler((details) => {
-      // Create a new tab with the popup URL
-      this.createTab(details.url);
-      return { action: "deny" };
+      const owner = resolveOwnedTabMap(
+        tab.groupId,
+        this.currentGroupId,
+        this.tabs,
+        this.sessionGroups,
+      );
+      if (this.isShuttingDown || !owner || !owner.tabs.has(tab.id)) {
+        return { action: "deny" };
+      }
+      return {
+        action: "allow",
+        outlivesOpener: false,
+        createWindow: (browserWindowOptions) =>
+          this.createPopupTab(tab, details, browserWindowOptions).view.webContents,
+      };
     });
 
     // Track URL changes
     const onNavigate = (): void => {
       if (wc.isDestroyed()) return;
       tab.url = wc.getURL();
-      this.emit("tab-updated", {
-        tabId: tab.id,
+      this.emitTabUpdated(tab, {
         url: tab.url,
         title: tab.title,
       });
@@ -494,8 +652,7 @@ export class TabManager extends EventEmitter {
     wc.on("page-title-updated", (_event, title) => {
       if (wc.isDestroyed()) return;
       tab.title = title;
-      this.emit("tab-updated", {
-        tabId: tab.id,
+      this.emitTabUpdated(tab, {
         url: tab.url,
         title: tab.title,
       });
@@ -505,8 +662,18 @@ export class TabManager extends EventEmitter {
     // Without this, the dead webContents stays in the view tree and any
     // subsequent operation on it crashes the main process.
     wc.on("render-process-gone", (_event, details) => {
-      if (this.destroyedTabs.has(tab.id) || !this.tabs.has(tab.id)) return;
       if (this.isShuttingDown) return;
+      const route = resolveOwnedTabMap(
+        tab.groupId,
+        this.currentGroupId,
+        this.tabs,
+        this.sessionGroups,
+      );
+      if (
+        this.destroyedTabs.has(tab.id) ||
+        !route ||
+        route.tabs.get(tab.id) !== tab
+      ) return;
 
       console.warn(`[TabManager] Renderer process gone for tab ${tab.id}: ${details.reason}`);
 
@@ -515,15 +682,21 @@ export class TabManager extends EventEmitter {
       const esc = (s: string): string => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
       const safeUrl = esc(crashUrl);
 
-      // Remove the crashed view from the window and destroy it
-      if (this.mainWindow) {
+      // Remove ownership before close(), whose destroyed event can fire inline.
+      route.tabs.delete(tab.id);
+      this.destroyedTabs.add(tab.id);
+      const group = tab.groupId === null ? null : this.sessionGroups.get(tab.groupId);
+      if (route.isCurrent && this.activeTabId === tab.id) this.activeTabId = null;
+      else if (!route.isCurrent && group?.activeTabId === tab.id) group.activeTabId = null;
+      if (route.isCurrent && this.mainWindow) {
         try { this.mainWindow.contentView.removeChildView(tab.view); } catch { /* already removed */ }
       }
       try { tab.view.webContents.close(); } catch { /* already dead */ }
-      this.tabs.delete(tab.id);
-      this.destroyedTabs.add(tab.id);
-      if (this.activeTabId === tab.id) this.activeTabId = null;
-      this.emit("tab-closed", { tabId: tab.id });
+      this.emit("tab-closed", {
+        tabId: tab.id,
+        groupId: tab.groupId,
+        isCurrentGroup: route.isCurrent,
+      });
 
       // Create a new tab with crash info page
       const crashPage = `data:text/html;charset=utf-8,${encodeURIComponent(`
@@ -544,39 +717,21 @@ export class TabManager extends EventEmitter {
           <button onclick="location.href=${JSON.stringify(crashUrl).replace(/"/g, '&quot;')}">\\u91CD\\u65B0\\u52A0\\u8F7D</button>
         </div></body></html>
       `)}`;
-      this.createTab(crashPage);
+      this.createOwnedTab({
+        groupId: tab.groupId,
+        electronSession: route.isCurrent
+          ? this.activeElectronSession
+          : group?.electronSession ?? null,
+        url: crashPage,
+        activate: true,
+      });
     });
 
-    // Handle unexpected WebContents destruction (e.g., window.close()
-    // bypassed our safeguards). Clean up gracefully instead of crashing.
+    // Script-created child windows are allowed to call window.close(). Route
+    // cleanup through the tab's fixed owner group, even when another Session is
+    // currently visible.
     wc.on("destroyed", () => {
-      if (this.destroyedTabs.has(tab.id) || !this.tabs.has(tab.id)) return;
-
-      // During app quit, WebContents are expected to be destroyed; do not recreate tabs.
-      if (this.isShuttingDown) {
-        this.tabs.delete(tab.id);
-        this.destroyedTabs.add(tab.id);
-        if (this.activeTabId === tab.id) this.activeTabId = null;
-        this.emit("tab-closed", { tabId: tab.id });
-        return;
-      }
-
-      // If this is the last tab, replace it with a new blank tab
-      // instead of letting the app crash with no view.
-      if (this.tabs.size <= 1) {
-        this.tabs.delete(tab.id);
-        this.destroyedTabs.add(tab.id);
-        this.activeTabId = null;
-        // Remove destroyed view from window
-        if (this.mainWindow) {
-          try { this.mainWindow.contentView.removeChildView(tab.view); } catch { /* already removed */ }
-        }
-        // Create a replacement tab
-        this.createTab();
-        this.emit("tab-closed", { tabId: tab.id });
-      } else {
-        this.closeTab(tab.id);
-      }
+      this.handleNativeTabDestroyed(tab);
     });
   }
 }

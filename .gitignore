@@ -1,6 +1,10 @@
 node_modules/
 out/
+out-internal/
 dist/
+dist-internal/
+dist-internal-*/
+output/
 release/
 
 # TypeScript build cache

@@ -76,4 +76,84 @@ describe("macOS 发布工作流", () => {
     expect(entitlements).toContain("com.apple.security.cs.allow-unsigned-executable-memory");
     expect(entitlements).toContain("com.apple.security.cs.disable-library-validation");
   });
+
+  it("应该将 Cloak 运行时限制在独立 Internal 构建", () => {
+    const publicBuilder = readWorkspaceFile("electron-builder.yml");
+    const internalBuilder = readWorkspaceFile("electron-builder.internal.yml");
+    const packageJson = readWorkspaceFile("package.json");
+    const mainEntry = readWorkspaceFile("src/main/index.ts");
+    const viteConfig = readWorkspaceFile("electron.vite.config.ts");
+
+    // These globs exclude both a hoisted package and pnpm's nested physical copy.
+    expect(publicBuilder).toContain("!**/node_modules/cloakbrowser{,/**}");
+    expect(publicBuilder).toContain("!**/node_modules/playwright-core{,/**}");
+    expect(publicBuilder).toContain("!**/node_modules/mmdb-lib{,/**}");
+    expect(publicBuilder).toContain("!**/node_modules/socks-proxy-agent{,/**}");
+    expect(publicBuilder).toContain("!**/node_modules/tar{,/**}");
+    expect(publicBuilder).toContain("!**/node_modules/chownr{,/**}");
+    expect(publicBuilder).toContain("!**/.cloakbrowser{,/**}");
+    expect(internalBuilder).not.toContain("!**/node_modules/cloakbrowser");
+    expect(internalBuilder).not.toContain("!**/node_modules/playwright-core");
+    expect(internalBuilder).toContain("!**/.cloakbrowser{,/**}");
+
+    expect(publicBuilder).toContain("'out{,/**}'");
+    expect(internalBuilder).toContain("'out-internal{,/**}'");
+    expect(internalBuilder).toContain("main: ./out-internal/main/index.js");
+    expect(viteConfig).toContain(
+      "const outputRoot = buildChannel === 'internal' ? 'out-internal' : 'out'",
+    );
+
+    for (const builderConfig of [publicBuilder, internalBuilder]) {
+      expect(builderConfig).toContain("'package.json'");
+      expect(builderConfig).toContain("from: resources");
+      expect(builderConfig).toContain("to: resources");
+      expect(builderConfig).toContain("- icon.png");
+      expect(builderConfig).toContain("!src{,/**}");
+      expect(builderConfig).toContain("!tests{,/**}");
+      expect(builderConfig).toContain("!**/tests{,/**}");
+      expect(builderConfig).toContain("!**/__tests__{,/**}");
+      expect(builderConfig).toContain("!dist{,/**}");
+      expect(builderConfig).toContain("!dist-internal{,/**}");
+      expect(builderConfig).toContain("!output{,/**}");
+      expect(builderConfig).toContain("!**/browser-profiles/cloak{,/**}");
+      expect(builderConfig).toContain("!**/license.key");
+      expect(builderConfig).toContain("!**/.license_cache");
+      expect(builderConfig).toContain("!**/chromium-[0-9]*{,/**}");
+      expect(builderConfig).toContain("!**/_download_*.{zip,tar.gz}");
+    }
+
+    expect(publicBuilder).toMatch(/^appId: com\.anything\.analyzer\r?$/m);
+    expect(publicBuilder).toMatch(/^productName: Anything Analyzer\r?$/m);
+    expect(internalBuilder).toContain("appId: com.anything.analyzer.internal");
+    expect(internalBuilder).toContain("productName: Anything Analyzer Internal");
+    expect(internalBuilder).toContain("output: dist-internal");
+    expect(internalBuilder).toContain(
+      'artifactName: "Anything-Analyzer-Internal-Setup-${version}.${ext}"',
+    );
+    expect(internalBuilder).toContain(
+      'artifactName: "Anything-Analyzer-Internal-${version}-${arch}.${ext}"',
+    );
+    expect(internalBuilder).toContain(
+      'artifactName: "Anything-Analyzer-Internal-${version}.${ext}"',
+    );
+    expect(internalBuilder).toContain("publish: null");
+    expect(mainEntry).toContain('if (BUILD_CHANNEL === "internal")');
+    expect(mainEntry).toContain('app.setName("Anything Analyzer Internal")');
+    expect(mainEntry).toContain(
+      'app.setPath("userData", join(app.getPath("appData"), "Anything Analyzer Internal"))',
+    );
+
+    expect(packageJson).toContain('"cloakbrowser": "0.5.10"');
+    expect(packageJson).toContain('"playwright-core": "1.62.1"');
+    expect(packageJson).toContain('"build:internal": "electron-vite build --mode internal"');
+    expect(packageJson).toContain(
+      '"dev:internal": "electron-vite dev --mode internal --entry out-internal/main/index.js"',
+    );
+    expect(packageJson).toContain(
+      '"preview:internal": "electron-vite preview --mode internal --entry out-internal/main/index.js"',
+    );
+    expect(packageJson).toContain(
+      '"package:internal": "pnpm build:internal && electron-builder --config electron-builder.internal.yml --publish never"',
+    );
+  });
 });

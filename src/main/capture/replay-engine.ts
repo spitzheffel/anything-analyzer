@@ -1,256 +1,263 @@
-import type { WebContents } from 'electron'
-import type { InteractionEvent } from '@shared/types'
+import type { InteractionEvent } from "@shared/types";
+import type { BrowserTarget, CdpLease } from "../browser/contracts";
 
-interface ReplayOptions {
-  speed: number       // Playback speed multiplier (1.0 = original)
-  skipMoves: boolean  // Whether to skip hover/move events
+export interface ReplayOptions {
+  speed: number;
+  skipMoves: boolean;
 }
 
-/**
- * ReplayEngine — Replays recorded interaction events via CDP Input domain.
- */
+export interface BrowserAction {
+  type: string;
+  selector?: string;
+  text?: string;
+  url?: string;
+  x?: number;
+  y?: number;
+  scrollDelta?: number;
+}
+
+export interface ReplayResult {
+  success: boolean;
+  stepsCompleted: number;
+  error?: string;
+}
+
+/** Replays recorded interactions through a shared, reference-counted CDP lease. */
 export class ReplayEngine {
-  private aborted = false
-
-  /** Send a CDP command, checking for destroyed WebContents first. */
-  private async cdp(
-    wc: WebContents,
-    method: string,
-    params: Record<string, unknown> = {}
-  ): Promise<Record<string, unknown>> {
-    if (wc.isDestroyed()) throw new Error('WebContents destroyed during replay')
-    return wc.debugger.sendCommand(method, params) as Promise<Record<string, unknown>>
-  }
-
-  /** Safely load a URL, checking for destroyed WebContents first. */
-  private async safeLoadURL(wc: WebContents, url: string): Promise<void> {
-    if (wc.isDestroyed()) throw new Error('WebContents destroyed during replay')
-    await wc.loadURL(url)
-  }
+  private activeRun: AbortController | null = null;
 
   async replay(
-    webContents: WebContents,
+    target: BrowserTarget,
     events: InteractionEvent[],
-    options: ReplayOptions = { speed: 1, skipMoves: false }
-  ): Promise<{ success: boolean; stepsCompleted: number; error?: string }> {
-    this.aborted = false
-    let completed = 0
-
-    if (webContents.isDestroyed()) {
-      return { success: false, stepsCompleted: 0, error: 'WebContents destroyed' }
+    options: ReplayOptions = { speed: 1, skipMoves: false },
+  ): Promise<ReplayResult> {
+    if (!Number.isFinite(options.speed) || options.speed <= 0) {
+      return { success: false, stepsCompleted: 0, error: "Replay speed must be greater than 0" };
+    }
+    if (target.isClosed()) {
+      return { success: false, stepsCompleted: 0, error: "Browser target is closed" };
     }
 
-    if (!webContents.debugger.isAttached()) {
-      try {
-        webContents.debugger.attach('1.3')
-      } catch (err) {
-        return { success: false, stepsCompleted: 0, error: `Failed to attach debugger: ${(err as Error).message}` }
-      }
-    }
+    this.abort();
+    const controller = new AbortController();
+    this.activeRun = controller;
+    let completed = 0;
+    let lease: CdpLease | null = null;
 
     try {
-      for (let i = 0; i < events.length; i++) {
-        if (this.aborted || webContents.isDestroyed()) break
-        const event = events[i]
+      lease = await (await target.getCdpTransport()).acquire("replay");
+      for (let index = 0; index < events.length; index += 1) {
+        this.assertActive(target, controller.signal);
+        const event = events[index];
+        if (options.skipMoves && event.type === "hover") continue;
 
-        if (options.skipMoves && event.type === 'hover') {
-          continue
-        }
+        await this.executeStep(target, lease, event, controller.signal);
+        completed += 1;
 
-        await this.executeStep(webContents, event)
-        completed++
-
-        // Wait between events based on original timing
-        const nextEvent = events[i + 1]
+        const nextEvent = events[index + 1];
         if (nextEvent) {
-          const delay = (nextEvent.timestamp - event.timestamp) / options.speed
-          await this.wait(Math.min(Math.max(delay, 10), 3000))
+          const delay = (nextEvent.timestamp - event.timestamp) / options.speed;
+          await this.wait(Math.min(Math.max(delay, 10), 3_000), controller.signal);
         }
       }
-    } catch (err) {
-      return { success: false, stepsCompleted: completed, error: (err as Error).message }
+      return { success: true, stepsCompleted: completed };
+    } catch (error) {
+      const aborted = controller.signal.aborted;
+      return {
+        success: false,
+        stepsCompleted: completed,
+        error: aborted ? "Replay cancelled" : errorMessage(error),
+      };
+    } finally {
+      await lease?.release().catch(() => undefined);
+      if (this.activeRun === controller) this.activeRun = null;
     }
-
-    return { success: !this.aborted, stepsCompleted: completed }
   }
 
   abort(): void {
-    this.aborted = true
+    this.activeRun?.abort();
+    this.activeRun = null;
   }
 
-  /** Execute a single browser action (for MCP execute_browser_action tool) */
   async executeAction(
-    webContents: WebContents,
-    action: { type: string; selector?: string; text?: string; url?: string; x?: number; y?: number; scrollDelta?: number }
+    target: BrowserTarget,
+    action: BrowserAction,
   ): Promise<{ success: boolean; error?: string }> {
-    if (webContents.isDestroyed()) {
-      return { success: false, error: 'WebContents destroyed' }
-    }
+    if (target.isClosed()) return { success: false, error: "Browser target is closed" };
 
-    if (!webContents.debugger.isAttached()) {
-      try {
-        webContents.debugger.attach('1.3')
-      } catch (err) {
-        return { success: false, error: `Failed to attach debugger: ${(err as Error).message}` }
-      }
-    }
-
+    let lease: CdpLease | null = null;
     try {
+      lease = await (await target.getCdpTransport()).acquire("replay:action");
       switch (action.type) {
-        case 'click': {
+        case "click": {
           if (action.selector) {
-            const coords = await this.resolveElementCenter(webContents, action.selector)
-            if (!coords) return { success: false, error: `Element not found: ${action.selector}` }
-            await this.clickAt(webContents, coords.x, coords.y)
+            const coords = await this.resolveElementCenter(lease, action.selector);
+            if (!coords) return { success: false, error: `Element not found: ${action.selector}` };
+            await this.clickAt(lease, coords.x, coords.y, 1);
           } else if (action.x != null && action.y != null) {
-            await this.clickAt(webContents, action.x, action.y)
+            await this.clickAt(lease, action.x, action.y, 1);
           } else {
-            return { success: false, error: 'click requires selector or x/y coordinates' }
+            return { success: false, error: "click requires selector or x/y coordinates" };
           }
-          break
+          break;
         }
-        case 'type': {
-          if (!action.text) return { success: false, error: 'type requires text' }
+        case "type": {
+          if (action.text == null) return { success: false, error: "type requires text" };
           if (action.selector) {
-            await this.cdp(webContents, 'Runtime.evaluate', {
-              expression: `document.querySelector(${JSON.stringify(action.selector)})?.focus()`
-            })
-            await this.wait(50)
+            await lease.send("Runtime.evaluate", {
+              expression: `document.querySelector(${JSON.stringify(action.selector)})?.focus()`,
+            });
           }
-          for (const char of action.text) {
-            await this.cdp(webContents, 'Input.dispatchKeyEvent', {
-              type: 'char', text: char
-            })
-            await this.wait(20)
-          }
-          break
+          await lease.send("Input.insertText", { text: action.text });
+          break;
         }
-        case 'scroll': {
-          const x = action.x ?? 400
-          const y = action.y ?? 300
-          const delta = action.scrollDelta ?? 200
-          await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-            type: 'mouseWheel', x, y, deltaX: 0, deltaY: delta
-          })
-          break
-        }
-        case 'navigate': {
-          if (!action.url) return { success: false, error: 'navigate requires url' }
-          await this.safeLoadURL(webContents, action.url)
-          break
-        }
+        case "scroll":
+          await lease.send("Input.dispatchMouseEvent", {
+            type: "mouseWheel",
+            x: action.x ?? 400,
+            y: action.y ?? 300,
+            deltaX: 0,
+            deltaY: action.scrollDelta ?? 200,
+          });
+          break;
+        case "navigate":
+          if (!action.url) return { success: false, error: "navigate requires url" };
+          await target.navigate(action.url);
+          break;
         default:
-          return { success: false, error: `Unknown action type: ${action.type}` }
+          return { success: false, error: `Unknown action type: ${action.type}` };
       }
-      return { success: true }
-    } catch (err) {
-      return { success: false, error: (err as Error).message }
+      return { success: true };
+    } catch (error) {
+      return { success: false, error: errorMessage(error) };
+    } finally {
+      await lease?.release().catch(() => undefined);
     }
   }
 
-  private async executeStep(webContents: WebContents, event: InteractionEvent): Promise<void> {
+  private async executeStep(
+    target: BrowserTarget,
+    lease: CdpLease,
+    event: InteractionEvent,
+    signal: AbortSignal,
+  ): Promise<void> {
     switch (event.type) {
-      case 'click':
-      case 'dblclick': {
-        const x = event.viewport_x ?? event.x ?? 0
-        const y = event.viewport_y ?? event.y ?? 0
-        const clickCount = event.type === 'dblclick' ? 2 : 1
-        await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x, y
-        })
-        await this.wait(30)
-        await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed', x, y, button: 'left', clickCount
-        })
-        await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x, y, button: 'left', clickCount
-        })
-        break
-      }
-      case 'input': {
+      case "click":
+      case "dblclick":
+        await this.clickAt(
+          lease,
+          event.viewport_x ?? event.x ?? 0,
+          event.viewport_y ?? event.y ?? 0,
+          event.type === "dblclick" ? 2 : 1,
+        );
+        break;
+      case "input":
         if (event.selector && event.input_value != null) {
-          await this.cdp(webContents, 'Runtime.evaluate', {
-            expression: `document.querySelector(${JSON.stringify(event.selector)})?.focus()`
-          })
-          await this.wait(50)
-          await this.cdp(webContents, 'Runtime.evaluate', {
-            expression: `{
-              const el = document.querySelector(${JSON.stringify(event.selector)});
-              if (el) { el.value = ''; el.dispatchEvent(new Event('input', {bubbles:true})); }
-            }`
-          })
-          for (const char of event.input_value) {
-            await this.cdp(webContents, 'Input.dispatchKeyEvent', {
-              type: 'char', text: char
-            })
-            await this.wait(15)
-          }
+          await lease.send("Runtime.evaluate", {
+            expression: `(() => {
+              const element = document.querySelector(${JSON.stringify(event.selector)});
+              if (!element) return false;
+              element.focus();
+              if ("value" in element) element.value = "";
+              element.dispatchEvent(new Event("input", { bubbles: true }));
+              return true;
+            })()`,
+            returnByValue: true,
+          });
+          await lease.send("Input.insertText", { text: event.input_value });
         }
-        break
-      }
-      case 'scroll': {
-        await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-          type: 'mouseWheel',
+        break;
+      case "scroll":
+        await lease.send("Input.dispatchMouseEvent", {
+          type: "mouseWheel",
           x: event.viewport_x ?? 400,
           y: event.viewport_y ?? 300,
           deltaX: event.scroll_dx ?? 0,
-          deltaY: event.scroll_dy ?? 0
-        })
-        break
-      }
-      case 'navigate': {
-        if (event.url) {
-          await this.safeLoadURL(webContents, event.url)
-          await this.wait(500)
-        }
-        break
-      }
-      case 'hover': {
+          deltaY: event.scroll_dy ?? 0,
+        });
+        break;
+      case "navigate":
+        if (event.url) await target.navigate(event.url);
+        break;
+      case "hover":
         if (event.path) {
-          const points = JSON.parse(event.path) as Array<{ x: number; y: number; t: number }>
+          const points = JSON.parse(event.path) as Array<{ x: number; y: number; t: number }>;
           for (const point of points) {
-            if (this.aborted) break
-            await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-              type: 'mouseMoved', x: point.x, y: point.y
-            })
-            await this.wait(20)
+            this.assertActive(target, signal);
+            await lease.send("Input.dispatchMouseEvent", {
+              type: "mouseMoved",
+              x: point.x,
+              y: point.y,
+            });
+            await this.wait(20, signal);
           }
         }
-        break
-      }
+        break;
     }
   }
 
-  private async clickAt(webContents: WebContents, x: number, y: number): Promise<void> {
-    await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-      type: 'mouseMoved', x, y
-    })
-    await this.wait(30)
-    await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-      type: 'mousePressed', x, y, button: 'left', clickCount: 1
-    })
-    await this.cdp(webContents, 'Input.dispatchMouseEvent', {
-      type: 'mouseReleased', x, y, button: 'left', clickCount: 1
-    })
+  private async clickAt(
+    lease: CdpLease,
+    x: number,
+    y: number,
+    clickCount: number,
+  ): Promise<void> {
+    await lease.send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+    await lease.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x,
+      y,
+      button: "left",
+      clickCount,
+    });
+    await lease.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x,
+      y,
+      button: "left",
+      clickCount,
+    });
   }
 
   private async resolveElementCenter(
-    webContents: WebContents,
-    selector: string
+    lease: CdpLease,
+    selector: string,
   ): Promise<{ x: number; y: number } | null> {
-    const result = await this.cdp(webContents, 'Runtime.evaluate', {
-      expression: `(function() {
-        const el = document.querySelector(${JSON.stringify(selector)});
-        if (!el) return null;
-        const r = el.getBoundingClientRect();
-        return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+    const result = await lease.send<{
+      result?: { value?: { x: number; y: number } | null };
+    }>("Runtime.evaluate", {
+      expression: `(() => {
+        const element = document.querySelector(${JSON.stringify(selector)});
+        if (!element) return null;
+        const rect = element.getBoundingClientRect();
+        return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
       })()`,
-      returnByValue: true
-    }) as { result?: { value?: { x: number; y: number } | null } }
-    return result?.result?.value ?? null
+      returnByValue: true,
+    });
+    return result.result?.value ?? null;
   }
 
-  private wait(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, Math.max(ms, 5)))
+  private assertActive(target: BrowserTarget, signal: AbortSignal): void {
+    if (signal.aborted) throw new Error("Replay cancelled");
+    if (target.isClosed()) throw new Error("Browser target closed during replay");
   }
+
+  private wait(ms: number, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) return Promise.reject(new Error("Replay cancelled"));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, Math.max(ms, 5));
+      signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timer);
+          reject(new Error("Replay cancelled"));
+        },
+        { once: true },
+      );
+    });
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

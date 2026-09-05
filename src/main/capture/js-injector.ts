@@ -1,57 +1,98 @@
 import { EventEmitter } from "events";
-import type { WebContents } from "electron";
 import { readFileSync } from "fs";
 import { join } from "path";
+import type { BrowserTarget } from "../browser/contracts";
+
+const HOOK_BINDING = "__anythingAnalyzerHookBinding";
+const initializedTargets = new WeakSet<BrowserTarget>();
+const hookDispatchers = new WeakMap<
+  BrowserTarget,
+  { callback: ((data: unknown) => void) | null }
+>();
 
 /**
- * JsInjector — Manages hook script injection into a target browser WebContents.
- * Only handles script injection and re-injection on navigation.
- * IPC hook data listening is handled externally (SessionManager).
+ * Installs the Deep-mode JavaScript hooks through the browser-neutral target
+ * contract. The init script is registered once and before the first navigation.
  */
 export class JsInjector extends EventEmitter {
-  private webContents: WebContents | null = null;
+  private target: BrowserTarget | null = null;
   private hookScriptContent: string | null = null;
-  private navigationHandler: (() => void) | null = null;
 
-  start(webContents: WebContents): void {
-    this.webContents = webContents;
+  async start(
+    target: BrowserTarget,
+    onHook?: (data: unknown) => void,
+  ): Promise<void> {
+    this.target = target;
     this.loadHookScript();
-    this.injectHooks();
+    if (!this.hookScriptContent) return;
 
-    this.navigationHandler = () => {
-      this.injectHooks();
-    };
-    webContents.on("did-navigate", this.navigationHandler);
-    webContents.on("did-navigate-in-page", this.navigationHandler);
+    let dispatcher = hookDispatchers.get(target);
+    if (!dispatcher) {
+      dispatcher = { callback: onHook ?? null };
+      hookDispatchers.set(target, dispatcher);
+    } else {
+      dispatcher.callback = onHook ?? null;
+    }
+
+    if (initializedTargets.has(target)) return;
+
+    const source = buildHookSource(this.hookScriptContent, target.backendKind === "cloak");
+    if (target.backendKind === "cloak") {
+      await target.exposeBinding(HOOK_BINDING, (call) => {
+        hookDispatchers.get(target)?.callback?.(call.args[0]);
+      });
+    }
+
+    await target.addInitScript(source);
+    initializedTargets.add(target);
+    // Electron's initial WebContentsView has no document and keeps
+    // executeJavaScript() pending until a navigation happens. The init script
+    // already covers that first document; immediate injection is only needed
+    // for a target that has loaded something.
+    if (target.url) await target.evaluate(source).catch(() => undefined);
   }
 
   stop(): void {
-    if (this.webContents && this.navigationHandler) {
-      this.webContents.removeListener("did-navigate", this.navigationHandler);
-      this.webContents.removeListener(
-        "did-navigate-in-page",
-        this.navigationHandler,
-      );
+    if (this.target) {
+      const dispatcher = hookDispatchers.get(this.target);
+      if (dispatcher) dispatcher.callback = null;
     }
-    this.webContents = null;
-    this.navigationHandler = null;
+    this.target = null;
   }
 
   private loadHookScript(): void {
     if (this.hookScriptContent) return;
     try {
-      const scriptPath = join(__dirname, "../preload/hook-script.js");
-      this.hookScriptContent = readFileSync(scriptPath, "utf-8");
+      this.hookScriptContent = readFileSync(
+        join(__dirname, "../preload/hook-script.js"),
+        "utf-8",
+      );
     } catch {
-      this.hookScriptContent = `console.log('[AnythingAnalyzer] Hook script not found')`;
+      this.hookScriptContent =
+        "console.warn('[AnythingAnalyzer] Hook script not found')";
     }
   }
+}
 
-  private injectHooks(): void {
-    if (!this.webContents || !this.hookScriptContent) return;
-    if (this.webContents.isDestroyed()) return;
-    this.webContents.executeJavaScript(this.hookScriptContent, true).catch(() => {
-      /* not ready or destroyed */
-    });
-  }
+function buildHookSource(hookSource: string, useBinding: boolean): string {
+  const bridge = useBinding
+    ? `
+      window.addEventListener("message", (event) => {
+        if (event.data?.type === "ar-hook") {
+          void globalThis["${HOOK_BINDING}"]?.(event.data);
+        }
+      });
+    `
+    : "";
+  return `
+    (() => {
+      if (globalThis.__anythingAnalyzerHookInstalled) return;
+      Object.defineProperty(globalThis, "__anythingAnalyzerHookInstalled", {
+        value: true,
+        configurable: false
+      });
+      ${bridge}
+      ${hookSource}
+    })();
+  `;
 }

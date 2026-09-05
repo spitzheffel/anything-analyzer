@@ -2,16 +2,20 @@ import React, { useState, useEffect, useCallback } from 'react'
 import { Button, Input, Modal, Empty } from '../ui'
 import { IconPlus, IconDelete } from '../ui/Icons'
 import { useLocale } from '../i18n'
-import type { Session } from '../../shared/types'
+import type { BrowserBackendKind, CaptureMode, CreateSessionOptions, Session } from '../../shared/types'
 import styles from './SessionList.module.css'
+
+declare const __AA_BUILD_CHANNEL__: 'public' | 'internal'
+const cloakBuildAvailable = typeof __AA_BUILD_CHANNEL__ !== 'undefined' && __AA_BUILD_CHANNEL__ === 'internal'
 
 interface SessionListProps {
   sessions: Session[]
   currentSessionId: string | null
   onSelect: (id: string) => void
-  onCreate: (name: string, url: string) => Promise<void>
-  onDelete: (id: string) => Promise<void>
+  onCreate: (name: string, url: string, options?: CreateSessionOptions) => Promise<void>
+  onDelete: (id: string, retainProfile?: boolean) => Promise<void>
   onOpenSettings: () => void
+  onModalVisibilityChange?: (open: boolean) => void
   activeRequestCount?: number
   /** Incrementing counter to trigger open-create-modal from outside */
   createTrigger?: number
@@ -44,6 +48,7 @@ const SessionList: React.FC<SessionListProps> = ({
   onCreate,
   onDelete,
   onOpenSettings,
+  onModalVisibilityChange,
   activeRequestCount = 0,
   createTrigger = 0,
 }) => {
@@ -52,9 +57,13 @@ const SessionList: React.FC<SessionListProps> = ({
   const [creating, setCreating] = useState(false)
   const [hoveredId, setHoveredId] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [deleteCandidate, setDeleteCandidate] = useState<Session | null>(null)
+  const [retainProfile, setRetainProfile] = useState(false)
 
   const [formName, setFormName] = useState('')
   const [formUrl, setFormUrl] = useState('')
+  const [backend, setBackend] = useState<BrowserBackendKind>('electron')
+  const [captureMode, setCaptureMode] = useState<CaptureMode>('deep')
   const [nameError, setNameError] = useState('')
   const [urlError, setUrlError] = useState('')
   const [appVersion, setAppVersion] = useState('')
@@ -64,8 +73,8 @@ const SessionList: React.FC<SessionListProps> = ({
   }, [])
 
   const openModal = () => {
+    onModalVisibilityChange?.(true)
     setModalOpen(true)
-    window.electronAPI.setTargetViewVisible(false)
   }
 
   // Open create modal when triggered externally
@@ -75,15 +84,13 @@ const SessionList: React.FC<SessionListProps> = ({
 
   const closeModal = () => {
     setModalOpen(false)
+    onModalVisibilityChange?.(false)
     setFormName('')
     setFormUrl('')
+    setBackend('electron')
+    setCaptureMode('deep')
     setNameError('')
     setUrlError('')
-    // Only restore WebContentsView if a session is selected;
-    // otherwise the empty guide needs to stay clickable
-    if (currentSessionId) {
-      window.electronAPI.setTargetViewVisible(true)
-    }
   }
 
   const validate = (): boolean => {
@@ -112,7 +119,7 @@ const SessionList: React.FC<SessionListProps> = ({
     if (!validate()) return
     setCreating(true)
     try {
-      await onCreate(formName.trim(), formUrl.trim())
+      await onCreate(formName.trim(), formUrl.trim(), { backend, captureMode })
       closeModal()
     } catch {
       // create failed
@@ -121,11 +128,25 @@ const SessionList: React.FC<SessionListProps> = ({
     }
   }
 
-  const handleDelete = async (e: React.MouseEvent, id: string) => {
+  const requestDelete = (e: React.MouseEvent, session: Session) => {
     e.stopPropagation()
+    onModalVisibilityChange?.(true)
+    setRetainProfile(false)
+    setDeleteCandidate(session)
+  }
+
+  const closeDeleteModal = () => {
+    setDeleteCandidate(null)
+    onModalVisibilityChange?.(false)
+  }
+
+  const handleDelete = async () => {
+    if (!deleteCandidate) return
+    const id = deleteCandidate.id
     setDeletingId(id)
     try {
-      await onDelete(id)
+      await onDelete(id, deleteCandidate.browser_backend === 'cloak' && retainProfile)
+      closeDeleteModal()
     } catch {
       // delete failed
     } finally {
@@ -170,6 +191,9 @@ const SessionList: React.FC<SessionListProps> = ({
                   <div className={styles.sessionName}>{session.name}</div>
                   <div className={styles.sessionMeta}>
                     <span style={{ color: status.color }}>{status.symbol} {t(status.labelKey as any)}</span>
+                    <span className={styles.backendBadge}>
+                      {session.browser_backend === 'cloak' ? 'Cloak' : 'Electron'} · {session.capture_mode === 'passive' ? 'Passive' : 'Deep'}
+                    </span>
                     {isActive && activeRequestCount > 0 && (
                       <span className={styles.sessionCount}> · {activeRequestCount} reqs</span>
                     )}
@@ -180,7 +204,7 @@ const SessionList: React.FC<SessionListProps> = ({
                 {isHovered && (
                   <span
                     className={`${styles.deleteBtn} ${deletingId === session.id ? styles.deleteBtnDisabled : ''}`}
-                    onClick={(e) => handleDelete(e, session.id)}
+                    onClick={(e) => requestDelete(e, session)}
                   >
                     <IconDelete size={13} />
                   </span>
@@ -230,6 +254,38 @@ const SessionList: React.FC<SessionListProps> = ({
           {nameError && <div className={styles.formError}>{nameError}</div>}
         </div>
         <div className={styles.formGroup}>
+          <label className={styles.formLabel}>Browser backend</label>
+          <div className={styles.segmented}>
+            <button
+              type="button"
+              className={backend === 'electron' ? styles.segmentActive : ''}
+              onClick={() => { setBackend('electron'); setCaptureMode('deep') }}
+            >Electron</button>
+            <button
+              type="button"
+              disabled={!cloakBuildAvailable}
+              title={cloakBuildAvailable ? 'Open CloakBrowser in a separate window' : 'Available in Internal builds only'}
+              className={backend === 'cloak' ? styles.segmentActive : ''}
+              onClick={() => { setBackend('cloak'); setCaptureMode('passive') }}
+            >Cloak</button>
+          </div>
+          {!cloakBuildAvailable && <div className={styles.formHint}>Cloak is available only in Internal builds.</div>}
+        </div>
+        {backend === 'cloak' && (
+          <div className={styles.formGroup}>
+            <label className={styles.formLabel}>Capture mode</label>
+            <div className={styles.segmented}>
+              <button type="button" className={captureMode === 'passive' ? styles.segmentActive : ''} onClick={() => setCaptureMode('passive')}>Passive</button>
+              <button type="button" className={captureMode === 'deep' ? styles.segmentActive : ''} onClick={() => setCaptureMode('deep')}>Deep</button>
+            </div>
+            <div className={styles.formHint}>
+              {captureMode === 'passive'
+                ? 'CDP network capture without page hooks. Interaction recording is disabled.'
+                : 'Enables page hooks and interaction recording; sites may detect the instrumentation.'}
+            </div>
+          </div>
+        )}
+        <div className={styles.formGroup}>
           <label className={styles.formLabel}>{t('session.targetUrl')}</label>
           <Input
             value={formUrl}
@@ -239,6 +295,32 @@ const SessionList: React.FC<SessionListProps> = ({
           <div className={styles.formHint}>Leave empty to capture traffic via proxy only</div>
           {urlError && <div className={styles.formError}>{urlError}</div>}
         </div>
+      </Modal>
+
+      <Modal
+        open={deleteCandidate !== null}
+        onClose={closeDeleteModal}
+        title="Delete session"
+        footer={
+          <>
+            <Button onClick={closeDeleteModal}>Cancel</Button>
+            <Button variant="danger" loading={deletingId !== null} onClick={handleDelete}>Delete</Button>
+          </>
+        }
+      >
+        <div className={styles.deleteText}>
+          Delete <strong>{deleteCandidate?.name}</strong> and all captured data? This cannot be undone.
+        </div>
+        {deleteCandidate?.browser_backend === 'cloak' && (
+          <label className={styles.checkboxRow}>
+            <input
+              type="checkbox"
+              checked={retainProfile}
+              onChange={(event) => setRetainProfile(event.target.checked)}
+            />
+            <span>Keep the Cloak profile, login state, and tabs for later recovery</span>
+          </label>
+        )}
       </Modal>
     </div>
   )

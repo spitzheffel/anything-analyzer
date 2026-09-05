@@ -3,6 +3,7 @@ import * as http from "http";
 import * as https from "https";
 import * as net from "net";
 import { networkInterfaces } from "os";
+import type { Duplex } from "stream";
 import * as tls from "tls";
 import * as url from "url";
 import {
@@ -199,9 +200,12 @@ export class MitmProxyServer extends EventEmitter {
         if (!settled) { settled = true; fn(); }
       };
 
-      // Use tls.connect for HTTPS proxy, net.connect for HTTP
-      const connectFn = proxy.type === "https" ? tls.connect : net.connect;
-      const proxySocket = connectFn(proxy.port, proxy.host, () => {
+      // Use tls.connect for HTTPS proxy, net.connect for HTTP.
+      const proxySocket: net.Socket = proxy.type === "https"
+        ? tls.connect({ port: proxy.port, host: proxy.host })
+        : net.connect({ port: proxy.port, host: proxy.host });
+      const connectedEvent = proxy.type === "https" ? "secureConnect" : "connect";
+      proxySocket.once(connectedEvent, () => {
         // Build CONNECT request with optional auth
         let connectReq = `CONNECT ${hostname}:${port} HTTP/1.1\r\nHost: ${hostname}:${port}\r\n`;
         if (proxy.username && proxy.password) {
@@ -460,7 +464,7 @@ export class MitmProxyServer extends EventEmitter {
 
     clientReq.on("end", () => {
       const reqBody = Buffer.concat(reqBodyChunks);
-      const headers = { ...clientReq.headers };
+      const headers: http.IncomingHttpHeaders = { ...clientReq.headers };
 
       // Remove proxy-specific headers
       delete headers["proxy-connection"];
@@ -480,7 +484,7 @@ export class MitmProxyServer extends EventEmitter {
         // Add proxy auth if configured
         if (proxy.username && proxy.password) {
           const auth = Buffer.from(`${proxy.username}:${proxy.password}`).toString("base64");
-          options.headers!["proxy-authorization"] = `Basic ${auth}`;
+          headers["proxy-authorization"] = `Basic ${auth}`;
         }
       } else if (proxy && proxy.type === "socks5") {
         // SOCKS5: connect to target through SOCKS, then send normal request
@@ -578,7 +582,7 @@ export class MitmProxyServer extends EventEmitter {
 
   private handleConnect(
     req: http.IncomingMessage,
-    clientSocket: net.Socket,
+    clientSocket: Duplex,
     head: Buffer,
   ): void {
     const [hostname, portStr] = (req.url || "").split(":");
@@ -878,7 +882,12 @@ export class MitmProxyServer extends EventEmitter {
         method: clientReq.method,
         headers: { ...clientReq.headers, host: hostHeader },
         rejectUnauthorized: false,
-        socket: tunnelSocket, // Use the pre-established tunnel
+        createConnection: () =>
+          tls.connect({
+            socket: tunnelSocket,
+            servername: hostname,
+            rejectUnauthorized: false,
+          }),
       };
 
       const proxyReq = https.request(options, (proxyRes) => {

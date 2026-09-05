@@ -113,6 +113,7 @@ export function runMigrations(db: Database.Database): void {
   migrateAddAiRequestLogsTable(db)
   migrateBackfillAnthropicCachedInputTokens(db)
   migrateAddInteractionEventsTable(db)
+  migrateAddBrowserPersistenceTables(db)
 }
 
 /**
@@ -250,4 +251,60 @@ export function migrateAddInteractionEventsTable(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_interactions_session_seq ON interaction_events(session_id, sequence);
     CREATE INDEX IF NOT EXISTS idx_interactions_type ON interaction_events(session_id, type);
   `)
+}
+
+/**
+ * Migration 011: Add browser backend configuration and recoverable Cloak state.
+ * Profiles and their tabs intentionally outlive sessions so a retained browser
+ * identity can be attached to a newly-created analysis session.
+ */
+export function migrateAddBrowserPersistenceTables(db: Database.Database): void {
+  db.transaction(() => {
+    db.exec(`
+    CREATE TABLE IF NOT EXISTS browser_profiles (
+      id            TEXT PRIMARY KEY,
+      display_name  TEXT NOT NULL,
+      profile_key   TEXT NOT NULL UNIQUE,
+      cloak_seed    TEXT NOT NULL,
+      state         TEXT NOT NULL CHECK (
+        state IN ('attached', 'retained', 'deleting', 'delete_failed', 'missing')
+      ),
+      last_used_at  INTEGER,
+      retained_at   INTEGER,
+      last_error    TEXT,
+      created_at    INTEGER NOT NULL,
+      updated_at    INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS session_browser_config (
+      session_id            TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      browser_backend       TEXT NOT NULL DEFAULT 'electron' CHECK (
+        browser_backend IN ('electron', 'cloak')
+      ),
+      capture_mode          TEXT NOT NULL DEFAULT 'deep' CHECK (
+        capture_mode IN ('passive', 'deep')
+      ),
+      profile_id            TEXT UNIQUE REFERENCES browser_profiles(id) ON DELETE RESTRICT,
+      last_browser_version  TEXT,
+      created_at            INTEGER NOT NULL,
+      updated_at            INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS browser_tabs (
+      profile_id  TEXT NOT NULL REFERENCES browser_profiles(id) ON DELETE CASCADE,
+      id          TEXT NOT NULL,
+      url         TEXT NOT NULL,
+      title       TEXT NOT NULL DEFAULT '',
+      position    INTEGER NOT NULL DEFAULT 0,
+      active      INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+      updated_at  INTEGER NOT NULL,
+      PRIMARY KEY (profile_id, id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_browser_profiles_state
+      ON browser_profiles(state, last_used_at);
+    CREATE INDEX IF NOT EXISTS idx_browser_tabs_profile_position
+      ON browser_tabs(profile_id, position);
+    `)
+  })()
 }

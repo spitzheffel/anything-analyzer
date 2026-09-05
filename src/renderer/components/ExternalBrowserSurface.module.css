@@ -1,0 +1,135 @@
+.surface {
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-height: 260px;
+  place-items: center;
+  background: var(--color-content);
+}
+
+.content {
+  display: flex;
+  width: min(100%, 360px);
+  padding: 24px;
+  flex-direction: column;
+  align-items: center;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.browserMark {
+  display: grid;
+  width: 42px;
+  height: 42px;
+  margin-bottom: 12px;
+  place-items: center;
+  border: 1px solid var(--color-border-hover);
+  border-radius: 8px;
+  background: var(--color-surface);
+  color: var(--text-primary);
+}
+
+.title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+  line-height: var(--line-height-tight);
+  letter-spacing: 0;
+}
+
+.statusRow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  gap: 9px;
+  margin: 7px 0 18px;
+}
+
+.divider {
+  width: 1px;
+  height: 12px;
+  background: var(--color-border-hover);
+}
+
+.version {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-3xs);
+  white-space: nowrap;
+}
+
+.error {
+  max-width: 100%;
+  margin: -6px 0 12px;
+  color: var(--color-error);
+  font-size: var(--font-size-2xs);
+  line-height: var(--line-height-normal);
+  overflow-wrap: anywhere;
+}
+
+.modeRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+}
+
+.modeLabel {
+  color: var(--text-muted);
+  font-size: var(--font-size-2xs);
+}
+
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(2, 76px);
+  padding: 2px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: var(--color-surface);
+}
+
+.segmented button {
+  height: 26px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-2xs);
+}
+
+.segmented button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.segmented .segmentActive {
+  background: var(--color-surface-hover);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.modeHint {
+  margin: -8px 0 12px;
+  color: var(--text-muted);
+  font-size: var(--font-size-3xs);
+}
+
+@media (max-width: 520px) {
+  .content {
+    padding: 18px;
+  }
+
+  .statusRow {
+    align-items: center;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .divider {
+    display: none;
+  }
+}

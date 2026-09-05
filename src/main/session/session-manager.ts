@@ -1,739 +1,2011 @@
+import { randomInt } from "node:crypto";
+import { ipcMain } from "electron";
+import type { Session as ElectronSession, WebContents } from "electron";
 import { v4 as uuidv4 } from "uuid";
-import { ipcMain, session as electronSession } from "electron";
-import type { WebContents, Session as ElectronSession } from "electron";
-import type { Session, ProxyConfig, RawInteractionData } from "@shared/types";
-import type { SessionsRepo } from "../db/repositories";
+import type {
+  BrowserBackendKind,
+  BrowserProfile,
+  BrowserSessionRuntimeStatus,
+  BrowserTab,
+  BrowserTabState,
+  CaptureMode,
+  CloakRuntimePolicy,
+  CloakRuntimeStatus,
+  CreateSessionOptions,
+  DeleteSessionOptions,
+  ProxyConfig,
+  RawInteractionData,
+  Session,
+  SessionBrowserConfig,
+} from "@shared/types";
+import type {
+  BrowserProfilesRepo,
+  BrowserTabsRepo,
+  InteractionEventsRepo,
+  SessionBrowserConfigRepo,
+  SessionsRepo,
+} from "../db/repositories";
+import type { ProfileStore } from "../fingerprint/profile-store";
 import type { TabManager } from "../tab-manager";
-import { CdpManager } from "../cdp/cdp-manager";
+import { BrowserCoordinator } from "../browser/browser-coordinator";
+import type { BrowserCoordinatorEvent } from "../browser/browser-coordinator";
+import {
+  BrowserBackendError,
+  type BrowserContext,
+  type BrowserTarget,
+} from "../browser/contracts";
+import type {
+  CloakRuntime,
+} from "../browser/cloak-runtime";
 import { CaptureEngine } from "../capture/capture-engine";
+import { InteractionRecorder } from "../capture/interaction-recorder";
 import { JsInjector } from "../capture/js-injector";
 import { StorageCollector } from "../capture/storage-collector";
-import { InteractionRecorder } from "../capture/interaction-recorder";
-import type { InteractionEventsRepo } from "../db/repositories";
-import type { ProfileStore } from '../fingerprint/profile-store';
-import { buildStealthScript } from '../../preload/stealth-script';
-import { applyHttpSpoofing, removeHttpSpoofing } from '../fingerprint/http-spoofing';
+import { CdpManager } from "../cdp/cdp-manager";
+import { buildStealthScript } from "../../preload/stealth-script";
 
-/** Per-tab capture bundle: CDP + JS hooks + storage + stealth cleanup */
 interface TabCaptureBundle {
+  sessionId: string;
+  target: BrowserTarget;
   cdp: CdpManager;
-  injector: JsInjector;
   storage: StorageCollector;
-  stealthCleanup?: () => void;
 }
 
+interface TargetScope {
+  sessionId: string;
+  tabId: string;
+}
+
+interface CaptureStateSnapshot {
+  sessionId: string;
+  status: Session["status"];
+}
+
+interface CloakCapacityAttempt {
+  evictedActiveSessionId: string | null;
+}
+
+const PUBLIC_CLOAK_STATUS: CloakRuntimeStatus = {
+  available: false,
+  state: "unavailable",
+  loggedIn: false,
+  plan: null,
+  seats: 0,
+  policy: "strict",
+  configuredVersion: null,
+  actualVersion: null,
+  error: "CloakBrowser is not available in this build",
+  errorCode: "BACKEND_NOT_AVAILABLE",
+  downloadProgress: null,
+};
+
 /**
- * SessionManager — Manages the lifecycle of capture sessions.
- * Coordinates per-tab CDP, JS injection, storage collection, and capture engine.
- * Also provides standalone stealth (fingerprint) mode independent of capture.
+ * Owns analysis Session lifecycle and delegates every browser operation to the
+ * BrowserCoordinator. Only one analysis capture can run at a time; browser
+ * contexts may remain warm subject to the Cloak seat/LRU limit.
  */
 export class SessionManager {
   private currentSessionId: string | null = null;
-  private tabManager: TabManager | null = null;
-  private tabCaptures = new Map<string, TabCaptureBundle>();
-
-  /** Cached Electron partition sessions keyed by app session ID */
-  private electronSessions = new Map<string, ElectronSession>();
-  /** The app session ID currently driving the browser partition */
-  private activePartitionSessionId: string | null = null;
-
-  /** Global hook IPC handler (registered once per session) */
-  private hookIpcHandler:
-    | ((event: Electron.IpcMainEvent, data: unknown) => void)
-    | null = null;
-  /** Interaction recording IPC handler */
-  private interactionIpcHandler:
-    | ((event: Electron.IpcMainEvent, data: unknown) => void)
-    | null = null;
-  /** Per-session interaction recorder instance */
+  private activeBrowserSessionId: string | null = null;
+  private rendererWebContents: WebContents | null = null;
+  private lastProxyConfig: ProxyConfig | null = null;
+  private readonly tabCaptures = new Map<string, TabCaptureBundle>();
+  private browserLifecycleTail: Promise<void> = Promise.resolve();
+  private readonly pendingCaptureAttachments = new Map<string, Promise<void>>();
+  private readonly suspendingCaptureSessions = new Set<string>();
+  private readonly injectors = new Map<string, JsInjector>();
+  private readonly pendingTargetPreparations = new Map<string, Promise<void>>();
   private interactionRecorder: InteractionRecorder | null = null;
-  /** TabManager event listeners */
-  private tabCreatedHandler:
-    | ((tabInfo: { id: string; url: string; title: string }) => void)
-    | null = null;
-  private tabClosedHandler: ((data: { tabId: string }) => void) | null = null;
+  private interactionRecorderSessionId: string | null = null;
+  private readonly electronTargetScopes = new Map<number, TargetScope>();
+  private readonly preparedElectronStealthTargets = new WeakSet<BrowserTarget>();
+  private readonly openingSessions = new Set<string>();
+  private readonly sessionErrors = new Map<string, string>();
+  private readonly intentionalContextCloses = new Set<string>();
+  private readonly crashRecoveryAttempts = new Map<string, number>();
+  private shuttingDown = false;
+  private shutdownPromise: Promise<void> | null = null;
 
-  /** Standalone stealth mode — event-based fingerprint injection (no CDP) */
-  private stealthSessionId: string | null = null;
-  private stealthTabManager: TabManager | null = null;
-  private stealthCleanups = new Map<string, () => void>();
-  private stealthTabCreatedHandler:
-    | ((tabInfo: { id: string; url: string; title: string }) => void)
-    | null = null;
-  private stealthTabClosedHandler: ((data: { tabId: string }) => void) | null = null;
+  private readonly hookIpcHandler = (
+    event: Electron.IpcMainEvent,
+    data: unknown,
+  ): void => {
+    const scope = this.electronTargetScopes.get(event.sender.id);
+    if (!scope || scope.sessionId !== this.currentSessionId) return;
+    this.handlePageMessage(scope.sessionId, data);
+  };
+
+  private readonly unsubscribeCoordinator: () => void;
 
   constructor(
-    private sessionsRepo: SessionsRepo,
-    private captureEngine: CaptureEngine,
-    private profileStore?: ProfileStore,
-    private interactionEventsRepo?: InteractionEventsRepo,
-  ) {}
-
-  // =============================================
-  // Partition Session Management
-  // =============================================
-
-  /** Get or create an isolated Electron session for the given app session. */
-  private getElectronSession(sessionId: string): ElectronSession {
-    if (!this.electronSessions.has(sessionId)) {
-      this.electronSessions.set(
-        sessionId,
-        electronSession.fromPartition(`persist:session-${sessionId}`),
-      );
-    }
-    return this.electronSessions.get(sessionId)!;
-  }
-
-  /** Return the Electron session for the currently active app session (capture or stealth). */
-  getActiveElectronSession(): ElectronSession | null {
-    const activeId = this.currentSessionId ?? this.stealthSessionId;
-    if (!activeId) return null;
-    return this.getElectronSession(activeId);
-  }
-
-  /** Apply proxy config to an Electron session. */
-  private async applyProxyToSession(
-    elSession: ElectronSession,
-    config: ProxyConfig | null,
-  ): Promise<void> {
-    if (!config || config.type === "none") {
-      await elSession.setProxy({ mode: "direct" });
-      return;
-    }
-
-    // Chromium proxyRules do NOT support inline credentials (user:pass@host)
-    // — that causes ERR_NO_SUPPORTED_PROXIES. Use plain host:port instead.
-    // Proxy auth is handled via app.on('login') in index.ts.
-    await elSession.setProxy({
-      proxyRules: `${config.type}://${config.host}:${config.port}`,
+    private readonly sessionsRepo: SessionsRepo,
+    private readonly captureEngine: CaptureEngine,
+    private readonly profileStore: ProfileStore | undefined,
+    private readonly interactionEventsRepo: InteractionEventsRepo | undefined,
+    private readonly browserCoordinator: BrowserCoordinator,
+    private readonly browserConfigRepo: SessionBrowserConfigRepo,
+    private readonly browserProfilesRepo: BrowserProfilesRepo,
+    private readonly browserTabsRepo: BrowserTabsRepo,
+    private readonly cloakRuntime?: CloakRuntime,
+  ) {
+    ipcMain.on("capture:hook-data", this.hookIpcHandler);
+    this.unsubscribeCoordinator = browserCoordinator.onEvent((event) => {
+      void this.handleBrowserEvent(event).catch((error) => {
+        this.sessionErrors.set(event.sessionId, errorMessage(error));
+        console.error(
+          `[SessionManager] Browser event ${event.type} failed for ${event.sessionId}:`,
+          error,
+        );
+      });
     });
   }
 
-  /**
-   * Switch the browser environment to a specific session's partition.
-   * Uses TabManager's session group to hide/restore tabs instead of destroying them.
-   */
-  private async switchBrowserToSession(
-    sessionId: string,
-    tabManager: TabManager,
-    proxyConfig?: ProxyConfig | null,
-  ): Promise<boolean> {
-    if (this.activePartitionSessionId === sessionId) return false;
+  createSession(
+    name: string,
+    targetUrl: string,
+    options: CreateSessionOptions = {},
+  ): Session {
+    const backend = options.backend ?? "electron";
+    const captureMode = options.captureMode ?? (backend === "cloak" ? "passive" : "deep");
+    this.assertBackendAndMode(backend, captureMode);
 
-    const elSession = this.getElectronSession(sessionId);
-
-    // Apply upstream proxy to the new partition (before tabs open)
-    if (proxyConfig !== undefined) {
-      await this.applyProxyToSession(elSession, proxyConfig ?? null);
-    }
-
-    const createdNew = tabManager.switchSessionGroup(sessionId, elSession);
-    this.activePartitionSessionId = sessionId;
-    return createdNew;
-  }
-
-  /**
-   * Create a new session record.
-   */
-  createSession(name: string, targetUrl: string): Session {
+    const now = Date.now();
+    const sessionId = uuidv4();
     const session: Session = {
-      id: uuidv4(),
-      name,
-      target_url: targetUrl,
+      id: sessionId,
+      name: name.trim() || "Untitled Session",
+      target_url: targetUrl.trim(),
       status: "stopped",
-      created_at: Date.now(),
+      created_at: now,
       stopped_at: null,
     };
-    this.sessionsRepo.insert(session);
-    // Auto-generate fingerprint profile for the new session
-    if (this.profileStore) {
-      this.profileStore.getOrCreate(session.id);
-    }
-    return session;
-  }
 
-  /**
-   * Start capturing on a session. Attaches capture pipelines to all existing tabs
-   * and auto-attaches to new tabs created during the session.
-   */
-  async startCapture(
-    sessionId: string,
-    tabManager: TabManager,
-    rendererWebContents: WebContents,
-    proxyConfig?: ProxyConfig | null,
-  ): Promise<void> {
-    const session = this.sessionsRepo.findById(sessionId);
-    if (!session) throw new Error(`Session ${sessionId} not found`);
-
-    // Stop any running capture first
-    if (this.currentSessionId) {
-      await this.stopCapture(this.currentSessionId);
-    }
-
-    // Suspend standalone stealth listeners — full capture pipeline includes stealth injection
-    if (this.stealthSessionId) {
-      this.suspendStealthListeners();
-    }
-
-    // Switch browser to this session's isolated partition
-    await this.switchBrowserToSession(sessionId, tabManager, proxyConfig);
-
-    this.currentSessionId = sessionId;
-    this.tabManager = tabManager;
-
-    // Publish the state transition before any optional capture setup. The renderer
-    // must never wait for a CDP debugger attach before enabling Pause/Stop.
-    this.sessionsRepo.updateStatus(sessionId, "running");
-
-    // Start capture engine
-    this.captureEngine.start(sessionId, rendererWebContents);
-
-    // Apply fingerprint HTTP spoofing to the session's partition
-    if (this.profileStore) {
-      const profile = this.profileStore.getOrCreate(sessionId);
-      applyHttpSpoofing(this.getElectronSession(sessionId), profile);
-    }
-
-    // Register global hook IPC listener (once for all tabs)
-    this.hookIpcHandler = (_event, data) => {
-      const hookData = data as {
-        type: string;
-        hookType: string;
-        functionName: string;
-        arguments: string;
-        result: string | null;
-        callStack: string | null;
-        timestamp: number;
-      };
-      if (hookData.type === "ar-hook") {
-        this.captureEngine.handleHookCaptured({
-          hookType: hookData.hookType,
-          functionName: hookData.functionName,
-          arguments: hookData.arguments,
-          result: hookData.result,
-          callStack: hookData.callStack,
-          timestamp: hookData.timestamp,
-        });
-      }
-    };
-    ipcMain.on("capture:hook-data", this.hookIpcHandler);
-
-    // Register interaction recording IPC handler
-    if (this.interactionEventsRepo) {
-      this.interactionRecorder = new InteractionRecorder(this.interactionEventsRepo);
-      this.interactionIpcHandler = (_event, data) => {
-        const msg = data as { type: string } & Record<string, unknown>;
-        if (msg.type === 'ar-interaction') {
-          this.interactionRecorder?.handleInteraction({
-            type: msg.interactionType as RawInteractionData['type'],
-            timestamp: msg.timestamp as number,
-            x: msg.x as number | undefined,
-            y: msg.y as number | undefined,
-            viewportX: msg.viewportX as number | undefined,
-            viewportY: msg.viewportY as number | undefined,
-            selector: msg.selector as string | undefined,
-            xpath: msg.xpath as string | undefined,
-            tagName: msg.tagName as string | undefined,
-            elementText: msg.elementText as string | undefined,
-            attributes: msg.attributes as Record<string, string> | undefined,
-            boundingRect: msg.boundingRect as RawInteractionData['boundingRect'],
-            inputValue: msg.inputValue as string | undefined,
-            key: msg.key as string | undefined,
-            scrollX: msg.scrollX as number | undefined,
-            scrollY: msg.scrollY as number | undefined,
-            scrollDX: msg.scrollDX as number | undefined,
-            scrollDY: msg.scrollDY as number | undefined,
-            url: msg.url as string,
-            pageTitle: msg.pageTitle as string | undefined,
-            path: msg.path as RawInteractionData['path'],
-          });
-        }
-      };
-      ipcMain.on("capture:hook-data", this.interactionIpcHandler);
-    }
-
-    // Start interaction recorder (before tab attachment so injectIntoWebContents works)
-    if (this.interactionRecorder) {
-      this.interactionRecorder.start(sessionId, rendererWebContents);
-    }
-
-    // Mark the session running BEFORE optional CDP/injection setup.  On Windows
-    // debugger attachment can take a long time (or be held by another debugger);
-    // keeping this update at the end made the renderer look like Start did
-    // nothing and left Pause/Stop disabled indefinitely.
-    this.sessionsRepo.updateStatus(sessionId, "running");
-
-    // Attach capture pipelines in the background.  A failing or slow tab must
-    // not block the capture state machine or make the control buttons inert;
-    // proxy capture remains available while a browser tab retries/gets skipped.
-    for (const tab of tabManager.getAllTabs()) {
-      if (!tab.view.webContents.isDestroyed()) {
-        void this.attachCaptureToTab(tab.id, tab.view.webContents).catch((err) => {
-          console.warn(`[SessionManager] Capture attach failed for tab ${tab.id}:`, (err as Error).message);
-        });
-      }
-    }
-
-    // Auto-attach to new tabs
-    this.tabCreatedHandler = async (tabInfo) => {
-      const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
-      if (tab && !tab.view.webContents.isDestroyed()) {
-        await this.attachCaptureToTab(tab.id, tab.view.webContents);
-      }
-    };
-    this.tabClosedHandler = (data) => {
-      this.detachCaptureFromTab(data.tabId);
-    };
-    tabManager.on("tab-created", this.tabCreatedHandler);
-    tabManager.on("tab-closed", this.tabClosedHandler);
-
-    // Update session status
-    this.sessionsRepo.updateStatus(sessionId, "running");
-  }
-
-  /**
-   * Attach CDP, JS injector, and storage collector to a single tab.
-   * If CDP attachment fails (e.g. blank page, debugger conflict), the tab is
-   * silently skipped — proxy-based capture still works without CDP.
-   */
-  private async attachCaptureToTab(
-    tabId: string,
-    webContents: WebContents,
-  ): Promise<void> {
-    if (this.tabCaptures.has(tabId)) return;
-    if (webContents.isDestroyed()) return;
-
-    // Interaction recording does not require CDP. Attach it first so element
-    // actions remain available even when debugger attachment is unavailable.
-    if (this.interactionRecorder) {
-      await this.interactionRecorder.injectIntoWebContents(webContents);
-    }
-
-    const cdp = new CdpManager();
-    const injector = new JsInjector();
-    const storage = new StorageCollector();
-
-    // Start CDP manager — non-fatal if it fails
-    try {
-      await cdp.start(webContents);
-    } catch (err) {
-      console.warn(`[SessionManager] CDP attach failed for tab ${tabId}, skipping browser capture:`, (err as Error).message);
-      cdp.detach();
-      return;
-    }
-
-    cdp.on("response-captured", (data) => {
-      this.captureEngine.handleResponseCaptured(data);
-    });
-    cdp.on("frame-navigated", () => {
-      storage.triggerCollection();
-    });
-
-    // Start JS injector (injection only, no IPC listener)
-    injector.start(webContents);
-
-    // Inject stealth script via CDP — runs BEFORE any page JS (critical for WAF challenges)
-    let stealthCleanup: (() => void) | undefined;
-    if (this.profileStore) {
-      const profile = this.profileStore.getOrCreate(this.currentSessionId!);
-      const stealthJs = buildStealthScript(JSON.stringify(profile));
-
-      // Use Page.addScriptToEvaluateOnNewDocument for early injection
-      // This ensures stealth runs before any page JavaScript, including WAF challenge scripts
-      try {
-        await cdp.sendCommand('Page.addScriptToEvaluateOnNewDocument', { source: stealthJs });
-      } catch (err) {
-        console.warn('[SessionManager] Failed to register stealth via CDP:', (err as Error).message);
-      }
-
-      // Also inject into current page immediately (for pages already loaded)
-      if (!webContents.isDestroyed()) {
-        webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready */ });
-      }
-
-      stealthCleanup = () => {
-        // CDP scripts are automatically removed when debugger detaches — no manual cleanup needed
+    let profile: BrowserProfile | null = null;
+    if (backend === "cloak") {
+      profile = {
+        id: uuidv4(),
+        display_name: session.name,
+        profile_key: `profile_${uuidv4().replaceAll("-", "")}`,
+        cloak_seed: String(randomInt(10_000, 2_147_483_647)),
+        state: "attached",
+        last_used_at: null,
+        retained_at: null,
+        last_error: null,
+        created_at: now,
+        updated_at: now,
       };
     }
 
-    // Start storage collector
-    storage.start(this.currentSessionId!, webContents);
-    storage.on("storage-collected", (data) => {
-      this.captureEngine.handleStorageCollected(data);
-    });
-
-    this.tabCaptures.set(tabId, { cdp, injector, storage, stealthCleanup });
-  }
-
-  /**
-   * Detach and clean up capture pipeline for a tab.
-   */
-  private detachCaptureFromTab(tabId: string): void {
-    const bundle = this.tabCaptures.get(tabId);
-    if (!bundle) return;
-
-    // Stop storage FIRST — its stop() does a final collectAll() that needs the debugger alive
-    bundle.storage.stop();
-    bundle.injector.stop();
-    bundle.stealthCleanup?.();
-    bundle.cdp.stop();
-    bundle.cdp.detach();
-    this.tabCaptures.delete(tabId);
-  }
-
-  /**
-   * Pause capturing — stops interception on all tabs but keeps session open.
-   */
-  async pauseCapture(sessionId: string): Promise<void> {
-    if (this.currentSessionId !== sessionId) return;
-
-    for (const bundle of this.tabCaptures.values()) {
-      bundle.storage.stop();
-      bundle.injector.stop();
-      await bundle.cdp.stop();
-    }
-
-    // Pause interaction recorder
-    this.interactionRecorder?.pause();
-
-    this.sessionsRepo.updateStatus(sessionId, "paused");
-  }
-
-  /**
-   * Resume capturing after a pause — re-attaches capture pipelines to all tabs.
-   */
-  async resumeCapture(sessionId: string): Promise<void> {
-    if (this.currentSessionId !== sessionId) return;
-    const session = this.sessionsRepo.findById(sessionId);
-    if (!session || session.status !== "paused") return;
-
-    // Detach stale bundles then re-attach fresh ones
-    for (const tabId of Array.from(this.tabCaptures.keys())) {
-      this.detachCaptureFromTab(tabId);
-    }
-
-    if (this.tabManager) {
-      for (const tab of this.tabManager.getAllTabs()) {
-        if (!tab.view.webContents.isDestroyed()) {
-          await this.attachCaptureToTab(tab.id, tab.view.webContents);
-        }
-      }
-    }
-
-    // Resume interaction recorder
-    this.interactionRecorder?.resume();
-
-    this.sessionsRepo.updateStatus(sessionId, "running");
-  }
-
-  /**
-   * Stop capturing and finalize the session.
-   */
-  async stopCapture(sessionId: string): Promise<void> {
-    if (this.currentSessionId !== sessionId) return;
-
-    // Detach all tab capture pipelines
-    for (const tabId of Array.from(this.tabCaptures.keys())) {
-      this.detachCaptureFromTab(tabId);
-    }
-
-    // Remove TabManager event listeners
-    if (this.tabManager) {
-      if (this.tabCreatedHandler)
-        this.tabManager.removeListener("tab-created", this.tabCreatedHandler);
-      if (this.tabClosedHandler)
-        this.tabManager.removeListener("tab-closed", this.tabClosedHandler);
-    }
-    this.tabCreatedHandler = null;
-    this.tabClosedHandler = null;
-    this.tabManager = null;
-
-    // Remove global hook IPC listener
-    if (this.hookIpcHandler) {
-      ipcMain.removeListener("capture:hook-data", this.hookIpcHandler);
-      this.hookIpcHandler = null;
-    }
-
-    // Stop interaction recorder
-    if (this.interactionIpcHandler) {
-      ipcMain.removeListener("capture:hook-data", this.interactionIpcHandler);
-      this.interactionIpcHandler = null;
-    }
-    if (this.interactionRecorder) {
-      this.interactionRecorder.stop();
-      this.interactionRecorder = null;
-    }
-
-    this.captureEngine.stop();
-    // Remove HTTP spoofing from the session's partition
-    removeHttpSpoofing(this.getElectronSession(sessionId));
-    this.sessionsRepo.updateStatus(sessionId, "stopped", Date.now());
-    this.currentSessionId = null;
-
-    // Restore standalone stealth if it was active before capture started
-    if (this.stealthSessionId && this.stealthTabManager) {
-      const profile = this.profileStore?.getOrCreate(this.stealthSessionId);
-      if (profile) {
-        applyHttpSpoofing(this.getElectronSession(this.stealthSessionId), profile);
-      }
-      this.restoreStealthListeners();
-    }
-  }
-
-  // =============================================
-  // Standalone Stealth (Fingerprint-Only) Mode
-  // Uses webContents events + executeJavaScript (no CDP debugger).
-  // CDP is only used during capture mode for early injection.
-  // =============================================
-
-  /**
-   * Enable standalone stealth mode — applies fingerprint injection to all tabs
-   * WITHOUT starting capture. Uses webContents events (no CDP debugger attachment).
-   */
-  async enableStealth(
-    sessionId: string,
-    tabManager: TabManager,
-    proxyConfig?: ProxyConfig | null,
-  ): Promise<void> {
-    if (!this.profileStore) return;
-
-    // If capture is running, stealth is already handled by the capture pipeline
-    if (this.currentSessionId) return;
-
-    // Disable previous stealth if switching sessions
-    if (this.stealthSessionId && this.stealthSessionId !== sessionId) {
-      await this.disableStealth();
-    }
-
-    // Avoid re-enabling for the same session
-    if (this.stealthSessionId === sessionId) return;
-
-    this.stealthSessionId = sessionId;
-    this.stealthTabManager = tabManager;
-
-    // Switch browser to this session's isolated partition (hides old tabs, restores/creates new)
-    const createdNew = await this.switchBrowserToSession(sessionId, tabManager, proxyConfig);
-
-    // If this is the session's first visit (blank tab created), navigate to target URL
-    if (createdNew) {
-      const session = this.sessionsRepo.findById(sessionId);
-      if (session?.target_url) {
-        const wc = tabManager.getActiveWebContents();
-        if (wc && !wc.isDestroyed()) {
-          wc.loadURL(session.target_url).catch(() => {});
-        }
-      }
-    }
-
-    // Apply HTTP-level spoofing to the session's partition
-    const elSession = this.getElectronSession(sessionId);
-    const profile = this.profileStore.getOrCreate(sessionId);
-    applyHttpSpoofing(elSession, profile);
-
-    // Attach stealth to all existing tabs
-    for (const tab of tabManager.getAllTabs()) {
-      if (!tab.view.webContents.isDestroyed()) {
-        this.attachStealthListeners(tab.id, tab.view.webContents);
-      }
-    }
-
-    // Auto-attach/detach for new/closed tabs
-    this.stealthTabCreatedHandler = (tabInfo) => {
-      const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
-      if (tab && !tab.view.webContents.isDestroyed()) {
-        this.attachStealthListeners(tab.id, tab.view.webContents);
-      }
-    };
-    this.stealthTabClosedHandler = (data) => {
-      this.detachStealthListeners(data.tabId);
-    };
-    tabManager.on("tab-created", this.stealthTabCreatedHandler);
-    tabManager.on("tab-closed", this.stealthTabClosedHandler);
-  }
-
-  /**
-   * Disable standalone stealth mode — removes fingerprint injection from all tabs.
-   */
-  async disableStealth(): Promise<void> {
-    // Detach all stealth listeners
-    for (const tabId of Array.from(this.stealthCleanups.keys())) {
-      this.detachStealthListeners(tabId);
-    }
-
-    // Remove tab event listeners
-    if (this.stealthTabManager) {
-      if (this.stealthTabCreatedHandler)
-        this.stealthTabManager.removeListener("tab-created", this.stealthTabCreatedHandler);
-      if (this.stealthTabClosedHandler)
-        this.stealthTabManager.removeListener("tab-closed", this.stealthTabClosedHandler);
-    }
-    this.stealthTabCreatedHandler = null;
-    this.stealthTabClosedHandler = null;
-    this.stealthTabManager = null;
-
-    // Remove HTTP spoofing from the session's partition
-    if (this.stealthSessionId) {
-      removeHttpSpoofing(this.getElectronSession(this.stealthSessionId));
-    }
-
-    this.stealthSessionId = null;
-  }
-
-  /**
-   * Attach stealth injection via webContents navigation events (no CDP).
-   * Injects the stealth script on every navigation.
-   */
-  private attachStealthListeners(
-    tabId: string,
-    webContents: WebContents,
-  ): void {
-    if (this.stealthCleanups.has(tabId)) return;
-    if (!this.profileStore || !this.stealthSessionId) return;
-
-    const profile = this.profileStore.getOrCreate(this.stealthSessionId);
-    const stealthJs = buildStealthScript(JSON.stringify(profile));
-
-    const onNavigate = () => {
-      if (webContents.isDestroyed()) return;
-      webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready or destroyed */ });
-    };
-
-    webContents.on("did-navigate", onNavigate);
-    webContents.on("did-navigate-in-page", onNavigate);
-
-    // Also inject into the current page immediately
-    if (!webContents.isDestroyed()) {
-      webContents.executeJavaScript(stealthJs, true).catch(() => { /* page not ready */ });
-    }
-
-    this.stealthCleanups.set(tabId, () => {
-      webContents.removeListener("did-navigate", onNavigate);
-      webContents.removeListener("did-navigate-in-page", onNavigate);
+    return this.sessionsRepo.transaction(() => {
+      this.sessionsRepo.insert(session);
+      if (profile) this.browserProfilesRepo.insert(profile);
+      this.browserConfigRepo.upsert({
+        session_id: sessionId,
+        browser_backend: backend,
+        capture_mode: captureMode,
+        profile_id: profile?.id ?? null,
+        last_browser_version: null,
+        created_at: now,
+        updated_at: now,
+      });
+      if (backend === "electron") this.profileStore?.getOrCreate(sessionId);
+      return this.requireSession(sessionId);
     });
   }
 
-  /**
-   * Detach stealth listeners from a single tab.
-   */
-  private detachStealthListeners(tabId: string): void {
-    const cleanup = this.stealthCleanups.get(tabId);
-    if (cleanup) {
-      cleanup();
-      this.stealthCleanups.delete(tabId);
-    }
-  }
-
-  /**
-   * Temporarily suspend stealth listeners (before capture takes over).
-   */
-  private suspendStealthListeners(): void {
-    for (const tabId of Array.from(this.stealthCleanups.keys())) {
-      this.detachStealthListeners(tabId);
-    }
-    // Remove tab listeners — capture will manage its own
-    if (this.stealthTabManager) {
-      if (this.stealthTabCreatedHandler)
-        this.stealthTabManager.removeListener("tab-created", this.stealthTabCreatedHandler);
-      if (this.stealthTabClosedHandler)
-        this.stealthTabManager.removeListener("tab-closed", this.stealthTabClosedHandler);
-    }
-    this.stealthTabCreatedHandler = null;
-    this.stealthTabClosedHandler = null;
-  }
-
-  /**
-   * Restore stealth listeners after capture stops (if stealth was active).
-   */
-  private restoreStealthListeners(): void {
-    if (!this.stealthSessionId || !this.stealthTabManager) return;
-
-    const tabManager = this.stealthTabManager;
-
-    // Re-attach stealth to all tabs
-    for (const tab of tabManager.getAllTabs()) {
-      if (!tab.view.webContents.isDestroyed()) {
-        this.attachStealthListeners(tab.id, tab.view.webContents);
-      }
-    }
-
-    // Re-register tab listeners
-    this.stealthTabCreatedHandler = (tabInfo) => {
-      const tab = tabManager.getAllTabs().find((t) => t.id === tabInfo.id);
-      if (tab && !tab.view.webContents.isDestroyed()) {
-        this.attachStealthListeners(tab.id, tab.view.webContents);
-      }
-    };
-    this.stealthTabClosedHandler = (data) => {
-      this.detachStealthListeners(data.tabId);
-    };
-    tabManager.on("tab-created", this.stealthTabCreatedHandler);
-    tabManager.on("tab-closed", this.stealthTabClosedHandler);
-  }
-
-  getStealthSessionId(): string | null {
-    return this.stealthSessionId;
-  }
-
-  /**
-   * List all sessions.
-   */
   listSessions(): Session[] {
     return this.sessionsRepo.findAll();
   }
 
-  /**
-   * Delete a session.
-   */
-  async deleteSession(sessionId: string, tabManager?: TabManager): Promise<void> {
-    if (this.currentSessionId === sessionId) {
-      await this.stopCapture(sessionId);
+  getSession(sessionId: string): Session | null {
+    return this.sessionsRepo.findById(sessionId) ?? null;
+  }
+
+  async activateSession(
+    sessionId: string,
+    rendererWebContents?: WebContents,
+    proxyConfig?: ProxyConfig | null,
+  ): Promise<BrowserContext> {
+    return this.enqueueBrowserLifecycle(() =>
+      this.activateSessionNow(sessionId, rendererWebContents, proxyConfig),
+    );
+  }
+
+  private async activateSessionNow(
+    sessionId: string,
+    rendererWebContents?: WebContents,
+    proxyConfig?: ProxyConfig | null,
+  ): Promise<BrowserContext> {
+    const session = this.requireSession(sessionId);
+    const interruptedCapture =
+      this.currentSessionId && this.currentSessionId !== sessionId
+        ? {
+            sessionId: this.currentSessionId,
+            status: this.requireSession(this.currentSessionId).status,
+          } satisfies CaptureStateSnapshot
+        : null;
+    if (
+      this.currentSessionId &&
+      this.currentSessionId !== sessionId
+    ) {
+      await this.stopCaptureNow(this.currentSessionId);
     }
-    if (this.stealthSessionId === sessionId) {
-      await this.disableStealth();
+    if (rendererWebContents) this.rendererWebContents = rendererWebContents;
+    if (proxyConfig !== undefined) this.lastProxyConfig = proxyConfig;
+
+    const wasOpen = this.browserCoordinator.hasOpenSession(sessionId);
+    const previouslyActiveSessionId = wasOpen
+      ? null
+      : this.browserCoordinator.getActiveSessionId();
+    const capacityAttempt: CloakCapacityAttempt = {
+      evictedActiveSessionId: null,
+    };
+    let context: BrowserContext;
+
+    try {
+      context = wasOpen
+        ? this.browserCoordinator.resolveContext(sessionId)
+        : await this.openBrowserContext(
+            session,
+            this.lastProxyConfig,
+            capacityAttempt,
+          );
+    } catch (error) {
+      await this.restoreEvictedActiveCloakSession(
+        capacityAttempt.evictedActiveSessionId,
+        interruptedCapture,
+        this.lastProxyConfig,
+      );
+      throw error;
     }
-    // Destroy tabs belonging to this session
-    if (tabManager) {
-      tabManager.destroySessionGroup(sessionId);
+
+    try {
+      await this.browserCoordinator.setActiveSession(sessionId);
+      this.activeBrowserSessionId = sessionId;
+      this.sessionErrors.delete(sessionId);
+      if (!wasOpen) {
+        await this.initializeOpenedContext(session, context);
+      } else {
+        await this.prepareTargetsForMode(session, await context.targets());
+      }
+      await this.persistTabsBestEffort(sessionId);
+      if (!wasOpen) await this.sendTabsReset(sessionId, context);
+      return context;
+    } catch (error) {
+      if (!wasOpen && (session.browser_backend ?? "electron") === "cloak") {
+        await this.rollbackOpenedCloakContext(
+          sessionId,
+          context,
+          previouslyActiveSessionId,
+          error,
+        );
+      }
+      await this.restoreEvictedActiveCloakSession(
+        capacityAttempt.evictedActiveSessionId,
+        interruptedCapture,
+        this.lastProxyConfig,
+      );
+      throw error;
     }
-    // Clean up isolated browser data for this session's partition
-    const elSession = this.electronSessions.get(sessionId);
-    if (elSession) {
-      await elSession.clearStorageData().catch(() => {});
-      await elSession.clearCache().catch(() => {});
-      this.electronSessions.delete(sessionId);
-    }
-    if (this.activePartitionSessionId === sessionId) {
-      this.activePartitionSessionId = null;
-    }
-    this.sessionsRepo.delete(sessionId);
+  }
+
+  async deactivateBrowser(): Promise<void> {
+    return this.enqueueBrowserLifecycle(() => this.deactivateBrowserNow());
+  }
+
+  private async deactivateBrowserNow(): Promise<void> {
+    await this.browserCoordinator.setActiveSession(null);
+    this.activeBrowserSessionId = null;
+    await this.stopPreparedInteractionRecorder();
   }
 
   /**
-   * Recover from crash — mark any 'running' sessions as 'stopped'.
+   * Kept as the selection entry point used by the current renderer. For Cloak
+   * it opens/focuses the external context and deliberately applies no Electron
+   * fingerprint overrides.
    */
-  recoverFromCrash(): void {
-    const sessions = this.sessionsRepo.findAll();
-    for (const session of sessions) {
-      if (session.status === "running" || session.status === "paused") {
-        this.sessionsRepo.updateStatus(session.id, "stopped", Date.now());
-      }
+  async enableStealth(
+    sessionId: string,
+    _tabManager?: TabManager,
+    proxyConfig?: ProxyConfig | null,
+    rendererWebContents?: WebContents,
+  ): Promise<void> {
+    await this.activateSession(
+      sessionId,
+      rendererWebContents,
+      proxyConfig,
+    );
+  }
+
+  async disableStealth(): Promise<void> {
+    await this.deactivateBrowser();
+  }
+
+  getStealthSessionId(): string | null {
+    return this.activeBrowserSessionId;
+  }
+
+  startCapture(
+    sessionId: string,
+    _tabManager: TabManager | undefined,
+    rendererWebContents: WebContents,
+    proxyConfig?: ProxyConfig | null,
+  ): Promise<void> {
+    return this.enqueueBrowserLifecycle(() =>
+      this.startCaptureNow(
+        sessionId,
+        rendererWebContents,
+        proxyConfig,
+      ),
+    );
+  }
+
+  private async startCaptureNow(
+    sessionId: string,
+    rendererWebContents: WebContents,
+    proxyConfig?: ProxyConfig | null,
+  ): Promise<void> {
+    const session = this.requireSession(sessionId);
+    if (this.currentSessionId === sessionId && session.status === "running") {
+      return;
     }
+    this.suspendingCaptureSessions.delete(sessionId);
+    if (this.currentSessionId && this.currentSessionId !== sessionId) {
+      await this.stopCaptureNow(this.currentSessionId);
+    }
+
+    // Opening and runtime preparation happen before the DB state transition.
+    // A license, binary, or profile failure therefore leaves the Session stopped.
+    const context = await this.activateSessionNow(
+      sessionId,
+      rendererWebContents,
+      proxyConfig,
+    );
+    this.currentSessionId = sessionId;
+    try {
+      this.rendererWebContents = rendererWebContents;
+      this.captureEngine.start(sessionId, rendererWebContents);
+      this.sessionsRepo.updateStatus(sessionId, "running");
+
+      const targets = await context.targets();
+      await this.prepareTargetsForMode(session, targets);
+      if (session.capture_mode === "deep") {
+        await this.interactionRecorder?.resume();
+      }
+      const results = await Promise.allSettled(
+        targets.map((target) => this.attachCaptureToTarget(session, target)),
+      );
+      for (let index = 0; index < results.length; index += 1) {
+        const result = results[index];
+        if (result.status === "rejected") {
+          console.warn(
+            `[SessionManager] Capture attach failed for ${targets[index].tabId}:`,
+            errorMessage(result.reason),
+          );
+        }
+      }
+      if (
+        targets.length > 0 &&
+        results.every((result) => result.status === "rejected")
+      ) {
+        throw (results[0] as PromiseRejectedResult).reason;
+      }
+    } catch (error) {
+      if (this.currentSessionId === sessionId) {
+        await this.rollbackFailedCaptureStart(sessionId);
+      }
+      throw error;
+    }
+  }
+
+  async pauseCapture(sessionId: string): Promise<void> {
+    return this.enqueueBrowserLifecycle(() => this.pauseCaptureNow(sessionId));
+  }
+
+  private async pauseCaptureNow(sessionId: string): Promise<void> {
+    if (this.currentSessionId !== sessionId) return;
+    this.suspendingCaptureSessions.add(sessionId);
+    try {
+      await this.detachSessionCaptures(sessionId);
+      await this.interactionRecorder?.pause();
+      this.sessionsRepo.updateStatus(sessionId, "paused");
+    } finally {
+      this.suspendingCaptureSessions.delete(sessionId);
+    }
+  }
+
+  async resumeCapture(sessionId: string): Promise<void> {
+    return this.enqueueBrowserLifecycle(() => this.resumeCaptureNow(sessionId));
+  }
+
+  private async resumeCaptureNow(sessionId: string): Promise<void> {
+    if (this.currentSessionId !== sessionId) return;
+    const session = this.requireSession(sessionId);
+    if (session.status !== "paused") return;
+    this.suspendingCaptureSessions.delete(sessionId);
+    try {
+      const context = this.browserCoordinator.resolveContext(sessionId);
+      const targets = await context.targets();
+      await this.prepareTargetsForMode(session, targets);
+      for (const target of targets) {
+        await this.attachCaptureToTarget(session, target);
+      }
+      await this.interactionRecorder?.resume();
+      this.sessionsRepo.updateStatus(sessionId, "running");
+    } catch (error) {
+      await this.rollbackFailedCaptureResume(sessionId);
+      throw error;
+    }
+  }
+
+  async stopCapture(sessionId: string): Promise<void> {
+    return this.enqueueBrowserLifecycle(() => this.stopCaptureNow(sessionId));
+  }
+
+  private async stopCaptureNow(sessionId: string): Promise<void> {
+    if (this.currentSessionId !== sessionId) return;
+    this.suspendingCaptureSessions.add(sessionId);
+    let detachError: unknown;
+    try {
+      await this.detachSessionCaptures(sessionId);
+    } catch (error) {
+      detachError = error;
+    } finally {
+      await this.interactionRecorder?.pause();
+      this.captureEngine.stop();
+      this.sessionsRepo.updateStatus(sessionId, "stopped", Date.now());
+      this.currentSessionId = null;
+      this.suspendingCaptureSessions.delete(sessionId);
+    }
+    await this.persistTabsBestEffort(sessionId);
+    if (detachError) throw detachError;
+  }
+
+  async setCaptureMode(sessionId: string, mode: CaptureMode): Promise<Session> {
+    return this.enqueueBrowserLifecycle(() =>
+      this.setCaptureModeNow(sessionId, mode),
+    );
+  }
+
+  private async setCaptureModeNow(
+    sessionId: string,
+    mode: CaptureMode,
+  ): Promise<Session> {
+    const session = this.requireSession(sessionId);
+    if (session.status !== "stopped") {
+      throw new BrowserBackendError(
+        "INVALID_ARGUMENT",
+        "Capture mode can only be changed while the Session is stopped",
+        { backendKind: session.browser_backend, sessionId },
+      );
+    }
+    const backend = session.browser_backend ?? "electron";
+    this.assertBackendAndMode(backend, mode);
+    const config = this.requireBrowserConfig(session);
+    if (config.capture_mode === mode) return session;
+
+    const wasActive = this.activeBrowserSessionId === sessionId;
+    await this.persistTabs(sessionId);
+    await this.closeBrowserContext(sessionId);
+    await this.clearPreparedTargets(sessionId);
+    this.browserConfigRepo.upsert({
+      ...config,
+      capture_mode: mode,
+      updated_at: Date.now(),
+    });
+    const updated = this.requireSession(sessionId);
+    if (wasActive) {
+      await this.activateSessionNow(
+        sessionId,
+        this.rendererWebContents ?? undefined,
+        this.lastProxyConfig,
+      );
+    }
+    return updated;
+  }
+
+  async deleteSession(
+    sessionId: string,
+    _tabManager?: TabManager,
+    options: DeleteSessionOptions = {},
+  ): Promise<void> {
+    return this.enqueueBrowserLifecycle(() =>
+      this.deleteSessionNow(sessionId, options),
+    );
+  }
+
+  private async deleteSessionNow(
+    sessionId: string,
+    options: DeleteSessionOptions,
+  ): Promise<void> {
+    const session = this.requireSession(sessionId);
+    if (this.currentSessionId === sessionId) await this.stopCaptureNow(sessionId);
+    await this.persistTabs(sessionId);
+    await this.closeBrowserContext(sessionId);
+    await this.clearPreparedTargets(sessionId);
+
+    const backend = session.browser_backend ?? "electron";
+    const profile =
+      session.browser_profile_id
+        ? this.browserProfilesRepo.findById(session.browser_profile_id)
+        : null;
+    if (backend === "cloak" && profile) {
+      if (options.retainProfile) {
+        this.sessionsRepo.transaction(() => {
+          this.browserProfilesRepo.updateState(profile.id, "retained");
+          this.sessionsRepo.delete(sessionId);
+        });
+      } else {
+        this.sessionsRepo.transaction(() => {
+          this.browserProfilesRepo.updateState(profile.id, "deleting");
+          this.sessionsRepo.delete(sessionId);
+        });
+        try {
+          await this.browserCoordinator.deletePersistentProfile(
+            "cloak",
+            profile.profile_key,
+          );
+          this.browserProfilesRepo.delete(profile.id);
+        } catch (error) {
+          this.browserProfilesRepo.updateState(
+            profile.id,
+            "delete_failed",
+            errorMessage(error),
+          );
+          console.warn(
+            `[SessionManager] Profile ${profile.id} deletion failed and can be retried:`,
+            errorMessage(error),
+          );
+        }
+      }
+    } else {
+      await this.browserCoordinator
+        .deletePersistentProfile("electron", sessionId)
+        .catch((error) => {
+          console.warn("[SessionManager] Electron profile cleanup failed:", errorMessage(error));
+        });
+      this.sessionsRepo.delete(sessionId);
+    }
+
+    if (this.activeBrowserSessionId === sessionId) {
+      this.activeBrowserSessionId = null;
+    }
+  }
+
+  listRetainedProfiles(): BrowserProfile[] {
+    return [
+      ...this.browserProfilesRepo.findByState("retained"),
+      ...this.browserProfilesRepo.findByState("delete_failed"),
+    ];
+  }
+
+  restoreBrowserProfile(profileId: string): Session {
+    this.assertCloakAvailable();
+    const profile = this.browserProfilesRepo.findById(profileId);
+    if (!profile || profile.state !== "retained") {
+      throw new BrowserBackendError(
+        "INVALID_ARGUMENT",
+        `Browser Profile ${profileId} is not recoverable`,
+        { backendKind: "cloak" },
+      );
+    }
+    const tabs = this.browserTabsRepo.findByProfileId(profileId);
+    const activeTab = tabs.find((tab) => tab.active) ?? tabs[0];
+    const sessionId = uuidv4();
+    const now = Date.now();
+    const session: Session = {
+      id: sessionId,
+      name: `${profile.display_name} (restored)`,
+      target_url: activeTab?.url ?? "",
+      status: "stopped",
+      created_at: now,
+      stopped_at: null,
+    };
+    return this.sessionsRepo.transaction(() => {
+      this.sessionsRepo.insert(session);
+      this.browserConfigRepo.upsert({
+        session_id: sessionId,
+        browser_backend: "cloak",
+        capture_mode: "passive",
+        profile_id: profile.id,
+        last_browser_version: null,
+        created_at: now,
+        updated_at: now,
+      });
+      this.browserProfilesRepo.updateState(profile.id, "attached");
+      return this.requireSession(sessionId);
+    });
+  }
+
+  async deleteBrowserProfile(profileId: string): Promise<void> {
+    this.assertCloakAvailable();
+    const profile = this.browserProfilesRepo.findById(profileId);
+    if (!profile) return;
+    if (profile.state === "attached") {
+      throw new BrowserBackendError(
+        "INVALID_ARGUMENT",
+        "An attached browser Profile must be detached by deleting its Session first",
+        { backendKind: "cloak" },
+      );
+    }
+    this.browserProfilesRepo.updateState(profile.id, "deleting");
+    try {
+      await this.browserCoordinator.deletePersistentProfile(
+        "cloak",
+        profile.profile_key,
+      );
+      this.browserProfilesRepo.delete(profile.id);
+    } catch (error) {
+      this.browserProfilesRepo.updateState(
+        profile.id,
+        "delete_failed",
+        errorMessage(error),
+      );
+      throw error;
+    }
+  }
+
+  getBrowserSessionStatus(sessionId?: string): BrowserSessionRuntimeStatus {
+    const resolvedId = sessionId ?? this.activeBrowserSessionId;
+    if (!resolvedId) {
+      return {
+        sessionId: null,
+        backend: null,
+        state: "closed",
+        presentation: null,
+        version: null,
+        error: null,
+      };
+    }
+    const session = this.sessionsRepo.findById(resolvedId);
+    if (!session) {
+      return {
+        sessionId: resolvedId,
+        backend: null,
+        state: "error",
+        presentation: null,
+        version: null,
+        error: `Session ${resolvedId} was not found`,
+      };
+    }
+    const backend = session.browser_backend ?? "electron";
+    const error = this.sessionErrors.get(resolvedId) ?? null;
+    return {
+      sessionId: resolvedId,
+      backend,
+      state: this.openingSessions.has(resolvedId)
+        ? "opening"
+        : error
+          ? "error"
+          : this.browserCoordinator.hasOpenSession(resolvedId)
+            ? "ready"
+            : "closed",
+      presentation: backend === "cloak" ? "external" : "embedded",
+      version:
+        backend === "cloak"
+          ? session.last_browser_version ?? this.cloakRuntime?.getStatus().actualVersion ?? null
+          : process.versions.chrome ?? null,
+      error,
+    };
+  }
+
+  async focusBrowser(sessionId?: string): Promise<void> {
+    return this.enqueueBrowserLifecycle(() => this.focusBrowserNow(sessionId));
+  }
+
+  private async focusBrowserNow(sessionId?: string): Promise<void> {
+    const resolvedId = sessionId ?? this.activeBrowserSessionId;
+    if (!resolvedId) {
+      throw new BrowserBackendError("CONTEXT_NOT_FOUND", "No browser Session is active");
+    }
+    if (!this.browserCoordinator.hasOpenSession(resolvedId)) {
+      await this.activateSessionNow(
+        resolvedId,
+        this.rendererWebContents ?? undefined,
+        this.lastProxyConfig,
+      );
+    } else {
+      await this.browserCoordinator.setActiveSession(resolvedId);
+      this.activeBrowserSessionId = resolvedId;
+    }
+    const target = this.browserCoordinator.resolveTarget(resolvedId);
+    await target.activate();
+  }
+
+  async getCloakStatus(): Promise<CloakRuntimeStatus> {
+    if (
+      !this.cloakRuntime ||
+      !this.browserCoordinator.hasBackend("cloak")
+    ) {
+      return { ...PUBLIC_CLOAK_STATUS };
+    }
+    return this.cloakRuntime.check();
+  }
+
+  async prepareCloakRuntime(
+    policy?: CloakRuntimePolicy,
+  ): Promise<CloakRuntimeStatus> {
+    this.assertCloakAvailable();
+    return this.cloakRuntime!.prepare(policy);
+  }
+
+  async setCloakRuntimePolicy(
+    policy: CloakRuntimePolicy,
+  ): Promise<CloakRuntimeStatus> {
+    this.assertCloakAvailable();
+    if (this.cloakRuntime!.listContexts().length > 0) {
+      throw new BrowserBackendError(
+        "INVALID_ARGUMENT",
+        "Close all Cloak Sessions before changing the runtime policy",
+        { backendKind: "cloak" },
+      );
+    }
+    return this.cloakRuntime!.setPolicy(policy);
+  }
+
+  getOpenCloakSessions(): Session[] {
+    if (!this.cloakRuntime) return [];
+    return this.cloakRuntime
+      .listContexts()
+      .map((context) => this.sessionsRepo.findById(context.sessionId))
+      .filter((session): session is Session => Boolean(session));
+  }
+
+  async restartOpenCloakContexts(
+    nextProxy: ProxyConfig | null,
+    previousProxy: ProxyConfig | null,
+  ): Promise<void> {
+    return this.enqueueBrowserLifecycle(() =>
+      this.restartOpenCloakContextsNow(nextProxy, previousProxy),
+    );
+  }
+
+  private async restartOpenCloakContextsNow(
+    nextProxy: ProxyConfig | null,
+    previousProxy: ProxyConfig | null,
+  ): Promise<void> {
+    if (!this.cloakRuntime) return;
+    const snapshots = [...this.cloakRuntime.listContexts()];
+    if (snapshots.length === 0) {
+      this.lastProxyConfig = nextProxy;
+      return;
+    }
+    const activeId = this.activeBrowserSessionId;
+    const captureId = this.currentSessionId;
+    const captureStatus = captureId
+      ? this.sessionsRepo.findById(captureId)?.status
+      : null;
+
+    if (captureId && captureStatus !== "stopped") {
+      await this.stopCaptureNow(captureId);
+    }
+    for (const snapshot of snapshots) {
+      await this.persistTabs(snapshot.sessionId);
+    }
+    for (const snapshot of snapshots) {
+      await this.closeBrowserContext(snapshot.sessionId);
+    }
+
+    try {
+      this.lastProxyConfig = nextProxy;
+      for (const snapshot of snapshots) {
+        const session = this.requireSession(snapshot.sessionId);
+        const context = await this.openBrowserContext(session, nextProxy);
+        await this.initializeOpenedContext(session, context);
+      }
+      if (activeId) {
+        await this.activateSessionNow(
+          activeId,
+          this.rendererWebContents ?? undefined,
+          nextProxy,
+        );
+      }
+      await this.restoreCaptureState(captureId, captureStatus, nextProxy);
+    } catch (error) {
+      for (const snapshot of snapshots) {
+        await this.closeBrowserContext(snapshot.sessionId).catch(() => undefined);
+      }
+      this.lastProxyConfig = previousProxy;
+      for (const snapshot of snapshots) {
+        const session = this.sessionsRepo.findById(snapshot.sessionId);
+        if (session) {
+          try {
+            const context = await this.openBrowserContext(session, previousProxy);
+            await this.initializeOpenedContext(session, context);
+          } catch (rollbackError) {
+            console.error(
+              `[SessionManager] Failed to restore Cloak Session ${snapshot.sessionId} after proxy rollback:`,
+              rollbackError,
+            );
+          }
+        }
+      }
+      if (activeId && this.browserCoordinator.hasOpenSession(activeId)) {
+        await this.browserCoordinator.setActiveSession(activeId).catch(() => undefined);
+        this.activeBrowserSessionId = activeId;
+      }
+      await this.restoreCaptureState(captureId, captureStatus, previousProxy).catch(
+        (rollbackError) => {
+          console.error(
+            "[SessionManager] Failed to restore capture state after proxy rollback:",
+            rollbackError,
+          );
+        },
+      );
+      throw error;
+    }
+  }
+
+  async createBrowserTab(
+    url?: string,
+    sessionId?: string,
+  ): Promise<BrowserTab> {
+    const context = sessionId
+      ? this.browserCoordinator.resolveContext(sessionId)
+      : this.requireActiveContext();
+    const session = this.requireSession(context.sessionId);
+    const target = await context.createTarget();
+    await this.prepareTargetForMode(session, target);
+    if (url) await target.navigate(url);
+    await this.browserCoordinator.setActiveTarget(context.sessionId, target.tabId);
+    this.activeBrowserSessionId = context.sessionId;
+    await this.persistTabsBestEffort(session.id);
+    return toBrowserTab(target);
+  }
+
+  async closeBrowserTab(tabId: string): Promise<void> {
+    const context = this.requireActiveContext();
+    await context.closeTarget(tabId);
+    await this.persistTabsBestEffort(context.sessionId);
+  }
+
+  async activateBrowserTab(tabId: string): Promise<void> {
+    const context = this.requireActiveContext();
+    await this.browserCoordinator.setActiveTarget(context.sessionId, tabId);
+    await this.persistTabsBestEffort(context.sessionId);
+  }
+
+  async listBrowserTabs(sessionId?: string): Promise<BrowserTab[]> {
+    const context = sessionId
+      ? this.browserCoordinator.resolveContext(sessionId)
+      : this.requireActiveContext();
+    return (await context.targets()).map(toBrowserTab);
+  }
+
+  async navigate(url: string, sessionId?: string, tabId?: string): Promise<void> {
+    const target = this.resolveTarget(sessionId, tabId);
+    await target.navigate(url);
+  }
+
+  async goBack(sessionId?: string, tabId?: string): Promise<void> {
+    await this.resolveTarget(sessionId, tabId).goBack();
+  }
+
+  async goForward(sessionId?: string, tabId?: string): Promise<void> {
+    await this.resolveTarget(sessionId, tabId).goForward();
+  }
+
+  async reload(sessionId?: string, tabId?: string): Promise<void> {
+    await this.resolveTarget(sessionId, tabId).reload();
+  }
+
+  async clearBrowserEnvironment(sessionId?: string): Promise<void> {
+    const context = sessionId
+      ? this.browserCoordinator.resolveContext(sessionId)
+      : this.requireActiveContext();
+    await context.clearData({ storage: true, cache: true, reloadTargets: true });
+  }
+
+  async toggleDevTools(): Promise<void> {
+    const target = this.resolveTarget();
+    if (!target.toggleDevTools) {
+      throw new BrowserBackendError(
+        "CAPABILITY_UNSUPPORTED",
+        "DevTools are managed by the selected browser backend",
+        {
+          backendKind: target.backendKind,
+          sessionId: target.sessionId,
+          contextId: target.contextId,
+          tabId: target.tabId,
+        },
+      );
+    }
+    await target.toggleDevTools();
+  }
+
+  getActiveElectronSession(): ElectronSession | null {
+    const context = this.browserCoordinator.getActiveContext();
+    if (!context || context.backendKind !== "electron") return null;
+    return context.getNativeHandle<ElectronSession>();
+  }
+
+  recoverFromCrash(): void {
+    this.sessionsRepo.transaction(() => {
+      const sessions = this.sessionsRepo.findAll();
+      const referencedProfileIds = new Set(
+        sessions
+          .map((session) => session.browser_profile_id)
+          .filter((profileId): profileId is string => Boolean(profileId)),
+      );
+      for (const session of sessions) {
+        if (session.status !== "stopped") {
+          this.sessionsRepo.updateStatus(session.id, "stopped", Date.now());
+        }
+      }
+      for (const profile of this.browserProfilesRepo.findByState("deleting")) {
+        if (referencedProfileIds.has(profile.id)) {
+          this.browserProfilesRepo.updateState(profile.id, "attached");
+          continue;
+        }
+        this.browserProfilesRepo.updateState(
+          profile.id,
+          "delete_failed",
+          "Profile deletion was interrupted; retry permanent deletion",
+        );
+      }
+      for (const profile of this.browserProfilesRepo.findByState("attached")) {
+        if (referencedProfileIds.has(profile.id)) continue;
+        this.browserProfilesRepo.updateState(
+          profile.id,
+          "retained",
+          "Profile attachment was interrupted; retained for recovery",
+        );
+      }
+      for (const profile of this.browserProfilesRepo.findByState("retained")) {
+        if (!referencedProfileIds.has(profile.id)) continue;
+        this.browserProfilesRepo.updateState(profile.id, "attached");
+      }
+    });
   }
 
   getCurrentSessionId(): string | null {
     return this.currentSessionId;
   }
 
-  /**
-   * Send a raw CDP command to the active tab's debugger.
-   * Requires an active capture session with CDP attached.
-   */
-  async sendCdpCommand(method: string, params?: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (!this.tabManager) throw new Error("No active capture session");
-    const activeTab = this.tabManager.getActiveTab();
-    if (!activeTab) throw new Error("No active tab");
-    const bundle = this.tabCaptures.get(activeTab.id);
-    if (!bundle) throw new Error("CDP not attached to active tab");
-    return bundle.cdp.sendCommand(method, params || {});
+  getActiveBrowserSessionId(): string | null {
+    return this.activeBrowserSessionId;
   }
+
+  async sendCdpCommand(
+    method: string,
+    params: Record<string, unknown> = {},
+    sessionId?: string,
+    tabId?: string,
+  ): Promise<Record<string, unknown>> {
+    const target = this.resolveTarget(sessionId, tabId);
+    const lease = await (await target.getCdpTransport()).acquire("mcp:raw");
+    try {
+      return await lease.send(method, params);
+    } finally {
+      await lease.release();
+    }
+  }
+
+  recordBrowserVersion(sessionId: string, version: string): void {
+    const session = this.sessionsRepo.findById(sessionId);
+    if (!session) return;
+    const config = this.requireBrowserConfig(session);
+    this.browserConfigRepo.upsert({
+      ...config,
+      last_browser_version: version,
+      updated_at: Date.now(),
+    });
+  }
+
+  touchBrowserProfile(profileId: string, lastUsedAt = Date.now()): void {
+    this.browserProfilesRepo.touchLastUsed(profileId, lastUsedAt);
+  }
+
+  shutdown(): Promise<void> {
+    if (this.shutdownPromise) return this.shutdownPromise;
+    this.shuttingDown = true;
+    const attempt = this.enqueueBrowserLifecycle(async () => {
+      if (this.currentSessionId) await this.stopCaptureNow(this.currentSessionId);
+      if (this.cloakRuntime) {
+        for (const context of this.cloakRuntime.listContexts()) {
+          await this.persistTabsBestEffort(context.sessionId);
+        }
+      }
+      await this.stopPreparedInteractionRecorder();
+      this.unsubscribeCoordinator();
+      ipcMain.removeListener("capture:hook-data", this.hookIpcHandler);
+      await this.browserCoordinator.shutdown();
+    });
+    const trackedAttempt = attempt.catch((error) => {
+      if (this.shutdownPromise === trackedAttempt) this.shutdownPromise = null;
+      throw error;
+    });
+    this.shutdownPromise = trackedAttempt;
+    return trackedAttempt;
+  }
+
+  private async openBrowserContext(
+    session: Session,
+    proxy: ProxyConfig | null,
+    capacityAttempt?: CloakCapacityAttempt,
+  ): Promise<BrowserContext> {
+    const backend = session.browser_backend ?? "electron";
+    const mode = session.capture_mode ?? "deep";
+    this.assertBackendAndMode(backend, mode);
+    const previouslyActiveSessionId =
+      backend === "cloak" ? this.browserCoordinator.getActiveSessionId() : null;
+    if (backend === "cloak") {
+      const evictedActiveSessionId = await this.ensureCloakCapacity(session.id);
+      if (capacityAttempt) {
+        capacityAttempt.evictedActiveSessionId = evictedActiveSessionId;
+      }
+    }
+
+    const profile =
+      session.browser_profile_id
+        ? this.browserProfilesRepo.findById(session.browser_profile_id)
+        : null;
+    const restoredTabs = profile
+      ? this.browserTabsRepo.findByProfileId(profile.id)
+      : [];
+    if (backend === "cloak" && !profile) {
+      throw new BrowserBackendError(
+        "BACKEND_FAILURE",
+        "The Cloak browser Profile is missing",
+        { backendKind: backend, sessionId: session.id },
+      );
+    }
+    if (backend === "cloak" && profile?.state === "missing") {
+      throw new BrowserBackendError(
+        "PROFILE_MISSING",
+        `The saved Cloak profile ${profile.profile_key} is missing`,
+        { backendKind: backend, sessionId: session.id },
+      );
+    }
+    if (backend === "cloak" && profile?.state !== "attached") {
+      throw new BrowserBackendError(
+        "BACKEND_FAILURE",
+        `Cloak profile ${profile?.profile_key ?? "unknown"} is not attached to this Session`,
+        { backendKind: backend, sessionId: session.id },
+      );
+    }
+
+    this.openingSessions.add(session.id);
+    this.sessionErrors.delete(session.id);
+    try {
+      return await this.browserCoordinator.openSession({
+        backendKind: backend,
+        sessionId: session.id,
+        profileId: profile?.id ?? null,
+        proxy,
+        captureMode: mode,
+        fingerprint:
+          backend === "electron"
+            ? this.profileStore?.getOrCreate(session.id) ?? null
+            : null,
+        backendOptions: profile
+          ? {
+              profileKey: profile.profile_key,
+              cloakSeed: profile.cloak_seed,
+              requireExistingProfile: profile.last_used_at !== null,
+              restoredTabs,
+            }
+          : undefined,
+      });
+    } catch (error) {
+      if (
+        previouslyActiveSessionId &&
+        this.browserCoordinator.hasOpenSession(previouslyActiveSessionId) &&
+        this.browserCoordinator.getActiveSessionId() !== previouslyActiveSessionId
+      ) {
+        try {
+          await this.browserCoordinator.setActiveSession(previouslyActiveSessionId);
+          this.activeBrowserSessionId = previouslyActiveSessionId;
+        } catch (restoreError) {
+          console.warn(
+            `[SessionManager] Failed to restore active Session ${previouslyActiveSessionId} after launch failure:`,
+            errorMessage(restoreError),
+          );
+        }
+      }
+      if (
+        backend === "cloak" &&
+        profile &&
+        error instanceof BrowserBackendError &&
+        error.code === "PROFILE_MISSING"
+      ) {
+        this.browserProfilesRepo.updateState(
+          profile.id,
+          "missing",
+          errorMessage(error),
+        );
+      }
+      this.sessionErrors.set(session.id, errorMessage(error));
+      throw error;
+    } finally {
+      this.openingSessions.delete(session.id);
+    }
+  }
+
+  private async initializeOpenedContext(
+    session: Session,
+    context: BrowserContext,
+  ): Promise<void> {
+    let targets = await context.targets();
+    if (targets.length === 0) targets = [await context.createTarget()];
+    await this.prepareTargetsForMode(session, targets);
+
+    if ((session.browser_backend ?? "electron") === "cloak") {
+      const savedTabs = session.browser_profile_id
+        ? this.browserTabsRepo.findByProfileId(session.browser_profile_id)
+        : [];
+      if (savedTabs.length > 0) {
+        while (targets.length < savedTabs.length) {
+          const target = await context.createTarget();
+          targets.push(target);
+          await this.prepareTargetForMode(session, target);
+        }
+        for (let index = 0; index < savedTabs.length; index += 1) {
+          const saved = savedTabs[index];
+          const target = targets[index];
+          if (saved.url && target.url !== saved.url) await target.navigate(saved.url);
+        }
+        for (const extra of targets.slice(savedTabs.length)) {
+          await extra.close();
+        }
+        const activeIndex = Math.max(
+          0,
+          savedTabs.findIndex((tab) => tab.active),
+        );
+        const activeTarget = targets[activeIndex] ?? targets[0];
+        if (activeTarget) await context.activateTarget(activeTarget.tabId);
+        return;
+      }
+    }
+
+    const target =
+      targets.find((candidate) => candidate.getState().isActive) ?? targets[0];
+    if (
+      target &&
+      session.target_url &&
+      (!target.url || target.url === "about:blank")
+    ) {
+      await target.navigate(session.target_url);
+    }
+  }
+
+  private async prepareTargetsForMode(
+    session: Session,
+    targets: BrowserTarget[],
+  ): Promise<void> {
+    for (const target of targets) {
+      await this.prepareTargetForMode(session, target);
+    }
+  }
+
+  private async prepareTargetForMode(
+    session: Session,
+    target: BrowserTarget,
+  ): Promise<void> {
+    const key = targetKey(session.id, target.tabId);
+    const pending = this.pendingTargetPreparations.get(key);
+    if (pending) return pending;
+    const preparation = this.performTargetPreparation(session, target, key);
+    this.pendingTargetPreparations.set(key, preparation);
+    try {
+      await preparation;
+    } finally {
+      if (this.pendingTargetPreparations.get(key) === preparation) {
+        this.pendingTargetPreparations.delete(key);
+      }
+    }
+  }
+
+  private async performTargetPreparation(
+    session: Session,
+    target: BrowserTarget,
+    key: string,
+  ): Promise<void> {
+    this.registerElectronTarget(target);
+    if ((session.capture_mode ?? "deep") !== "deep") return;
+
+    // A fresh Electron WebContentsView has no document at all. Prime it with an
+    // internal blank page so CDP init-script registration and immediate script
+    // evaluation cannot wait forever for the first navigation.
+    if (target.backendKind === "electron" && !target.url) {
+      await target.navigate("about:blank");
+    }
+
+    if (
+      target.backendKind === "electron" &&
+      !this.preparedElectronStealthTargets.has(target)
+    ) {
+      const profile = this.profileStore?.getOrCreate(session.id);
+      if (profile) {
+        const source = buildStealthScript(JSON.stringify(profile));
+        await target.addInitScript(source);
+        this.preparedElectronStealthTargets.add(target);
+        // A newly-created WebContentsView has no document yet. Electron keeps
+        // executeJavaScript() pending in that state, which would block the first
+        // navigation (and shutdown behind the same lifecycle queue). The init
+        // script above is sufficient for that first document; only patch an
+        // already-loaded target in place.
+        if (target.url) await target.evaluate(source).catch(() => undefined);
+      }
+    }
+
+    let injector = this.injectors.get(key);
+    if (!injector) {
+      injector = new JsInjector();
+      this.injectors.set(key, injector);
+    }
+    await injector.start(target, (data) => this.handlePageMessage(session.id, data));
+
+    if (
+      this.interactionEventsRepo &&
+      this.rendererWebContents &&
+      (this.activeBrowserSessionId === session.id ||
+        this.currentSessionId === session.id)
+    ) {
+      await this.ensureInteractionRecorder(session.id);
+      await this.interactionRecorder?.attachTarget(target);
+    }
+  }
+
+  private async ensureInteractionRecorder(sessionId: string): Promise<void> {
+    if (!this.interactionEventsRepo || !this.rendererWebContents) return;
+    if (
+      this.interactionRecorder &&
+      this.interactionRecorderSessionId !== sessionId
+    ) {
+      await this.interactionRecorder.stop();
+      this.interactionRecorder = null;
+      this.interactionRecorderSessionId = null;
+    }
+    if (!this.interactionRecorder) {
+      this.interactionRecorder = new InteractionRecorder(
+        this.interactionEventsRepo,
+      );
+      this.interactionRecorder.start(sessionId, this.rendererWebContents);
+      this.interactionRecorderSessionId = sessionId;
+      if (this.currentSessionId !== sessionId) {
+        await this.interactionRecorder.pause();
+      }
+    }
+  }
+
+  private async stopPreparedInteractionRecorder(): Promise<void> {
+    if (this.interactionRecorder) await this.interactionRecorder.stop();
+    this.interactionRecorder = null;
+    this.interactionRecorderSessionId = null;
+  }
+
+  private async attachCaptureToTarget(
+    session: Session,
+    target: BrowserTarget,
+  ): Promise<void> {
+    const key = targetKey(session.id, target.tabId);
+    if (this.tabCaptures.has(key)) return;
+    const pending = this.pendingCaptureAttachments.get(key);
+    if (pending) return pending;
+    const attachment = this.performCaptureAttachment(session, target, key);
+    this.pendingCaptureAttachments.set(key, attachment);
+    try {
+      await attachment;
+    } finally {
+      if (this.pendingCaptureAttachments.get(key) === attachment) {
+        this.pendingCaptureAttachments.delete(key);
+      }
+    }
+  }
+
+  private async performCaptureAttachment(
+    session: Session,
+    target: BrowserTarget,
+    key: string,
+  ): Promise<void> {
+    if (!this.canAttachCapture(session.id, target)) return;
+    await this.prepareTargetForMode(session, target);
+    if (!this.canAttachCapture(session.id, target)) return;
+
+    const cdp = new CdpManager();
+    const storage = new StorageCollector();
+    let cdpStarted = false;
+    let storageStarted = false;
+    try {
+      await cdp.start(target, session.capture_mode ?? "deep");
+      cdpStarted = true;
+      cdp.on("response-captured", (data) => {
+        if (this.currentSessionId === session.id) {
+          this.captureEngine.handleResponseCaptured(data);
+        }
+      });
+      cdp.on("frame-navigated", () => {
+        storage.triggerCollection();
+        void this.syncInteractionRecordingAfterNavigation(session.id, target);
+      });
+      storage.on("storage-collected", (data) => {
+        if (this.currentSessionId === session.id) {
+          this.captureEngine.handleStorageCollected(data);
+        }
+      });
+      await storage.start(session.id, target);
+      storageStarted = true;
+      if (!this.canAttachCapture(session.id, target)) {
+        await storage.stop();
+        storageStarted = false;
+        await cdp.stop();
+        cdpStarted = false;
+        return;
+      }
+      this.tabCaptures.set(key, {
+        sessionId: session.id,
+        target,
+        cdp,
+        storage,
+      });
+    } catch (error) {
+      if (storageStarted) await storage.stop().catch(() => undefined);
+      if (cdpStarted) await cdp.stop().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  private canAttachCapture(sessionId: string, target: BrowserTarget): boolean {
+    return (
+      this.currentSessionId === sessionId &&
+      !this.suspendingCaptureSessions.has(sessionId) &&
+      !target.isClosed()
+    );
+  }
+
+  private async detachCapture(sessionId: string, tabId: string): Promise<void> {
+    const key = targetKey(sessionId, tabId);
+    const bundle = this.tabCaptures.get(key);
+    if (!bundle) return;
+    this.tabCaptures.delete(key);
+    let storageError: unknown;
+    try {
+      await bundle.storage.stop();
+    } catch (error) {
+      storageError = error;
+    }
+    try {
+      await bundle.cdp.stop();
+    } catch (error) {
+      if (!storageError) storageError = error;
+    }
+    if (storageError) throw storageError;
+  }
+
+  private async rollbackFailedCaptureStart(sessionId: string): Promise<void> {
+    this.suspendingCaptureSessions.add(sessionId);
+    try {
+      await this.detachSessionCaptures(sessionId).catch((error) => {
+        console.warn(
+          `[SessionManager] Failed to fully detach capture after Session ${sessionId} start failed:`,
+          errorMessage(error),
+        );
+      });
+      await this.interactionRecorder?.pause();
+      this.captureEngine.stop();
+      if (this.sessionsRepo.findById(sessionId)) {
+        this.sessionsRepo.updateStatus(sessionId, "stopped", Date.now());
+      }
+      this.currentSessionId = null;
+    } finally {
+      this.suspendingCaptureSessions.delete(sessionId);
+    }
+  }
+
+  private async rollbackFailedCaptureResume(sessionId: string): Promise<void> {
+    this.suspendingCaptureSessions.add(sessionId);
+    try {
+      await this.detachSessionCaptures(sessionId).catch((error) => {
+        console.warn(
+          `[SessionManager] Failed to fully detach capture after Session ${sessionId} resume failed:`,
+          errorMessage(error),
+        );
+      });
+      await this.interactionRecorder?.pause();
+      if (this.sessionsRepo.findById(sessionId)) {
+        this.sessionsRepo.updateStatus(sessionId, "paused");
+      }
+    } finally {
+      this.suspendingCaptureSessions.delete(sessionId);
+    }
+  }
+
+  private async detachSessionCaptures(sessionId: string): Promise<void> {
+    const pending = [...this.pendingCaptureAttachments.entries()]
+      .filter(([key]) => key.startsWith(`${sessionId}:`))
+      .map(([, attachment]) => attachment);
+    if (pending.length > 0) await Promise.allSettled(pending);
+    const bundles = [...this.tabCaptures.values()].filter(
+      (bundle) => bundle.sessionId === sessionId,
+    );
+    await Promise.all(
+      bundles.map((bundle) =>
+        this.detachCapture(bundle.sessionId, bundle.target.tabId),
+      ),
+    );
+  }
+
+  private async syncInteractionRecordingAfterNavigation(
+    sessionId: string,
+    target: BrowserTarget,
+  ): Promise<void> {
+    const recorder = this.interactionRecorder;
+    if (
+      this.currentSessionId !== sessionId ||
+      recorder?.getSessionId() !== sessionId ||
+      !recorder.isRecording()
+    ) {
+      return;
+    }
+    try {
+      await recorder.syncTargetRecordingState(target);
+    } catch (error) {
+      console.warn(
+        `[SessionManager] Failed to restore interaction recording after navigation for ${target.tabId}:`,
+        errorMessage(error),
+      );
+    }
+  }
+
+  private async handleBrowserEvent(
+    event: BrowserCoordinatorEvent,
+  ): Promise<void> {
+    if (this.shuttingDown) return;
+    if (event.type === "target-created") {
+      if (this.intentionalContextCloses.has(event.sessionId)) return;
+      const session = this.sessionsRepo.findById(event.sessionId);
+      if (session) {
+        await this.prepareTargetForMode(session, event.target);
+        if (
+          this.currentSessionId === event.sessionId &&
+          session.status === "running"
+        ) {
+          await this.attachCaptureToTarget(session, event.target);
+        }
+      }
+    } else if (event.type === "target-crashed") {
+      await this.enqueueBrowserLifecycle(() =>
+        this.handleTargetCrash(
+          event.sessionId,
+          event.tabId,
+          event.reason,
+        ),
+      );
+      return;
+    } else if (event.type === "target-closed") {
+      await this.detachCapture(event.sessionId, event.tabId);
+      this.injectors.get(targetKey(event.sessionId, event.tabId))?.stop();
+      this.injectors.delete(targetKey(event.sessionId, event.tabId));
+      this.interactionRecorder?.detachTarget(event.tabId);
+      for (const [id, scope] of this.electronTargetScopes) {
+        if (scope.sessionId === event.sessionId && scope.tabId === event.tabId) {
+          this.electronTargetScopes.delete(id);
+        }
+      }
+    } else if (
+      event.type === "disconnected" &&
+      event.backendKind === "cloak"
+    ) {
+      const intentional = this.intentionalContextCloses.delete(event.sessionId);
+      await this.enqueueBrowserLifecycle(() =>
+        this.handleUnexpectedCloakDisconnect(event.sessionId, intentional),
+      );
+      return;
+    }
+
+    if (event.backendKind === "cloak") {
+      await this.persistTabsBestEffort(event.sessionId);
+    }
+  }
+
+  private async handleUnexpectedCloakDisconnect(
+    sessionId: string,
+    intentional = false,
+  ): Promise<void> {
+    await this.detachSessionCaptures(sessionId).catch((error) => {
+      console.warn(
+        `[SessionManager] Failed to detach capture after Cloak Session ${sessionId} disconnected:`,
+        errorMessage(error),
+      );
+    });
+    if (intentional || this.shuttingDown) return;
+    const wasActive = this.activeBrowserSessionId === sessionId;
+    const attempts = this.crashRecoveryAttempts.get(sessionId) ?? 0;
+    if (attempts >= 1) {
+      this.sessionErrors.set(
+        sessionId,
+        "CloakBrowser exited again after one automatic recovery",
+      );
+      if (this.currentSessionId === sessionId) {
+        await this.rollbackFailedCaptureStart(sessionId);
+      }
+      return;
+    }
+    this.crashRecoveryAttempts.set(sessionId, attempts + 1);
+    try {
+      const session = this.requireSession(sessionId);
+      const context = await this.openBrowserContext(session, this.lastProxyConfig);
+      if (wasActive) {
+        await this.browserCoordinator.setActiveSession(sessionId);
+        this.activeBrowserSessionId = sessionId;
+      }
+      await this.initializeOpenedContext(session, context);
+      await this.persistTabsBestEffort(sessionId);
+      if (wasActive) await this.sendTabsReset(sessionId, context);
+      if (this.currentSessionId === sessionId && session.status === "running") {
+        for (const target of await context.targets()) {
+          await this.attachCaptureToTarget(session, target);
+        }
+      }
+    } catch (error) {
+      this.sessionErrors.set(sessionId, errorMessage(error));
+      if (this.currentSessionId === sessionId) {
+        await this.rollbackFailedCaptureStart(sessionId);
+      }
+    }
+  }
+
+  private async handleTargetCrash(
+    sessionId: string,
+    tabId: string,
+    reason?: string,
+  ): Promise<void> {
+    this.sessionErrors.set(sessionId, reason ?? "Browser target crashed");
+    try {
+      if (this.currentSessionId === sessionId) {
+        await this.rollbackFailedCaptureStart(sessionId);
+      } else {
+        await this.detachCapture(sessionId, tabId);
+      }
+    } finally {
+      const key = targetKey(sessionId, tabId);
+      this.injectors.get(key)?.stop();
+      this.injectors.delete(key);
+      this.interactionRecorder?.detachTarget(tabId);
+      for (const [id, scope] of this.electronTargetScopes) {
+        if (scope.sessionId === sessionId && scope.tabId === tabId) {
+          this.electronTargetScopes.delete(id);
+        }
+      }
+    }
+  }
+
+  private async ensureCloakCapacity(
+    openingSessionId: string,
+  ): Promise<string | null> {
+    if (!this.cloakRuntime) this.assertCloakAvailable();
+    const contexts = [...this.cloakRuntime!.listContexts()].filter(
+      (context) => context.sessionId !== openingSessionId,
+    );
+    const seatLimit = Math.min(
+      2,
+      Math.max(1, this.cloakRuntime!.getStatus().seats || 1),
+    );
+    if (contexts.length < seatLimit) return null;
+
+    const evictionCount = contexts.length - seatLimit + 1;
+    const activeSessionId = this.browserCoordinator.getActiveSessionId();
+    const candidates = contexts.filter(
+      (context) => context.sessionId !== activeSessionId,
+    );
+    if (candidates.length < evictionCount && activeSessionId) {
+      const activeContext = contexts.find(
+        (context) => context.sessionId === activeSessionId,
+      );
+      if (activeContext) candidates.push(activeContext);
+    }
+    candidates.sort((left, right) => left.lastUsedAt - right.lastUsedAt);
+    const victims = candidates.slice(0, evictionCount);
+    for (const victim of victims) {
+      await this.persistTabs(victim.sessionId);
+    }
+    if (
+      activeSessionId &&
+      victims.some((victim) => victim.sessionId === activeSessionId)
+    ) {
+      await this.browserCoordinator.setActiveSession(null);
+    }
+    for (const victim of victims) {
+      await this.closeBrowserContext(victim.sessionId);
+    }
+    return activeSessionId && victims.some(
+      (victim) => victim.sessionId === activeSessionId,
+    )
+      ? activeSessionId
+      : null;
+  }
+
+  private async restoreEvictedActiveCloakSession(
+    sessionId: string | null,
+    interruptedCapture: CaptureStateSnapshot | null,
+    proxy: ProxyConfig | null,
+  ): Promise<void> {
+    if (!sessionId) return;
+
+    try {
+      const session = this.requireSession(sessionId);
+      let context = this.browserCoordinator.hasOpenSession(sessionId)
+        ? this.browserCoordinator.resolveContext(sessionId)
+        : null;
+      if (!context) {
+        context = await this.openBrowserContext(session, proxy);
+      }
+      await this.browserCoordinator.setActiveSession(sessionId);
+      this.activeBrowserSessionId = sessionId;
+      await this.initializeOpenedContext(session, context);
+      await this.persistTabsBestEffort(sessionId);
+      await this.sendTabsReset(sessionId, context);
+
+      if (interruptedCapture?.sessionId === sessionId) {
+        await this.restoreCaptureState(
+          interruptedCapture.sessionId,
+          interruptedCapture.status,
+          proxy,
+        );
+      }
+    } catch (restoreError) {
+      console.error(
+        `[SessionManager] Failed to restore evicted active Cloak Session ${sessionId}:`,
+        restoreError,
+      );
+    }
+  }
+
+  private async persistTabs(sessionId: string): Promise<void> {
+    const session = this.sessionsRepo.findById(sessionId);
+    if (
+      !session ||
+      session.browser_backend !== "cloak" ||
+      !session.browser_profile_id ||
+      !this.browserCoordinator.hasOpenSession(sessionId)
+    ) {
+      return;
+    }
+    const context = this.browserCoordinator.resolveContext(sessionId);
+    const targets = await context.targets();
+    const now = Date.now();
+    this.browserTabsRepo.replaceForProfile(
+      session.browser_profile_id,
+      targets.map((target, position) => {
+        const state = target.getState();
+        return {
+          id: state.tabId,
+          profile_id: session.browser_profile_id!,
+          url: state.url,
+          title: state.title,
+          position,
+          active: state.isActive,
+          updated_at: now,
+        } satisfies BrowserTabState;
+      }),
+    );
+    this.browserProfilesRepo.touchLastUsed(session.browser_profile_id, now);
+  }
+
+  private async persistTabsBestEffort(sessionId: string): Promise<void> {
+    try {
+      await this.persistTabs(sessionId);
+    } catch (error) {
+      console.warn(
+        `[SessionManager] Failed to persist tabs for ${sessionId}:`,
+        errorMessage(error),
+      );
+    }
+  }
+
+  private async sendTabsReset(
+    sessionId: string,
+    context: BrowserContext,
+  ): Promise<void> {
+    if (
+      this.activeBrowserSessionId !== sessionId ||
+      this.browserCoordinator.getActiveSessionId() !== sessionId ||
+      !this.rendererWebContents ||
+      this.rendererWebContents.isDestroyed()
+    ) {
+      return;
+    }
+    this.rendererWebContents.send(
+      "tabs:reset",
+      {
+        sessionId,
+        contextId: context.id,
+        tabId: null,
+        tabs: (await context.targets()).map(toBrowserTab),
+      },
+    );
+  }
+
+  private async closeBrowserContext(sessionId: string): Promise<void> {
+    if (!this.browserCoordinator.hasOpenSession(sessionId)) return;
+    this.intentionalContextCloses.add(sessionId);
+    try {
+      await this.detachSessionCaptures(sessionId);
+      await this.clearPreparedTargets(sessionId);
+      await this.browserCoordinator.closeSession(sessionId);
+    } finally {
+      this.intentionalContextCloses.delete(sessionId);
+      if (this.activeBrowserSessionId === sessionId) {
+        this.activeBrowserSessionId = null;
+      }
+    }
+  }
+
+  private async rollbackOpenedCloakContext(
+    sessionId: string,
+    context: BrowserContext,
+    previouslyActiveSessionId: string | null,
+    cause: unknown,
+  ): Promise<void> {
+    this.sessionErrors.set(sessionId, errorMessage(cause));
+
+    try {
+      await this.closeBrowserContext(sessionId);
+    } catch (cleanupError) {
+      console.warn(
+        `[SessionManager] Failed to close newly opened Cloak Context for ${sessionId}:`,
+        errorMessage(cleanupError),
+      );
+      await this.clearPreparedTargets(sessionId).catch(() => undefined);
+      if (!context.isClosed()) {
+        await context.close().catch((fallbackError) => {
+          console.warn(
+            `[SessionManager] Direct Cloak Context close also failed for ${sessionId}:`,
+            errorMessage(fallbackError),
+          );
+        });
+      }
+    }
+
+    if (this.currentSessionId === sessionId) {
+      await this.rollbackFailedCaptureStart(sessionId);
+    } else {
+      const persisted = this.sessionsRepo.findById(sessionId);
+      if (persisted && persisted.status !== "stopped") {
+        this.sessionsRepo.updateStatus(sessionId, "stopped", Date.now());
+      }
+    }
+
+    if (
+      previouslyActiveSessionId &&
+      this.browserCoordinator.hasOpenSession(previouslyActiveSessionId)
+    ) {
+      try {
+        await this.browserCoordinator.setActiveSession(previouslyActiveSessionId);
+        this.activeBrowserSessionId = previouslyActiveSessionId;
+      } catch (restoreError) {
+        console.warn(
+          `[SessionManager] Failed to restore active Session ${previouslyActiveSessionId} after Cloak initialization failed:`,
+          errorMessage(restoreError),
+        );
+      }
+    }
+  }
+
+  private async clearPreparedTargets(sessionId: string): Promise<void> {
+    const pending = [...this.pendingTargetPreparations.entries()]
+      .filter(([key]) => key.startsWith(`${sessionId}:`))
+      .map(([, preparation]) => preparation);
+    if (pending.length > 0) await Promise.allSettled(pending);
+    for (const [key, injector] of this.injectors) {
+      if (!key.startsWith(`${sessionId}:`)) continue;
+      injector.stop();
+      this.injectors.delete(key);
+    }
+    for (const [id, scope] of this.electronTargetScopes) {
+      if (scope.sessionId === sessionId) this.electronTargetScopes.delete(id);
+    }
+    if (this.interactionRecorderSessionId === sessionId) {
+      await this.stopPreparedInteractionRecorder();
+    }
+  }
+
+  private async restoreCaptureState(
+    sessionId: string | null,
+    status: Session["status"] | null | undefined,
+    proxy: ProxyConfig | null,
+  ): Promise<void> {
+    if (
+      !sessionId ||
+      (status !== "running" && status !== "paused") ||
+      !this.rendererWebContents
+    ) {
+      return;
+    }
+    await this.startCaptureNow(
+      sessionId,
+      this.rendererWebContents,
+      proxy,
+    );
+    if (status === "paused") await this.pauseCaptureNow(sessionId);
+  }
+
+  private enqueueBrowserLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.browserLifecycleTail.then(operation, operation);
+    this.browserLifecycleTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private registerElectronTarget(target: BrowserTarget): void {
+    if (target.backendKind !== "electron" || target.isClosed()) return;
+    try {
+      const webContents = target.getNativeHandle<WebContents>();
+      this.electronTargetScopes.set(webContents.id, {
+        sessionId: target.sessionId,
+        tabId: target.tabId,
+      });
+    } catch {
+      // Target closed between event delivery and registration.
+    }
+  }
+
+  private handlePageMessage(sessionId: string, data: unknown): void {
+    if (this.currentSessionId !== sessionId || !data || typeof data !== "object") {
+      return;
+    }
+    const message = data as Record<string, unknown>;
+    if (message.type === "ar-hook") {
+      this.captureEngine.handleHookCaptured({
+        hookType: String(message.hookType ?? ""),
+        functionName: String(message.functionName ?? ""),
+        arguments: String(message.arguments ?? ""),
+        result: message.result == null ? null : String(message.result),
+        callStack: message.callStack == null ? null : String(message.callStack),
+        timestamp:
+          typeof message.timestamp === "number" ? message.timestamp : Date.now(),
+      });
+    } else if (
+      message.type === "ar-interaction" &&
+      this.interactionRecorder &&
+      isRawInteractionMessage(message)
+    ) {
+      this.interactionRecorder.handleInteraction({
+        type: message.interactionType as RawInteractionData["type"],
+        timestamp: message.timestamp as number,
+        x: message.x as number | undefined,
+        y: message.y as number | undefined,
+        viewportX: message.viewportX as number | undefined,
+        viewportY: message.viewportY as number | undefined,
+        selector: message.selector as string | undefined,
+        xpath: message.xpath as string | undefined,
+        tagName: message.tagName as string | undefined,
+        elementText: message.elementText as string | undefined,
+        attributes: message.attributes as Record<string, string> | undefined,
+        boundingRect: message.boundingRect as RawInteractionData["boundingRect"],
+        inputValue: message.inputValue as string | undefined,
+        key: message.key as string | undefined,
+        scrollX: message.scrollX as number | undefined,
+        scrollY: message.scrollY as number | undefined,
+        scrollDX: message.scrollDX as number | undefined,
+        scrollDY: message.scrollDY as number | undefined,
+        url: message.url as string,
+        pageTitle: message.pageTitle as string | undefined,
+        path: message.path as RawInteractionData["path"],
+      });
+    }
+  }
+
+  private resolveTarget(
+    sessionId?: string,
+    tabId?: string,
+  ): BrowserTarget {
+    if (sessionId) return this.browserCoordinator.resolveTarget(sessionId, tabId);
+    if (tabId) {
+      const activeId = this.browserCoordinator.getActiveSessionId();
+      if (!activeId) {
+        throw new BrowserBackendError(
+          "CONTEXT_NOT_FOUND",
+          "No browser Session is active",
+        );
+      }
+      return this.browserCoordinator.resolveTarget(activeId, tabId);
+    }
+    const target = this.browserCoordinator.getActiveTarget();
+    if (!target) {
+      throw new BrowserBackendError("TARGET_NOT_FOUND", "No active browser tab");
+    }
+    return target;
+  }
+
+  private requireActiveContext(): BrowserContext {
+    const context = this.browserCoordinator.getActiveContext();
+    if (!context) {
+      throw new BrowserBackendError(
+        "CONTEXT_NOT_FOUND",
+        "No browser Session is active",
+      );
+    }
+    return context;
+  }
+
+  private requireSession(sessionId: string): Session {
+    const session = this.sessionsRepo.findById(sessionId);
+    if (!session) throw new Error(`Session ${sessionId} not found`);
+    return session;
+  }
+
+  private requireBrowserConfig(session: Session): SessionBrowserConfig {
+    const config = this.browserConfigRepo.findBySessionId(session.id);
+    if (config) return config;
+    const now = Date.now();
+    return {
+      session_id: session.id,
+      browser_backend: session.browser_backend ?? "electron",
+      capture_mode: session.capture_mode ?? "deep",
+      profile_id: session.browser_profile_id ?? null,
+      last_browser_version: session.last_browser_version ?? null,
+      created_at: now,
+      updated_at: now,
+    };
+  }
+
+  private assertBackendAndMode(
+    backend: BrowserBackendKind,
+    mode: CaptureMode,
+  ): void {
+    if (!this.browserCoordinator.hasBackend(backend)) {
+      throw new BrowserBackendError(
+        "BACKEND_NOT_AVAILABLE",
+        `Browser backend ${backend} is not available in this build`,
+        { backendKind: backend },
+      );
+    }
+    const capabilities = this.browserCoordinator.getCapabilities(backend);
+    if (!capabilities.captureModes.includes(mode)) {
+      throw new BrowserBackendError(
+        "CAPABILITY_UNSUPPORTED",
+        `${backend} does not support ${mode} capture`,
+        { backendKind: backend },
+      );
+    }
+  }
+
+  private assertCloakAvailable(): void {
+    if (!this.cloakRuntime || !this.browserCoordinator.hasBackend("cloak")) {
+      throw new BrowserBackendError(
+        "BACKEND_NOT_AVAILABLE",
+        "CloakBrowser is not available in this build",
+        { backendKind: "cloak" },
+      );
+    }
+  }
+}
+
+function targetKey(sessionId: string, tabId: string): string {
+  return `${sessionId}:${tabId}`;
+}
+
+function toBrowserTab(target: BrowserTarget): BrowserTab {
+  const state = target.getState();
+  return {
+    id: state.tabId,
+    sessionId: target.sessionId,
+    contextId: target.contextId,
+    tabId: target.tabId,
+    url: state.url,
+    title: state.title,
+    isActive: state.isActive,
+    isLoading: state.isLoading,
+  };
+}
+
+function isRawInteractionMessage(
+  message: Record<string, unknown>,
+): boolean {
+  return (
+    typeof message.interactionType === "string" &&
+    ["click", "dblclick", "input", "scroll", "navigate", "hover"].includes(
+      message.interactionType,
+    ) &&
+    typeof message.timestamp === "number" &&
+    typeof message.url === "string"
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

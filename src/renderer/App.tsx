@@ -5,6 +5,7 @@ import type { AppView } from './components/Titlebar'
 import StatusBar from './components/StatusBar'
 import SessionList from './components/SessionList'
 import BrowserPanel from './components/BrowserPanel'
+import ExternalBrowserSurface from './components/ExternalBrowserSurface'
 import TabBar from './components/TabBar'
 import AnalyzeBar from './components/AnalyzeBar'
 import SettingsModal from './components/SettingsModal'
@@ -30,6 +31,7 @@ import { LocaleProvider } from './i18n'
 import { zh } from './i18n/zh'
 import { en } from './i18n/en'
 import type { LocaleKey } from './i18n'
+import { shouldShowEmbeddedBrowser } from '@shared/browser-presentation'
 
 function App(): React.ReactElement {
   const toast = useToast()
@@ -43,6 +45,7 @@ function App(): React.ReactElement {
     createSession,
     selectSession,
     deleteSession,
+    setCaptureMode,
     startCapture,
     resumeCapture,
     pauseCapture,
@@ -52,8 +55,16 @@ function App(): React.ReactElement {
   const { tabs, activeTabId, activeTabUrl, isActiveTabLoading, activateTab, closeTab, createTab } = useTabs()
 
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [sessionModalOpen, setSessionModalOpen] = useState(false)
+  const [titlebarOverlayOpen, setTitlebarOverlayOpen] = useState(false)
   const [activeView, setActiveView] = useState<AppView>('browser')
   const [createTrigger, setCreateTrigger] = useState(0)
+
+  const embeddedBrowserVisible =
+    shouldShowEmbeddedBrowser(activeView, currentSession?.browser_backend) &&
+    !settingsOpen &&
+    !sessionModalOpen &&
+    !titlebarOverlayOpen
 
   // Theme & locale state (persisted to localStorage)
   const [appTheme, setAppTheme] = useState<string>(() => {
@@ -105,15 +116,11 @@ function App(): React.ReactElement {
 
   const openSettings = useCallback(() => {
     setSettingsOpen(true)
-    window.electronAPI.setTargetViewVisible(false)
   }, [])
 
   const closeSettings = useCallback(() => {
     setSettingsOpen(false)
-    if (activeView === 'browser' && currentSession) {
-      window.electronAPI.setTargetViewVisible(true)
-    }
-  }, [activeView, currentSession])
+  }, [])
 
   const [selectedRequestId, setSelectedRequestId] = useState<string | null>(null)
   const [selectedSeqs, setSelectedSeqs] = useState<number[]>([])
@@ -227,7 +234,12 @@ function App(): React.ReactElement {
   // could overlap the capture controls, swallowing Start/Pause/Stop clicks.
   useEffect(() => {
     const el = placeholderRef.current
-    if (!el || activeView !== 'browser' || !currentSession) return
+    if (
+      !el ||
+      activeView !== 'browser' ||
+      !currentSession ||
+      currentSession.browser_backend === 'cloak'
+    ) return
 
     const reportBounds = () => {
       const rect = el.getBoundingClientRect()
@@ -246,14 +258,12 @@ function App(): React.ReactElement {
     return () => observer.disconnect()
   }, [activeView, currentSession])
 
-  // Hide/show browser view based on active view and session
+  // A native WebContentsView always sits above the renderer on Windows. Keep
+  // its visibility derived from app state so empty/Cloak/modal screens remain
+  // interactive instead of relying on each overlay to restore it correctly.
   useEffect(() => {
-    if (activeView === 'browser' && currentSession) {
-      window.electronAPI.setTargetViewVisible(true)
-    } else {
-      window.electronAPI.setTargetViewVisible(false)
-    }
-  }, [activeView, currentSession])
+    void window.electronAPI.setTargetViewVisible(embeddedBrowserVisible)
+  }, [embeddedBrowserVisible, currentSessionId])
 
   // Browser navigation handlers
   const handleNavigate = useCallback(async (url: string) => {
@@ -305,9 +315,7 @@ function App(): React.ReactElement {
     window.electronAPI.setTargetViewVisible(false)
     const ok = await confirm(t('data.clearEnvConfirm'), { okText: t('data.clear') })
     if (!ok) {
-      if (activeView === 'browser' && currentSession) {
-        window.electronAPI.setTargetViewVisible(true)
-      }
+      window.electronAPI.setTargetViewVisible(embeddedBrowserVisible)
       return
     }
     try {
@@ -317,10 +325,8 @@ function App(): React.ReactElement {
       console.error('Clear env failed:', err)
       toast.error(t('toast.envClearFailed'))
     }
-    if (activeView === 'browser' && currentSession) {
-      window.electronAPI.setTargetViewVisible(true)
-    }
-  }, [toast, confirm, t, activeView, currentSession])
+    window.electronAPI.setTargetViewVisible(embeddedBrowserVisible)
+  }, [toast, confirm, t, embeddedBrowserVisible])
 
   // Clear capture data for re-analysis
   const handleClearData = useCallback(async () => {
@@ -517,18 +523,29 @@ function App(): React.ReactElement {
             onReload={handleReload}
             captureSlot={buildCaptureSlot()}
             onClearEnv={handleClearEnv}
-            onToggleDevTools={() => window.electronAPI.toggleDevTools()}
+            onToggleDevTools={
+              currentSession.browser_backend === 'cloak'
+                ? undefined
+                : () => window.electronAPI.toggleDevTools()
+            }
           />
 
-          {/* Browser view placeholder — native WebContentsView overlays this area */}
-          <div
-            ref={placeholderRef}
-            style={{
-              flex: 1,
-              position: 'relative',
-              minHeight: 80
-            }}
-          />
+          {currentSession.browser_backend === 'cloak' ? (
+            <ExternalBrowserSurface
+              session={currentSession}
+              onCaptureModeChange={(mode) => setCaptureMode(currentSession.id, mode)}
+            />
+          ) : (
+            /* Native WebContentsView overlays this placeholder. */
+            <div
+              ref={placeholderRef}
+              style={{
+                flex: 1,
+                position: 'relative',
+                minHeight: 80
+              }}
+            />
+          )}
         </>
       ) : (
         renderEmptyGuide()
@@ -651,7 +668,7 @@ function App(): React.ReactElement {
             </div>
           ) : activeTab === 'hooks' ? (
             <div style={{ flex: 1, overflow: 'auto', padding: '0 12px' }}>
-              <HookLog hooks={hooks} />
+              <HookLog hooks={hooks} captureMode={currentSession.capture_mode} />
             </div>
           ) : activeTab === 'storage' ? (
             <div style={{ flex: 1, overflow: 'auto', padding: '0 12px' }}>
@@ -659,7 +676,7 @@ function App(): React.ReactElement {
             </div>
           ) : activeTab === 'interactions' ? (
             <div style={{ flex: 1, overflow: 'hidden', padding: '0 12px' }}>
-              <InteractionLog interactions={interactions} />
+              <InteractionLog interactions={interactions} captureMode={currentSession.capture_mode} />
             </div>
           ) : null}
 
@@ -723,6 +740,7 @@ function App(): React.ReactElement {
         onLocaleToggle={handleLocaleToggle}
         activeView={activeView}
         onViewChange={setActiveView}
+        onOverlayVisibilityChange={setTitlebarOverlayOpen}
         requestCount={requests.length}
       />
 
@@ -746,6 +764,7 @@ function App(): React.ReactElement {
             onCreate={createSession}
             onDelete={deleteSession}
             onOpenSettings={openSettings}
+            onModalVisibilityChange={setSessionModalOpen}
             activeRequestCount={requests.length}
             createTrigger={createTrigger}
           />
@@ -774,7 +793,13 @@ function App(): React.ReactElement {
       />
 
       {/* Settings modal */}
-      <SettingsModal open={settingsOpen} onClose={closeSettings} currentSessionId={currentSession?.id ?? null} />
+      <SettingsModal
+        open={settingsOpen}
+        onClose={closeSettings}
+        currentSessionId={currentSession?.id ?? null}
+        currentSessionBackend={currentSession?.browser_backend}
+        onProfileRestored={loadSessions}
+      />
       {/* Confirm dialog (portal) */}
       {ConfirmDialog}
     </div>

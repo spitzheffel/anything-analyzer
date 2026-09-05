@@ -426,7 +426,13 @@ export class LLMRouter {
 
     for (;;) {
       const url = `${this.config.baseUrl.replace(/\/$/, "")}/chat/completions`;
-      const body = {
+      const body: {
+        model: string;
+        messages: Record<string, unknown>[];
+        max_tokens: number;
+        stream: boolean;
+        tools?: typeof openaiTools;
+      } = {
         model: this.config.model,
         messages: history.map((m) => {
           const msg: Record<string, unknown> = { role: m.role, content: m.content };

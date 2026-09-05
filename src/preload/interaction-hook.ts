@@ -75,12 +75,14 @@
     let current: Element | null = el
     while (current && current !== document.documentElement) {
       const tag = current.tagName.toLowerCase()
-      const parent = current.parentElement
+      const parent: Element | null = current.parentElement
       if (!parent) {
         parts.unshift(tag)
         break
       }
-      const sameTagSiblings = Array.from(parent.children).filter(c => c.tagName === current!.tagName)
+      const sameTagSiblings = Array.from(parent.children).filter(
+        (candidate: Element) => candidate.tagName === current!.tagName
+      )
       if (sameTagSiblings.length === 1) {
         parts.unshift(tag)
       } else {

@@ -1,9 +1,13 @@
 import Database from 'better-sqlite3'
 import { app } from 'electron'
-import { join } from 'path'
-import { existsSync, mkdirSync } from 'fs'
+import { dirname, join } from 'path'
+import { existsSync, mkdirSync, renameSync, unlinkSync } from 'fs'
 
 let db: Database.Database | null = null
+
+export function databasePathFor(userDataPath: string): string {
+  return join(userDataPath, 'data', 'anything-register.db')
+}
 
 /**
  * Get or initialize the SQLite database connection.
@@ -19,7 +23,7 @@ export function getDatabase(): Database.Database {
     mkdirSync(dbDir, { recursive: true })
   }
 
-  const dbPath = join(dbDir, 'anything-register.db')
+  const dbPath = databasePathFor(userDataPath)
 
   db = new Database(dbPath)
 
@@ -28,6 +32,55 @@ export function getDatabase(): Database.Database {
   db.pragma('foreign_keys = ON')
 
   return db
+}
+
+/** Import a consistent SQLite snapshot without copying WAL/SHM sidecars. */
+export async function importDatabaseSnapshot(
+  sourcePath: string,
+  destinationPath: string,
+): Promise<void> {
+  if (!existsSync(sourcePath)) throw new Error('Source database does not exist')
+  if (existsSync(destinationPath)) {
+    throw new Error('Destination database already exists')
+  }
+
+  const destinationDir = dirname(destinationPath)
+  mkdirSync(destinationDir, { recursive: true })
+  const temporaryPath = `${destinationPath}.importing-${process.pid}`
+  if (existsSync(temporaryPath)) unlinkSync(temporaryPath)
+
+  const source = new Database(sourcePath, {
+    readonly: true,
+    fileMustExist: true,
+  })
+  try {
+    await source.backup(temporaryPath)
+    renameSync(temporaryPath, destinationPath)
+  } finally {
+    source.close()
+    if (existsSync(temporaryPath)) unlinkSync(temporaryPath)
+  }
+}
+
+/** Back up an existing pre-browser-backend database once before migration 011. */
+export async function backupBeforeBrowserMigration(database: Database.Database): Promise<string | null> {
+  const hasSessionsTable = Boolean(database.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+  ).get())
+  const hasBrowserConfig = Boolean(database.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session_browser_config'",
+  ).get())
+  if (!hasSessionsTable || hasBrowserConfig) return null
+
+  const sessionCount = (database.prepare('SELECT COUNT(*) AS count FROM sessions').get() as { count: number }).count
+  if (sessionCount === 0) return null
+
+  const backupDir = join(app.getPath('userData'), 'data', 'backups')
+  mkdirSync(backupDir, { recursive: true })
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+  const destination = join(backupDir, `anything-register-pre-browser-${stamp}.db`)
+  await database.backup(destination)
+  return destination
 }
 
 /**

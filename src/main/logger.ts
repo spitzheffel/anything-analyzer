@@ -2,6 +2,32 @@ import log from "electron-log/main";
 import { app } from "electron";
 import { join } from "path";
 
+const SENSITIVE_KEY = /^(authorization|proxy-authorization|license[_-]?key|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|api[_-]?key)$/i;
+
+function redactString(value: string): string {
+  return value
+    .replace(/([?&](?:access_token|refresh_token|token|key|api_key|auth|authorization)=)[^&\s]+/gi, "$1[REDACTED]")
+    .replace(/((?:authorization|proxy-authorization)\s*[:=]\s*)[^\r\n,;}]+/gi, "$1[REDACTED]")
+    .replace(/((?:license[_-]?key|password|secret|token|api[_-]?key)\s*[:=]\s*)[^\s,;}]+/gi, "$1[REDACTED]")
+    .replace(/((?:https?|wss?):\/\/)[^/@\s]+@/gi, "$1[REDACTED]@");
+}
+
+function redactLogValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === "string") return redactString(value);
+  if (!value || typeof value !== "object") return value;
+  if (seen.has(value)) return "[Circular]";
+  seen.add(value);
+  if (value instanceof Error) {
+    return { name: value.name, message: redactString(value.message), stack: value.stack ? redactString(value.stack) : undefined };
+  }
+  if (Array.isArray(value)) return value.map((entry) => redactLogValue(entry, seen));
+  const result: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+    result[key] = SENSITIVE_KEY.test(key) ? "[REDACTED]" : redactLogValue(entry, seen);
+  }
+  return result;
+}
+
 /**
  * Initialize electron-log for persistent file logging.
  * Log files are stored in the app's userData/logs directory.
@@ -22,6 +48,11 @@ export function initLogger(): void {
 
   // Format: [timestamp] [level] message
   log.transports.file.format = "[{y}-{m}-{d} {h}:{i}:{s}.{ms}] [{level}] {text}";
+
+  log.hooks.push((message) => ({
+    ...message,
+    data: message.data.map((value) => redactLogValue(value)),
+  }));
 
   // Override console methods so existing console.log/warn/error
   // statements throughout the codebase are automatically captured.

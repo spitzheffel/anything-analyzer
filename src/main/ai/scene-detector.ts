@@ -267,7 +267,9 @@ export class SceneDetector {
    */
   private isJsonResponse(req: FilteredRequest): boolean {
     const contentType = req.responseHeaders?.['content-type']?.toLowerCase() || ''
-    return contentType.includes('json') || (req.responseBody && this.isJsonString(req.responseBody))
+    return contentType.includes('json') || Boolean(
+      req.responseBody && this.isJsonString(req.responseBody)
+    )
   }
 
 

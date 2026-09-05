@@ -1,0 +1,54 @@
+appId: com.anything.analyzer.internal
+productName: Anything Analyzer Internal
+directories:
+  buildResources: resources
+  output: dist-internal
+extraMetadata:
+  main: ./out-internal/main/index.js
+files:
+  - 'out-internal{,/**}'
+  - 'package.json'
+  - from: resources
+    to: resources
+    filter:
+      - icon.png
+  - '!**/.vscode/*'
+  - '!src{,/**}'
+  - '!tests{,/**}'
+  - '!**/tests{,/**}'
+  - '!**/__tests__{,/**}'
+  - '!dist{,/**}'
+  - '!dist-internal{,/**}'
+  - '!output{,/**}'
+  - '!electron.vite.config.*'
+  - '!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!**/.cloakbrowser{,/**}'
+  - '!**/browser-profiles/cloak{,/**}'
+  - '!**/license.key'
+  - '!**/.license_cache'
+  - '!**/chromium-[0-9]*{,/**}'
+  - '!**/_download_*.{zip,tar.gz}'
+publish: null
+win:
+  target:
+    - nsis
+  artifactName: "Anything-Analyzer-Internal-Setup-${version}.${ext}"
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+mac:
+  category: public.app-category.developer-tools
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  type: distribution
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+  target:
+    - dmg
+    - zip
+  artifactName: "Anything-Analyzer-Internal-${version}-${arch}.${ext}"
+linux:
+  target:
+    - AppImage
+  artifactName: "Anything-Analyzer-Internal-${version}.${ext}"

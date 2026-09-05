@@ -1,24 +1,33 @@
 import { useEffect, useState } from 'react'
 import { Button, Input, InputNumber, Select, useToast } from '../../ui'
 import { useLocale } from '../../i18n'
-import type { FingerprintProfile } from '@shared/types'
+import type { BrowserBackendKind, FingerprintProfile } from '@shared/types'
 
 interface Props {
   currentSessionId?: string | null
+  backend?: BrowserBackendKind
 }
 
-export default function FingerprintSection({ currentSessionId }: Props) {
+export default function FingerprintSection({ currentSessionId, backend = 'electron' }: Props) {
   const toast = useToast()
   const { t } = useLocale()
   const [profile, setProfile] = useState<FingerprintProfile | null>(null)
   const [expanded, setExpanded] = useState(false)
 
   useEffect(() => {
-    if (!currentSessionId) { setProfile(null); return }
+    if (!currentSessionId || backend === 'cloak') { setProfile(null); return }
     window.electronAPI.getFingerprintProfile(currentSessionId).then(p => {
       setProfile(p)
     })
-  }, [currentSessionId])
+  }, [currentSessionId, backend])
+
+  if (backend === 'cloak') {
+    return (
+      <div style={{ color: 'var(--text-muted)', padding: 20, lineHeight: 1.6 }}>
+        CloakBrowser owns the complete fingerprint profile for this session. Anything Analyzer does not apply its Electron stealth scripts or header overrides.
+      </div>
+    )
+  }
 
   if (!currentSessionId) {
     return (

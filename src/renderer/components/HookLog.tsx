@@ -1,10 +1,12 @@
 import React, { useMemo } from 'react'
 import { VirtualTable, Tag, CopyableBlock } from '../ui'
 import type { VTColumn } from '../ui'
-import type { JsHookRecord, HookType } from '@shared/types'
+import type { CaptureMode, JsHookRecord, HookType } from '@shared/types'
+import { useLocale } from '../i18n'
 
 interface HookLogProps {
   hooks: JsHookRecord[]
+  captureMode?: CaptureMode
 }
 
 // Color mapping for hook types
@@ -61,7 +63,8 @@ const ExpandedRow: React.FC<{ record: JsHookRecord }> = ({ record }) => (
   </div>
 )
 
-const HookLog: React.FC<HookLogProps> = ({ hooks }) => {
+const HookLog: React.FC<HookLogProps> = ({ hooks, captureMode }) => {
+  const { t } = useLocale()
   const columns: VTColumn<JsHookRecord>[] = useMemo(() => [
     {
       key: 'timestamp',
@@ -115,17 +118,24 @@ const HookLog: React.FC<HookLogProps> = ({ hooks }) => {
   ], [])
 
   return (
-    <VirtualTable<JsHookRecord>
-      columns={columns}
-      data={hooks}
-      rowKey="id"
-      height={400}
-      expandable={{
-        expandedRowRender: (record) => <ExpandedRow record={record} />,
-        rowExpandable: () => true,
-      }}
-      emptyText="No hook records captured yet"
-    />
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      {captureMode === 'passive' && (
+        <div style={{ padding: '10px 4px', color: 'var(--color-warning)', fontSize: 'var(--font-size-sm)' }}>
+          {t('capture.deepRequiredHooks')}
+        </div>
+      )}
+      <VirtualTable<JsHookRecord>
+        columns={columns}
+        data={hooks}
+        rowKey="id"
+        height={400}
+        expandable={{
+          expandedRowRender: (record) => <ExpandedRow record={record} />,
+          rowExpandable: () => true,
+        }}
+        emptyText="No hook records captured yet"
+      />
+    </div>
   )
 }
 

@@ -1,11 +1,12 @@
 import React, { useMemo } from 'react'
 import { VirtualTable, Tag } from '../ui'
 import type { VTColumn } from '../ui'
-import type { InteractionEvent, InteractionType } from '@shared/types'
+import type { CaptureMode, InteractionEvent, InteractionType } from '@shared/types'
 import { useLocale } from '../i18n'
 
 interface InteractionLogProps {
   interactions: InteractionEvent[]
+  captureMode?: CaptureMode
 }
 
 const TYPE_COLORS: Record<InteractionType, 'info' | 'success' | 'purple' | 'orange' | 'warning' | 'error'> = {
@@ -75,7 +76,7 @@ const ExpandedRow: React.FC<{ record: InteractionEvent }> = ({ record }) => {
   )
 }
 
-const InteractionLog: React.FC<InteractionLogProps> = ({ interactions }) => {
+const InteractionLog: React.FC<InteractionLogProps> = ({ interactions, captureMode }) => {
   const { t } = useLocale()
 
   const typeLabel = (type: InteractionType): string => {
@@ -161,22 +162,31 @@ const InteractionLog: React.FC<InteractionLogProps> = ({ interactions }) => {
         color: 'var(--text-muted)',
         fontSize: 'var(--font-size-sm)',
       }}>
-        {t('interaction.noData')}
+        {captureMode === 'passive'
+          ? t('capture.deepRequiredInteractions')
+          : t('interaction.noData')}
       </div>
     )
   }
 
   return (
-    <VirtualTable<InteractionEvent>
-      columns={columns}
-      data={interactions}
-      rowKey="id"
-      rowHeight={34}
-      expandable={{
-        expandedRowRender: (record) => <ExpandedRow record={record} />,
-        rowExpandable: (record) => record.type !== 'scroll',
-      }}
-    />
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+      {captureMode === 'passive' && (
+        <div style={{ padding: '10px 4px', color: 'var(--color-warning)', fontSize: 'var(--font-size-sm)' }}>
+          {t('capture.deepRequiredInteractions')}
+        </div>
+      )}
+      <VirtualTable<InteractionEvent>
+        columns={columns}
+        data={interactions}
+        rowKey="id"
+        rowHeight={34}
+        expandable={{
+          expandedRowRender: (record) => <ExpandedRow record={record} />,
+          rowExpandable: (record) => record.type !== 'scroll',
+        }}
+      />
+    </div>
   )
 }
 

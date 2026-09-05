@@ -17,8 +17,8 @@ export class WindowManager {
   private tabManager: TabManager | null = null;
   /** Browser area height ratio (0.0 ~ 1.0), default 70% */
   private browserRatio = 0.7;
-  /** Whether the browser view should be visible */
-  private targetViewVisible = true;
+  /** Hidden until an Electron-backed Session is explicitly activated. */
+  private targetViewVisible = false;
 
   /**
    * Create the main application window.

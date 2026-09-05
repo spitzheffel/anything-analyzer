@@ -2,6 +2,7 @@ import { autoUpdater } from "electron-updater";
 import { app } from "electron";
 import type { BrowserWindow } from "electron";
 import type { UpdateStatus } from "@shared/types";
+import { BUILD_CHANNEL } from "./build-flavor";
 
 /**
  * Updater — Wraps electron-updater's autoUpdater singleton.
@@ -70,6 +71,10 @@ export class Updater {
 
   /** Trigger an update check. Safe to call at any time. */
   checkForUpdates(): void {
+    if (BUILD_CHANNEL === "internal") {
+      this.sendStatus({ state: "not-available", info: { version: app.getVersion() } });
+      return;
+    }
     // 开发模式下跳过，避免 electron-updater 输出 "Skip checkForUpdates" 警告
     if (!app.isPackaged) {
       this.sendStatus({ state: "not-available", info: { version: app.getVersion() } });
@@ -92,11 +97,11 @@ export class Updater {
   }
 
   private formatNotes(
-    notes: string | Array<{ note: string }> | undefined | null,
+    notes: string | Array<{ note: string | null }> | undefined | null,
   ): string | undefined {
     if (!notes) return undefined;
     if (typeof notes === "string") return notes;
-    return notes.map((n) => n.note).join("\n");
+    return notes.map((n) => n.note ?? "").join("\n");
   }
 
   private formatError(message: string): string {

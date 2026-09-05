@@ -42,12 +42,55 @@ jobs:
           cache-dependency-path: pnpm-lock.yaml
 
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
         env:
           ELECTRON_MIRROR: ""
 
-      - name: Build
+      - name: Run database migrations on Electron ABI
+        run: pnpm run test:migrations:electron
+
+      - name: Rebuild native dependency for Node tests
+        run: pnpm run rebuild:native:node
+
+      - name: Typecheck
+        run: pnpm run typecheck
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build Public
         run: pnpm run build
+
+      - name: Build Internal
+        run: pnpm run build:internal
+
+      - name: Package Internal smoke app for Windows
+        if: matrix.platform == 'win'
+        run: pnpm exec electron-builder --config electron-builder.internal.yml --win --x64 --dir --publish never
+
+      - name: Package Internal smoke app for macOS
+        if: matrix.platform == 'mac'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: pnpm exec electron-builder --config electron-builder.internal.yml --mac --${{ matrix.arch }} --dir --publish never
+
+      - name: Package Internal smoke app for Linux
+        if: matrix.platform == 'linux'
+        run: pnpm exec electron-builder --config electron-builder.internal.yml --linux --x64 --dir --publish never
+
+      - name: Verify Internal package contents
+        run: pnpm run verify:package:internal
+
+      - name: Install Linux packaged-smoke display
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
+      - name: Smoke Internal packaged app
+        run: pnpm run smoke:package:internal
+
+      - name: Smoke Internal packaged UI interactions
+        if: matrix.platform == 'win'
+        run: pnpm run smoke:package:ui:internal
 
       - name: Package for Windows
         if: matrix.platform == 'win'
@@ -117,6 +160,12 @@ jobs:
       - name: Package for Linux
         if: matrix.platform == 'linux'
         run: npx electron-builder --linux --publish never
+
+      - name: Verify Public package contents
+        run: pnpm run verify:package:public
+
+      - name: Smoke Public packaged app
+        run: pnpm run smoke:package:public
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7

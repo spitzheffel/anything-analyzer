@@ -3,8 +3,35 @@ productName: Anything Analyzer
 directories:
   buildResources: resources
 files:
+  - 'out{,/**}'
+  - 'package.json'
+  - from: resources
+    to: resources
+    filter:
+      - icon.png
   - '!**/.vscode/*'
-  - '!src/*'
+  - '!src{,/**}'
+  - '!tests{,/**}'
+  - '!**/tests{,/**}'
+  - '!**/__tests__{,/**}'
+  - '!dist{,/**}'
+  - '!dist-internal{,/**}'
+  - '!output{,/**}'
+  - '!**/node_modules/cloakbrowser{,/**}'
+  - '!**/node_modules/playwright-core{,/**}'
+  - '!**/node_modules/mmdb-lib{,/**}'
+  - '!**/node_modules/socks-proxy-agent{,/**}'
+  - '!**/node_modules/tar{,/**}'
+  - '!**/node_modules/tar/**'
+  - '!**/node_modules/tar/node_modules{,/**}'
+  - '!**/node_modules/tar/node_modules/chownr{,/**}'
+  - '!**/node_modules/chownr{,/**}'
+  - '!**/.cloakbrowser{,/**}'
+  - '!**/browser-profiles/cloak{,/**}'
+  - '!**/license.key'
+  - '!**/.license_cache'
+  - '!**/chromium-[0-9]*{,/**}'
+  - '!**/_download_*.{zip,tar.gz}'
   - '!electron.vite.config.*'
   - '!{.eslintignore,.eslintrc.cjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
   - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'

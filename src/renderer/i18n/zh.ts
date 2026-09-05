@@ -162,6 +162,8 @@ export const zh = {
   'interaction.clear': '清除录制',
   'interaction.clearConfirm': '清除此会话的所有交互录制数据？',
   'interaction.recording': '录制中',
+  'capture.deepRequiredHooks': '页面 Hook 需要 Deep 抓取；Passive 模式不会改写页面 API。',
+  'capture.deepRequiredInteractions': '交互录制需要 Deep 抓取；Passive 模式不会注入交互 Hook。',
   'interaction.points': '{count} 个点',
 
   // AI Request Log

@@ -15,6 +15,41 @@
 
 export type SessionStatus = "running" | "paused" | "stopped";
 
+export type BrowserBackendKind = "electron" | "cloak";
+
+export type CaptureMode = "passive" | "deep";
+
+export type BrowserErrorCode =
+  | "BACKEND_NOT_AVAILABLE"
+  | "BACKEND_NOT_REGISTERED"
+  | "BACKEND_ALREADY_REGISTERED"
+  | "BACKEND_NOT_STARTED"
+  | "BACKEND_SHUTTING_DOWN"
+  | "BACKEND_FAILURE"
+  | "CONTEXT_NOT_FOUND"
+  | "CONTEXT_CLOSED"
+  | "CONTEXT_BACKEND_MISMATCH"
+  | "TARGET_NOT_FOUND"
+  | "TARGET_CLOSED"
+  | "PROFILE_MISSING"
+  | "CAPABILITY_UNSUPPORTED"
+  | "CDP_UNAVAILABLE"
+  | "CDP_DETACHED"
+  | "CDP_IN_USE"
+  | "CDP_DOMAIN_CONFLICT"
+  | "NAVIGATION_FAILED"
+  | "INVALID_ARGUMENT"
+  | "OPERATION_ABORTED";
+
+export interface CreateSessionOptions {
+  backend?: BrowserBackendKind;
+  captureMode?: CaptureMode;
+}
+
+export interface DeleteSessionOptions {
+  retainProfile?: boolean;
+}
+
 export interface Session {
   id: string;
   name: string;
@@ -22,6 +57,94 @@ export interface Session {
   status: SessionStatus;
   created_at: number;
   stopped_at: number | null;
+  /** Defaults to "electron" when an older session has no browser config row. */
+  browser_backend?: BrowserBackendKind;
+  /** Defaults to "deep" when an older session has no browser config row. */
+  capture_mode?: CaptureMode;
+  browser_profile_id?: string | null;
+  last_browser_version?: string | null;
+}
+
+export interface SessionBrowserConfig {
+  session_id: string;
+  browser_backend: BrowserBackendKind;
+  capture_mode: CaptureMode;
+  profile_id: string | null;
+  last_browser_version: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export type BrowserProfileState =
+  | "attached"
+  | "retained"
+  | "deleting"
+  | "delete_failed"
+  | "missing";
+
+export interface BrowserProfile {
+  id: string;
+  display_name: string;
+  /** Opaque key used to derive a profile directory below app userData. */
+  profile_key: string;
+  /** Kept as text so 64-bit, hexadecimal, and future seed formats stay exact. */
+  cloak_seed: string;
+  state: BrowserProfileState;
+  last_used_at: number | null;
+  retained_at: number | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface BrowserTabState {
+  id: string;
+  profile_id: string;
+  url: string;
+  title: string;
+  position: number;
+  active: boolean;
+  updated_at: number;
+}
+
+export type CloakRuntimePolicy = "strict" | "free-latest";
+
+export type CloakRuntimeState =
+  | "unavailable"
+  | "checking"
+  | "login-required"
+  | "not-installed"
+  | "downloading"
+  | "ready"
+  | "error";
+
+export interface CloakDownloadProgress {
+  percent: number;
+  receivedBytes?: number;
+  totalBytes?: number;
+}
+
+export interface CloakRuntimeStatus {
+  available: boolean;
+  state: CloakRuntimeState;
+  loggedIn: boolean;
+  plan: string | null;
+  seats: number;
+  policy: CloakRuntimePolicy;
+  configuredVersion: string | null;
+  actualVersion: string | null;
+  error: string | null;
+  errorCode: BrowserErrorCode | null;
+  downloadProgress: CloakDownloadProgress | null;
+}
+
+export interface BrowserSessionRuntimeStatus {
+  sessionId: string | null;
+  backend: BrowserBackendKind | null;
+  state: "closed" | "opening" | "ready" | "error";
+  presentation: "embedded" | "external" | null;
+  version: string | null;
+  error: string | null;
 }
 
 // ---- Captured Request ----
@@ -211,10 +334,38 @@ export function stripToolContext(content: string): string {
 
 export interface BrowserTab {
   id: string;
+  sessionId: string;
+  contextId: string;
+  tabId: string;
   url: string;
   title: string;
   isActive: boolean;
   isLoading?: boolean;
+}
+
+export interface BrowserTabEventScope {
+  sessionId: string;
+  contextId: string;
+  tabId: string;
+}
+
+export interface BrowserTabActivatedEvent extends BrowserTabEventScope {
+  url: string;
+  title: string;
+}
+
+export interface BrowserTabUpdatedEvent extends BrowserTabEventScope {
+  url?: string;
+  title?: string;
+  isLoading?: boolean;
+}
+
+/** Context-level reset. Null scope explicitly means that no browser Context is active. */
+export interface BrowserTabsResetEvent {
+  sessionId: string | null;
+  contextId: string | null;
+  tabId: null;
+  tabs: BrowserTab[];
 }
 
 // ---- Auto Update ----
@@ -332,6 +483,7 @@ export interface MitmProxyStatus {
   caInstalled: boolean;
   caCertPath: string | null;
   systemProxyEnabled: boolean;
+  localIPs: string[];
 }
 
 // ---- Interaction Recording ----
@@ -542,6 +694,7 @@ export const IPC_CHANNELS = {
   TABS_CLOSED: "tabs:closed",
   TABS_ACTIVATED: "tabs:activated",
   TABS_UPDATED: "tabs:updated",
+  TABS_RESET: "tabs:reset",
 
   // Capture events (main → renderer)
   CAPTURE_REQUEST: "capture:request",
@@ -602,13 +755,14 @@ export interface ElectronAPI {
   closeWindow: () => Promise<void>;
   isWindowMaximized: () => Promise<boolean>;
 
-  createSession: (name: string, targetUrl: string) => Promise<Session>;
+  createSession: (name: string, targetUrl: string, options?: CreateSessionOptions) => Promise<Session>;
   listSessions: () => Promise<Session[]>;
   startCapture: (sessionId: string) => Promise<void>;
   pauseCapture: (sessionId: string) => Promise<void>;
   resumeCapture: (sessionId: string) => Promise<void>;
   stopCapture: (sessionId: string) => Promise<void>;
-  deleteSession: (sessionId: string) => Promise<void>;
+  deleteSession: (sessionId: string, options?: DeleteSessionOptions) => Promise<void>;
+  setCaptureMode: (sessionId: string, mode: CaptureMode) => Promise<Session>;
 
   navigate: (url: string) => Promise<void>;
   goBack: () => Promise<void>;
@@ -617,6 +771,8 @@ export interface ElectronAPI {
   setBrowserRatio: (ratio: number) => Promise<void>;
   setTargetViewVisible: (visible: boolean) => Promise<void>;
   toggleDevTools: () => Promise<void>;
+  focusBrowser: (sessionId?: string) => Promise<void>;
+  getBrowserSessionStatus: (sessionId?: string) => Promise<BrowserSessionRuntimeStatus>;
   exportFile: (defaultName: string, content: string) => Promise<boolean>;
   openExternal: (url: string) => Promise<void>;
 
@@ -650,13 +806,10 @@ export interface ElectronAPI {
 
   // Tab events
   onTabCreated: (callback: (tab: BrowserTab) => void) => void;
-  onTabClosed: (callback: (data: { tabId: string }) => void) => void;
-  onTabActivated: (
-    callback: (data: { tabId: string; url: string; title: string }) => void,
-  ) => void;
-  onTabUpdated: (
-    callback: (data: { tabId: string; url?: string; title?: string; isLoading?: boolean }) => void,
-  ) => void;
+  onTabClosed: (callback: (data: BrowserTabEventScope) => void) => void;
+  onTabActivated: (callback: (data: BrowserTabActivatedEvent) => void) => void;
+  onTabUpdated: (callback: (data: BrowserTabUpdatedEvent) => void) => void;
+  onTabsReset: (callback: (data: BrowserTabsResetEvent) => void) => void;
 
   onRequestCaptured: (callback: (data: CapturedRequest) => void) => void;
   onHookCaptured: (callback: (data: JsHookRecord) => void) => void;
@@ -691,10 +844,21 @@ export interface ElectronAPI {
 
   // Proxy
   getProxyConfig: () => Promise<ProxyConfig | null>;
+  getProxyRestartImpact: () => Promise<
+    Array<{ id: string; name: string; status: SessionStatus }>
+  >;
   saveProxyConfig: (config: ProxyConfig) => Promise<void>;
 
   // Browser environment
-  clearBrowserEnv: () => Promise<void>;
+  clearBrowserEnv: (sessionId?: string) => Promise<void>;
+
+  // CloakBrowser runtime and retained profiles (Internal builds only)
+  getCloakStatus: () => Promise<CloakRuntimeStatus>;
+  prepareCloakRuntime: (policy?: CloakRuntimePolicy) => Promise<CloakRuntimeStatus>;
+  setCloakRuntimePolicy: (policy: CloakRuntimePolicy) => Promise<CloakRuntimeStatus>;
+  listRetainedBrowserProfiles: () => Promise<BrowserProfile[]>;
+  restoreBrowserProfile: (profileId: string) => Promise<Session>;
+  deleteBrowserProfile: (profileId: string) => Promise<void>;
 
   // MCP Server
   getMCPServerConfig: () => Promise<MCPServerSettings>;

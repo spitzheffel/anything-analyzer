@@ -68,6 +68,9 @@ export class DataAssembler {
   private isRelevantRequest(r: CapturedRequest): boolean {
     if (r.method !== 'GET') return true
     if (STATIC_EXTENSIONS.test(r.url)) return false
+    // SSE / WebSocket 是协议分析最关心的对象，但它们的 content-type 不在 API 列表里，
+    // 且 GET 没有请求体，不显式保留就会被下面的规则丢掉
+    if (r.is_streaming || r.is_websocket) return true
     if (r.content_type && API_CONTENT_TYPES.some(t => r.content_type!.includes(t))) return true
     if (r.content_type?.includes('html')) return true
     if (r.request_body) return true

@@ -192,6 +192,13 @@ export type BrowserContextEvent =
       reason?: string;
     }
   | {
+      type: "target-warning";
+      sessionId: string;
+      contextId: string;
+      tabId: string;
+      message: string;
+    }
+  | {
       type: "download";
       sessionId: string;
       contextId: string;
@@ -205,6 +212,29 @@ export type BrowserContextEvent =
       tabId: null;
       reason?: string;
     };
+
+/**
+ * Human-like input, provided by backends that humanize interactions (Cloak).
+ * Replay prefers this over raw CDP Input.* so the recorded actions reproduce the
+ * backend's real mouse trajectories and keystroke timing instead of the
+ * instantaneous, straight-line events an anti-bot system flags.
+ */
+export interface HumanInput {
+  click(options: {
+    selector?: string;
+    x?: number;
+    y?: number;
+    clickCount?: number;
+  }): Promise<void>;
+  type(options: { selector?: string; text: string }): Promise<void>;
+  scroll(options: {
+    x?: number;
+    y?: number;
+    deltaX: number;
+    deltaY: number;
+  }): Promise<void>;
+  move(points: ReadonlyArray<{ x: number; y: number }>): Promise<void>;
+}
 
 export interface BrowserTarget {
   readonly id: string;
@@ -234,6 +264,9 @@ export interface BrowserTarget {
   setVisible?(visible: boolean): Promise<void>;
   setBounds?(bounds: BrowserBounds): Promise<void>;
   toggleDevTools?(): Promise<void>;
+
+  /** Present only when the backend humanizes input (Cloak). */
+  getHumanInput?(): HumanInput | null;
 
   /** Transitional escape hatch for existing Electron-only capture modules. */
   getNativeHandle<T = unknown>(): T;

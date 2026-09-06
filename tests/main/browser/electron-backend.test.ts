@@ -209,6 +209,35 @@ describe("ElectronBrowserTarget DevTools CDP ownership", () => {
     await keeper.release();
   });
 
+  it("does not let a slow body fetch block other CDP commands on the same tab", async () => {
+    const { target, webContents } = createTarget();
+    const transport = await target.getCdpTransport() as ElectronCdpTransport;
+    const capture = await transport.acquire("capture");
+    const storage = await transport.acquire("storage");
+    let releaseBody: (() => void) | undefined;
+    webContents.debugger.blockSend(
+      "Fetch.getResponseBody",
+      new Promise<void>((resolve) => {
+        releaseBody = resolve;
+      }),
+    );
+
+    const body = capture.send("Fetch.getResponseBody", { requestId: "sse" });
+    const evaluation = storage.send("Runtime.evaluate", { expression: "1" });
+
+    await expect(
+      Promise.race([
+        evaluation.then(() => "completed"),
+        new Promise((resolve) => setTimeout(() => resolve("stalled"), 50)),
+      ]),
+    ).resolves.toBe("completed");
+
+    releaseBody?.();
+    await body;
+    await capture.release();
+    await storage.release();
+  });
+
   it("retains a lease when graceful debugger detach fails and retries", async () => {
     const { target, webContents } = createTarget();
     const transport = await target.getCdpTransport() as ElectronCdpTransport;

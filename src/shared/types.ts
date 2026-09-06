@@ -145,6 +145,8 @@ export interface BrowserSessionRuntimeStatus {
   presentation: "embedded" | "external" | null;
   version: string | null;
   error: string | null;
+  /** Non-fatal notice (e.g. Deep-mode hooks failed to attach on a page). */
+  warning?: string | null;
 }
 
 // ---- Captured Request ----

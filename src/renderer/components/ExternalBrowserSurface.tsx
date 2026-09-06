@@ -32,6 +32,7 @@ export default function ExternalBrowserSurface({
   const [status, setStatus] = useState<BrowserSessionRuntimeStatus | null>(null)
   const [focusing, setFocusing] = useState(false)
   const [focusError, setFocusError] = useState<string | null>(null)
+  const [warning, setWarning] = useState<string | null>(null)
   const [modeBusy, setModeBusy] = useState(false)
 
   const refresh = useCallback(async () => {
@@ -40,6 +41,7 @@ export default function ExternalBrowserSurface({
       if (mountedRef.current) {
         setStatus(nextStatus)
         setFocusError(nextStatus.error)
+        setWarning(nextStatus.warning ?? null)
       }
     } catch (error) {
       if (mountedRef.current) setFocusError(errorMessage(error))
@@ -107,6 +109,11 @@ export default function ExternalBrowserSurface({
           <span className={styles.version}>{status?.version ? `Chromium ${status.version}` : '版本未知'}</span>
         </div>
         {focusError && <div className={styles.error} role="alert">{focusError}</div>}
+        {!focusError && warning && (
+          <div className={styles.error} role="status" style={{ color: 'var(--color-warning)' }}>
+            {warning}
+          </div>
+        )}
         <div className={styles.modeRow}>
           <span className={styles.modeLabel}>Capture</span>
           <div className={styles.segmented} role="radiogroup" aria-label="Capture mode">

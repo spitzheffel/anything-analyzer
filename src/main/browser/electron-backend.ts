@@ -177,6 +177,7 @@ export class ElectronCdpTransport implements CdpTransport {
   private disconnectPromise: Promise<void> | null = null;
   private forceClosePromise: Promise<void> | null = null;
   private operationTail: Promise<void> = Promise.resolve();
+  private readonly concurrentOperations = new Set<Promise<void>>();
   private listenersAttached = false;
   private nextLeaseId = 1;
   private readonly leases = new Map<number, ElectronCdpLeaseRecord>();
@@ -273,7 +274,7 @@ export class ElectronCdpTransport implements CdpTransport {
     params: Record<string, unknown> = {},
   ): Promise<T> {
     this.compatibilityHold = true;
-    return this.enqueueOperation(async () => {
+    return this.dispatch(method, async () => {
       await this.ensureConnected();
       return this.sendCommand<T>(COMPAT_CDP_OWNER_ID, method, params);
     });
@@ -290,7 +291,36 @@ export class ElectronCdpTransport implements CdpTransport {
         targetId: this.targetId,
       });
     }
-    return this.enqueueOperation(() => this.sendCommand<T>(leaseId, method, params));
+    return this.dispatch(method, () => this.sendCommand<T>(leaseId, method, params));
+  }
+
+  /**
+   * Only domain enable/disable and lease release need a total order, so the
+   * claim recorded by an in-flight enable is visible to the release behind it.
+   * Every other command runs concurrently: CDP multiplexes by message id, and
+   * serializing them would let one Fetch.getResponseBody on a never-ending
+   * stream stall all other commands for this tab.
+   */
+  private dispatch<T>(method: string, operation: () => Promise<T>): Promise<T> {
+    if (parseProtectedDomainOperation(method)) return this.enqueueOperation(operation);
+    return this.trackConcurrent(operation);
+  }
+
+  private trackConcurrent<T>(operation: () => Promise<T>): Promise<T> {
+    const result = operation();
+    const settled = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.concurrentOperations.add(settled);
+    void settled.finally(() => this.concurrentOperations.delete(settled));
+    return result;
+  }
+
+  private async waitForConcurrentOperations(): Promise<void> {
+    while (this.concurrentOperations.size > 0) {
+      await Promise.allSettled([...this.concurrentOperations]);
+    }
   }
 
   onMessage(listener: (message: CdpMessage) => void): Unsubscribe {
@@ -357,6 +387,7 @@ export class ElectronCdpTransport implements CdpTransport {
     this.compatibilityHold = false;
     if (this.connectPromise) await this.connectPromise.catch(() => undefined);
     await this.operationTail.catch(() => undefined);
+    await this.waitForConcurrentOperations();
     for (const domain of [...this.compatClaimedDomains]) {
       await this.sendCommand(COMPAT_CDP_OWNER_ID, `${domain}.disable`, {});
     }

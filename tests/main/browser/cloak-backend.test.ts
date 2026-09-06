@@ -102,8 +102,100 @@ class FakeCdpSession extends EventEmitter {
   }
 }
 
+/** A cross-origin child frame: it runs in another process, so the main frame's
+ * CDP session (and Runtime.addBinding) never reaches it. Bindings only attach
+ * once the backend opens a frame-scoped CDP session via newCDPSession(frame). */
+class FakeOopifFrame {
+  readonly evaluations: string[] = [];
+  private detached = false;
+  private readonly registrations = new Map<string, FakeBindingRegistration>();
+  private readonly cdpSessions: FakeCdpSession[] = [];
+
+  isDetached(): boolean {
+    return this.detached;
+  }
+
+  detach(): void {
+    this.detached = true;
+  }
+
+  addCdpSession(session: FakeCdpSession): void {
+    this.cdpSessions.push(session);
+  }
+
+  async evaluate<T>(source: string): Promise<T> {
+    this.evaluations.push(source);
+    const registration = this.installBindingSource(source);
+    if (registration) return undefined as T;
+
+    for (const candidate of this.registrations.values()) {
+      if (source.includes(JSON.stringify(candidate.attachName))) {
+        const argument = /\?\.\((null|"(?:\\.|[^"\\])*")\)/.exec(source)?.[1];
+        const rawName = argument && argument !== "null"
+          ? (JSON.parse(argument) as string)
+          : null;
+        return this.attachBinding(candidate, rawName) as T;
+      }
+    }
+    return false as T;
+  }
+
+  invokeBinding(name: string, ...args: unknown[]): void {
+    const registration = this.registrations.get(name);
+    if (!registration) throw new Error(`Binding ${name} is not installed in frame`);
+    const payload = JSON.stringify({ args });
+    if (!registration.activeRawName) {
+      registration.queuedPayloads.push(payload);
+      return;
+    }
+    const session = [...this.cdpSessions]
+      .reverse()
+      .find(
+        (candidate) =>
+          !candidate.detached &&
+          candidate.globalBindings.has(registration.activeRawName!),
+      );
+    if (session) session.emitBinding(registration.activeRawName, payload);
+    else registration.queuedPayloads.push(payload);
+  }
+
+  private installBindingSource(source: string): FakeBindingRegistration | null {
+    const name = readStringConstant(source, "bindingName");
+    const attachName = readStringConstant(source, "attachName");
+    if (!name || !attachName) return null;
+    const existing = this.registrations.get(name);
+    if (existing) return existing;
+    const registration = { attachName, activeRawName: null, queuedPayloads: [] };
+    this.registrations.set(name, registration);
+    return registration;
+  }
+
+  private attachBinding(
+    registration: FakeBindingRegistration,
+    rawName: string | null,
+  ): boolean {
+    if (rawName === null) {
+      registration.activeRawName = null;
+      return true;
+    }
+    const session = [...this.cdpSessions]
+      .reverse()
+      .find(
+        (candidate) =>
+          !candidate.detached && candidate.globalBindings.has(rawName),
+      );
+    if (!session) return false;
+    registration.activeRawName = rawName;
+    while (registration.queuedPayloads.length) {
+      session.emitBinding(rawName, registration.queuedPayloads.shift()!);
+    }
+    return true;
+  }
+}
+
 class FakePage extends EventEmitter {
   readonly firstDocumentScripts: readonly string[];
+  readonly childFrames: FakeOopifFrame[] = [];
   private closed = false;
   private readonly contextScripts: string[];
   private readonly registrations = new Map<string, FakeBindingRegistration>();
@@ -142,8 +234,14 @@ class FakePage extends EventEmitter {
     return this;
   }
 
-  frames(): this[] {
-    return [this];
+  frames(): Array<this | FakeOopifFrame> {
+    return [this, ...this.childFrames];
+  }
+
+  attachCrossOriginFrame(): FakeOopifFrame {
+    const frame = new FakeOopifFrame();
+    this.childFrames.push(frame);
+    return frame;
   }
 
   isDetached(): boolean {
@@ -263,13 +361,15 @@ class FakeContext extends EventEmitter {
     this.installedScripts.push(content);
     for (const page of this.contextPages) page.addContextScript(content);
   });
-  readonly newCDPSession = vi.fn(async (page: Page): Promise<FakeCdpSession> => {
-    const fakePage = page as unknown as FakePage;
+  readonly newCDPSession = vi.fn(async (pageOrFrame: Page): Promise<FakeCdpSession> => {
     const session = new FakeCdpSession();
-    fakePage.addCdpSession(session);
-    const sessions = this.sessionsByPage.get(fakePage) ?? [];
-    sessions.push(session);
-    this.sessionsByPage.set(fakePage, sessions);
+    const target = pageOrFrame as unknown as FakePage | FakeOopifFrame;
+    target.addCdpSession(session);
+    if (target instanceof FakePage) {
+      const sessions = this.sessionsByPage.get(target) ?? [];
+      sessions.push(session);
+      this.sessionsByPage.set(target, sessions);
+    }
     return session;
   });
   private readonly contextPages: FakePage[];
@@ -525,6 +625,95 @@ describe("CloakBrowser context-wide hooks", () => {
     await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(2));
     expect(session.globalBindings.size).toBe(2);
     expect(session.subscribedBindings.size).toBe(1);
+  });
+
+  it("keeps main-frame bindings live when a cross-origin iframe cannot attach", async () => {
+    const { browserContext, nativeContext, firstPage } = createHarness();
+    const [target] = await browserContext.targets();
+    const hookCallback = vi.fn();
+    const interactionCallback = vi.fn();
+    await target.exposeBinding("__hook", hookCallback);
+    await target.exposeBinding("__interaction", interactionCallback);
+    const session = nativeContext.latestSession(firstPage);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      firstPage.commitNavigation("https://example.com/with-widget");
+      const widgetFrame = firstPage.attachCrossOriginFrame();
+      firstPage.domContentLoaded();
+      await vi.waitFor(() => expect(session.subscribedBindings.size).toBe(2));
+
+      expect(widgetFrame.evaluations.length).toBeGreaterThan(0);
+      expect(warn).not.toHaveBeenCalled();
+
+      firstPage.invokeBinding("__hook", { event: "after-widget" });
+      firstPage.invokeBinding("__interaction", { event: "click" });
+      await vi.waitFor(() => expect(hookCallback).toHaveBeenCalledTimes(1));
+      await vi.waitFor(() => expect(interactionCallback).toHaveBeenCalledTimes(1));
+      expect(hookCallback).toHaveBeenCalledWith(
+        expect.objectContaining({ args: [{ event: "after-widget" }] }),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("attaches bindings inside a cross-origin iframe through a frame CDP session", async () => {
+    const { browserContext, nativeContext, firstPage } = createHarness();
+    const [target] = await browserContext.targets();
+    const hookCallback = vi.fn();
+    await target.exposeBinding("__hook", hookCallback);
+
+    firstPage.commitNavigation("https://example.com/with-widget");
+    const widgetFrame = firstPage.attachCrossOriginFrame();
+    firstPage.domContentLoaded();
+
+    // The page CDP session covers only the main frame; the widget needs its own.
+    await vi.waitFor(() =>
+      expect(nativeContext.newCDPSession).toHaveBeenCalledWith(widgetFrame),
+    );
+    await vi.waitFor(() => expect(widgetFrame.evaluations.length).toBeGreaterThan(0));
+
+    widgetFrame.invokeBinding("__hook", { event: "from-widget" });
+    await vi.waitFor(() => expect(hookCallback).toHaveBeenCalledTimes(1));
+    expect(hookCallback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tabId: target.tabId,
+        args: [{ event: "from-widget" }],
+      }),
+    );
+  });
+
+  it("does not let a slow body fetch block other CDP commands on the same target", async () => {
+    const { browserContext, nativeContext, firstPage } = createHarness();
+    const [target] = await browserContext.targets();
+    const transport = await target.getCdpTransport();
+    const capture = await transport.acquire("capture");
+    const storage = await transport.acquire("storage");
+    const session = nativeContext.latestSession(firstPage);
+    let releaseBody: (() => void) | undefined;
+    session.blockSend(
+      "Fetch.getResponseBody",
+      new Promise<void>((resolve) => {
+        releaseBody = resolve;
+      }),
+    );
+
+    const body = capture.send("Fetch.getResponseBody", { requestId: "sse" });
+    const evaluation = storage.send("Runtime.evaluate", { expression: "1" });
+    const continued = capture.send("Fetch.continueResponse", { requestId: "other" });
+
+    await expect(
+      Promise.race([
+        Promise.all([evaluation, continued]).then(() => "completed"),
+        new Promise((resolve) => setTimeout(() => resolve("stalled"), 50)),
+      ]),
+    ).resolves.toBe("completed");
+
+    releaseBody?.();
+    await body;
+    await capture.release();
+    await storage.release();
   });
 
   it("forwards Playwright protocol-named CDP events to every lease", async () => {

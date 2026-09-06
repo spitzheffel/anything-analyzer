@@ -15,6 +15,10 @@ const BINARY_CONTENT_TYPES = [
   'application/octet-stream', 'application/pdf', 'application/zip'
 ]
 
+// Responses that never reach an "end" (server-sent events, multipart streams).
+// Fetch.getResponseBody would block until they finish, which never happens.
+const STREAMING_CONTENT_TYPES = ['text/event-stream', 'multipart/x-mixed-replace']
+
 interface RequestInfo {
   method: string
   url: string
@@ -64,6 +68,29 @@ function isBinaryContent(contentType: string | null): boolean {
   return BINARY_CONTENT_TYPES.some(type => normalized.includes(type))
 }
 
+function isStreamingContent(contentType: string | null): boolean {
+  if (!contentType) return false
+  const normalized = contentType.toLowerCase()
+  return STREAMING_CONTENT_TYPES.some(type => normalized.includes(type))
+}
+
+function isWebSocketUpgrade(headers: Record<string, string>): boolean {
+  return Object.entries(headers).some(([key, value]) =>
+    key.toLowerCase() === 'upgrade' && value.toLowerCase() === 'websocket'
+  )
+}
+
+/** Body collection is skipped for payloads that are binary or never terminate. */
+function shouldCollectBody(
+  requestHeaders: Record<string, string>,
+  responseInfo: ResponseInfo,
+): boolean {
+  if (isBinaryContent(responseInfo.contentType)) return false
+  if (isStreamingContent(responseInfo.contentType)) return false
+  if (responseInfo.statusCode === 101 || isWebSocketUpgrade(requestHeaders)) return false
+  return true
+}
+
 function decodeBody(result: Record<string, unknown>): { body: string | null; truncated: boolean } {
   if (typeof result.body !== 'string') return { body: null, truncated: false }
   let body = result.base64Encoded
@@ -82,6 +109,17 @@ export class CdpManager extends EventEmitter {
   private captureMode: CaptureMode = 'deep'
   private pendingRequests = new Map<string, RequestInfo>()
   private pendingResponses = new Map<string, ResponseInfo>()
+  // Streaming responses (SSE / multipart) keyed by Network requestId. Their body
+  // is accumulated from Network.streamResourceContent and emitted once, when the
+  // stream ends or capture stops.
+  private readonly pendingStreams = new Map<string, {
+    requestInfo: RequestInfo
+    responseInfo: ResponseInfo
+    chunks: string[]
+    byteLength: number
+    truncated: boolean
+    emitted: boolean
+  }>()
   private readonly enabledDomains = new Set<ManagedDomain>()
   private running = false
   private unsubscribeMessage: Unsubscribe | null = null
@@ -173,6 +211,9 @@ export class CdpManager extends EventEmitter {
       // Finish already-observed Fetch responses before disabling interception,
       // otherwise their request IDs can become invalid before body collection.
       await this.waitForHandlers()
+      // Emit whatever open streams have accumulated so far — they never reach a
+      // natural end, so stopping capture is their only chance to be recorded.
+      this.flushPendingStreams()
       await this.disableOwnedDomains(lease)
       this.pendingRequests.clear()
       this.pendingResponses.clear()
@@ -187,6 +228,7 @@ export class CdpManager extends EventEmitter {
     this.removeSubscriptions()
     this.pendingRequests.clear()
     this.pendingResponses.clear()
+    this.pendingStreams.clear()
     this.enabledDomains.clear()
     this.target = null
     this.lease = null
@@ -240,6 +282,24 @@ export class CdpManager extends EventEmitter {
     method: string,
     params: Record<string, unknown>
   ): Promise<void> {
+    // Streaming body accumulation is shared by both capture modes: once a
+    // response is recognized as a stream we follow its Network requestId here.
+    const streamId = typeof params.requestId === 'string' ? params.requestId : null
+    if (streamId && this.pendingStreams.has(streamId)) {
+      if (method === 'Network.dataReceived') {
+        this.appendStream(streamId, params.data as string | undefined)
+        return
+      }
+      if (method === 'Network.loadingFinished') {
+        this.finalizeStream(streamId, false)
+        return
+      }
+      if (method === 'Network.loadingFailed') {
+        this.finalizeStream(streamId, true)
+        return
+      }
+    }
+
     if (this.captureMode === 'deep' && method === 'Fetch.requestPaused') {
       await this.handleRequestPaused(params)
       return
@@ -250,7 +310,7 @@ export class CdpManager extends EventEmitter {
           this.handleNetworkRequest(params)
           return
         case 'Network.responseReceived':
-          this.handleNetworkResponse(params)
+          await this.handleNetworkResponse(params)
           return
         case 'Network.loadingFinished':
           await this.handleNetworkLoadingFinished(params)
@@ -307,11 +367,35 @@ export class CdpManager extends EventEmitter {
   ): Promise<void> {
     const requestInfo = this.pendingRequests.get(requestId)
     const headers = normalizeHeaders(params.responseHeaders)
-    const contentType = headers['content-type'] || null
+    const responseInfo: ResponseInfo = {
+      statusCode: params.responseStatusCode as number,
+      headers,
+      contentType: headers['content-type'] || null,
+    }
+
+    // A streaming body (SSE / multipart) never terminates, so getResponseBody
+    // would block this handler and — since the transport serializes per target
+    // — hang every other command. Release the request immediately and follow
+    // the body through Network.dataReceived on its networkId instead.
+    const networkId = typeof params.networkId === 'string' ? params.networkId : null
+    if (requestInfo && networkId && isStreamingContent(responseInfo.contentType)) {
+      this.beginStream(networkId, requestInfo, responseInfo)
+      // Enable streaming BEFORE releasing the response: once continueResponse
+      // lets the body flow, any dataReceived that arrives before streaming is
+      // enabled carries no `data`. Enabling first means bufferedData plus every
+      // later chunk is captured.
+      try {
+        const result = await this.send('Network.streamResourceContent', { requestId: networkId })
+        this.appendStream(networkId, result.bufferedData as string | undefined)
+      } catch { /* stream already ended or unsupported */ }
+      try { await this.send('Fetch.continueResponse', { requestId }) } catch { /* cancelled */ }
+      this.pendingRequests.delete(requestId)
+      return
+    }
+
     let responseBody: string | null = null
     let truncated = false
-
-    if (!isBinaryContent(contentType)) {
+    if (shouldCollectBody(requestInfo?.headers ?? {}, responseInfo)) {
       try {
         const result = await this.send('Fetch.getResponseBody', { requestId })
         const decoded = decodeBody(result)
@@ -321,11 +405,7 @@ export class CdpManager extends EventEmitter {
     }
 
     if (requestInfo) {
-      this.emitResponse(requestId, requestInfo, {
-        statusCode: params.responseStatusCode as number,
-        headers,
-        contentType,
-      }, responseBody, truncated)
+      this.emitResponse(requestId, requestInfo, responseInfo, responseBody, truncated)
     }
     this.clearNetworkRequest(requestId)
     try { await this.send('Fetch.continueResponse', { requestId }) } catch { /* cancelled */ }
@@ -355,11 +435,25 @@ export class CdpManager extends EventEmitter {
     this.emitRequest(requestId, info)
   }
 
-  private handleNetworkResponse(params: Record<string, unknown>): void {
+  private async handleNetworkResponse(params: Record<string, unknown>): Promise<void> {
     const requestId = params.requestId as string
     const response = params.response as Record<string, unknown> | undefined
     if (!requestId || !response) return
-    this.pendingResponses.set(requestId, this.readNetworkResponse(response))
+    const responseInfo = this.readNetworkResponse(response)
+    this.pendingResponses.set(requestId, responseInfo)
+
+    // Follow SSE/multipart bodies incrementally: Network.getResponseBody only
+    // resolves after loadingFinished, which for a stream can be minutes away.
+    const requestInfo = this.pendingRequests.get(requestId)
+    if (requestInfo && isStreamingContent(responseInfo.contentType)) {
+      this.beginStream(requestId, requestInfo, responseInfo)
+      this.pendingRequests.delete(requestId)
+      this.pendingResponses.delete(requestId)
+      try {
+        const result = await this.send('Network.streamResourceContent', { requestId })
+        this.appendStream(requestId, result.bufferedData as string | undefined)
+      } catch { /* stream already ended or unsupported */ }
+    }
   }
 
   private async handleNetworkLoadingFinished(params: Record<string, unknown>): Promise<void> {
@@ -373,7 +467,7 @@ export class CdpManager extends EventEmitter {
 
     let responseBody: string | null = null
     let truncated = false
-    if (!isBinaryContent(responseInfo.contentType)) {
+    if (shouldCollectBody(requestInfo.headers, responseInfo)) {
       try {
         const result = await this.send('Network.getResponseBody', { requestId })
         const decoded = decodeBody(result)
@@ -430,10 +524,8 @@ export class CdpManager extends EventEmitter {
     truncated: boolean
   ): void {
     const contentType = responseInfo.contentType
-    const isStreaming = contentType?.includes('text/event-stream') ?? false
-    const isWebSocket = Object.entries(requestInfo.headers).some(([key, value]) =>
-      key.toLowerCase() === 'upgrade' && value.toLowerCase() === 'websocket'
-    )
+    const isStreaming = contentType?.toLowerCase().includes('text/event-stream') ?? false
+    const isWebSocket = responseInfo.statusCode === 101 || isWebSocketUpgrade(requestInfo.headers)
 
     this.emit('response-captured', {
       requestId,
@@ -454,6 +546,59 @@ export class CdpManager extends EventEmitter {
       truncated,
       timestamp: requestInfo.timestamp,
     })
+  }
+
+  private beginStream(
+    streamId: string,
+    requestInfo: RequestInfo,
+    responseInfo: ResponseInfo,
+  ): void {
+    if (this.pendingStreams.has(streamId)) return
+    this.pendingStreams.set(streamId, {
+      requestInfo,
+      responseInfo,
+      chunks: [],
+      byteLength: 0,
+      truncated: false,
+      emitted: false,
+    })
+  }
+
+  private appendStream(streamId: string, data: string | undefined): void {
+    const stream = this.pendingStreams.get(streamId)
+    if (!stream || typeof data !== 'string' || !data) return
+    if (stream.byteLength >= MAX_BODY_SIZE) {
+      stream.truncated = true
+      return
+    }
+    // Chunks arrive base64-encoded from Network.dataReceived.
+    const decoded = Buffer.from(data, 'base64').toString('utf-8')
+    stream.chunks.push(decoded)
+    stream.byteLength += decoded.length
+  }
+
+  /** Emit the accumulated stream body once the stream ends or capture stops. */
+  private finalizeStream(streamId: string, failed: boolean): void {
+    const stream = this.pendingStreams.get(streamId)
+    this.pendingStreams.delete(streamId)
+    if (!stream || stream.emitted) return
+    stream.emitted = true
+
+    let body = stream.chunks.join('')
+    let truncated = stream.truncated
+    if (body.length > MAX_BODY_SIZE) {
+      body = `${body.substring(0, MAX_BODY_SIZE)}\n[TRUNCATED]`
+      truncated = true
+    }
+    if (failed && !body) body = '[STREAM FAILED]'
+    this.emitResponse(streamId, stream.requestInfo, stream.responseInfo, body || null, truncated)
+  }
+
+  /** Flush every still-open stream with whatever body has been collected. */
+  private flushPendingStreams(): void {
+    for (const streamId of [...this.pendingStreams.keys()]) {
+      this.finalizeStream(streamId, false)
+    }
   }
 
   private clearNetworkRequest(requestId: string): void {

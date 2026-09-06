@@ -1,5 +1,5 @@
 import type { InteractionEvent } from "@shared/types";
-import type { BrowserTarget, CdpLease } from "../browser/contracts";
+import type { BrowserTarget, CdpLease, HumanInput } from "../browser/contracts";
 
 export interface ReplayOptions {
   speed: number;
@@ -43,6 +43,7 @@ export class ReplayEngine {
     this.activeRun = controller;
     let completed = 0;
     let lease: CdpLease | null = null;
+    const human = target.getHumanInput?.() ?? null;
 
     try {
       lease = await (await target.getCdpTransport()).acquire("replay");
@@ -51,7 +52,7 @@ export class ReplayEngine {
         const event = events[index];
         if (options.skipMoves && event.type === "hover") continue;
 
-        await this.executeStep(target, lease, event, controller.signal);
+        await this.executeStep(target, lease, human, event, controller.signal);
         completed += 1;
 
         const nextEvent = events[index + 1];
@@ -85,17 +86,23 @@ export class ReplayEngine {
   ): Promise<{ success: boolean; error?: string }> {
     if (target.isClosed()) return { success: false, error: "Browser target is closed" };
 
+    const human = target.getHumanInput?.() ?? null;
     let lease: CdpLease | null = null;
     try {
       lease = await (await target.getCdpTransport()).acquire("replay:action");
       switch (action.type) {
         case "click": {
           if (action.selector) {
-            const coords = await this.resolveElementCenter(lease, action.selector);
-            if (!coords) return { success: false, error: `Element not found: ${action.selector}` };
-            await this.clickAt(lease, coords.x, coords.y, 1);
+            if (human) {
+              await human.click({ selector: action.selector, clickCount: 1 });
+            } else {
+              const coords = await this.resolveElementCenter(lease, action.selector);
+              if (!coords) return { success: false, error: `Element not found: ${action.selector}` };
+              await this.clickAt(lease, coords.x, coords.y, 1);
+            }
           } else if (action.x != null && action.y != null) {
-            await this.clickAt(lease, action.x, action.y, 1);
+            if (human) await human.click({ x: action.x, y: action.y, clickCount: 1 });
+            else await this.clickAt(lease, action.x, action.y, 1);
           } else {
             return { success: false, error: "click requires selector or x/y coordinates" };
           }
@@ -103,22 +110,35 @@ export class ReplayEngine {
         }
         case "type": {
           if (action.text == null) return { success: false, error: "type requires text" };
-          if (action.selector) {
-            await lease.send("Runtime.evaluate", {
-              expression: `document.querySelector(${JSON.stringify(action.selector)})?.focus()`,
-            });
+          if (human) {
+            await human.type({ selector: action.selector, text: action.text });
+          } else {
+            if (action.selector) {
+              await lease.send("Runtime.evaluate", {
+                expression: `document.querySelector(${JSON.stringify(action.selector)})?.focus()`,
+              });
+            }
+            await lease.send("Input.insertText", { text: action.text });
           }
-          await lease.send("Input.insertText", { text: action.text });
           break;
         }
         case "scroll":
-          await lease.send("Input.dispatchMouseEvent", {
-            type: "mouseWheel",
-            x: action.x ?? 400,
-            y: action.y ?? 300,
-            deltaX: 0,
-            deltaY: action.scrollDelta ?? 200,
-          });
+          if (human) {
+            await human.scroll({
+              x: action.x ?? 400,
+              y: action.y ?? 300,
+              deltaX: 0,
+              deltaY: action.scrollDelta ?? 200,
+            });
+          } else {
+            await lease.send("Input.dispatchMouseEvent", {
+              type: "mouseWheel",
+              x: action.x ?? 400,
+              y: action.y ?? 300,
+              deltaX: 0,
+              deltaY: action.scrollDelta ?? 200,
+            });
+          }
           break;
         case "navigate":
           if (!action.url) return { success: false, error: "navigate requires url" };
@@ -138,43 +158,66 @@ export class ReplayEngine {
   private async executeStep(
     target: BrowserTarget,
     lease: CdpLease,
+    human: HumanInput | null,
     event: InteractionEvent,
     signal: AbortSignal,
   ): Promise<void> {
+    const x = event.viewport_x ?? event.x ?? 0;
+    const y = event.viewport_y ?? event.y ?? 0;
     switch (event.type) {
       case "click":
-      case "dblclick":
-        await this.clickAt(
-          lease,
-          event.viewport_x ?? event.x ?? 0,
-          event.viewport_y ?? event.y ?? 0,
-          event.type === "dblclick" ? 2 : 1,
-        );
+      case "dblclick": {
+        const clickCount = event.type === "dblclick" ? 2 : 1;
+        // Prefer the selector so humanized replay lands on the element even if
+        // the layout shifted since recording; fall back to coordinates.
+        if (human) {
+          await human.click(
+            event.selector
+              ? { selector: event.selector, clickCount }
+              : { x, y, clickCount },
+          );
+        } else {
+          await this.clickAt(lease, x, y, clickCount);
+        }
         break;
+      }
       case "input":
         if (event.selector && event.input_value != null) {
-          await lease.send("Runtime.evaluate", {
-            expression: `(() => {
-              const element = document.querySelector(${JSON.stringify(event.selector)});
-              if (!element) return false;
-              element.focus();
-              if ("value" in element) element.value = "";
-              element.dispatchEvent(new Event("input", { bubbles: true }));
-              return true;
-            })()`,
-            returnByValue: true,
-          });
-          await lease.send("Input.insertText", { text: event.input_value });
+          if (human) {
+            await human.type({ selector: event.selector, text: event.input_value });
+          } else {
+            await lease.send("Runtime.evaluate", {
+              expression: `(() => {
+                const element = document.querySelector(${JSON.stringify(event.selector)});
+                if (!element) return false;
+                element.focus();
+                if ("value" in element) element.value = "";
+                element.dispatchEvent(new Event("input", { bubbles: true }));
+                return true;
+              })()`,
+              returnByValue: true,
+            });
+            await lease.send("Input.insertText", { text: event.input_value });
+          }
         }
         break;
       case "scroll":
-        await lease.send("Input.dispatchMouseEvent", {
-          type: "mouseWheel",
-          x: event.viewport_x ?? 400,
-          y: event.viewport_y ?? 300,
-          deltaX: event.scroll_dx ?? 0,
-          deltaY: event.scroll_dy ?? 0,
-        });
+        if (human) {
+          await human.scroll({
+            x: event.viewport_x ?? 400,
+            y: event.viewport_y ?? 300,
+            deltaX: event.scroll_dx ?? 0,
+            deltaY: event.scroll_dy ?? 0,
+          });
+        } else {
+          await lease.send("Input.dispatchMouseEvent", {
+            type: "mouseWheel",
+            x: event.viewport_x ?? 400,
+            y: event.viewport_y ?? 300,
+            deltaX: event.scroll_dx ?? 0,
+            deltaY: event.scroll_dy ?? 0,
+          });
+        }
         break;
       case "navigate":
         if (event.url) await target.navigate(event.url);
@@ -182,14 +225,19 @@ export class ReplayEngine {
       case "hover":
         if (event.path) {
           const points = JSON.parse(event.path) as Array<{ x: number; y: number; t: number }>;
-          for (const point of points) {
+          if (human) {
             this.assertActive(target, signal);
-            await lease.send("Input.dispatchMouseEvent", {
-              type: "mouseMoved",
-              x: point.x,
-              y: point.y,
-            });
-            await this.wait(20, signal);
+            await human.move(points.map((point) => ({ x: point.x, y: point.y })));
+          } else {
+            for (const point of points) {
+              this.assertActive(target, signal);
+              await lease.send("Input.dispatchMouseEvent", {
+                type: "mouseMoved",
+                x: point.x,
+                y: point.y,
+              });
+              await this.wait(20, signal);
+            }
           }
         }
         break;

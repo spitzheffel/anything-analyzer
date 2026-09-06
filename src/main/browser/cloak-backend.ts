@@ -27,6 +27,7 @@ import {
   type CdpLease,
   type CdpMessage,
   type CdpTransport,
+  type HumanInput,
   type Unsubscribe,
 } from "./contracts";
 import {
@@ -120,6 +121,13 @@ interface CloakTargetBindingChannel {
   readonly unsubscribeDisconnect: Unsubscribe;
 }
 
+interface OopifFrameBindingState {
+  readonly session: CDPSession;
+  readonly page: Page;
+  readonly activeRawByName: Map<string, string>;
+  readonly handler: (params: Record<string, unknown>) => void;
+}
+
 function createBindingRegistration(name: string): CloakBindingRegistration {
   const suffix = randomUUID().replaceAll("-", "");
   const attachName = `__aaAttachBinding${suffix}`;
@@ -190,6 +198,20 @@ function createRawBindingName(): string {
   return `__aaCdpBinding${randomUUID().replaceAll("-", "")}`;
 }
 
+async function attachBindingToFrame(
+  frame: Frame,
+  registration: CloakBindingRegistration,
+  rawName: string,
+): Promise<boolean> {
+  const attachExpression = `globalThis[${JSON.stringify(registration.attachName)}]?.(${JSON.stringify(rawName)}) === true`;
+  let attached = await frame.evaluate<boolean>(attachExpression);
+  if (!attached) {
+    await frame.evaluate(registration.source);
+    attached = await frame.evaluate<boolean>(attachExpression);
+  }
+  return attached;
+}
+
 export class CloakCdpTransport implements CdpTransport {
   readonly targetId: string;
 
@@ -199,6 +221,7 @@ export class CloakCdpTransport implements CdpTransport {
   private detachPromise: Promise<void> | null = null;
   private forceClosePromise: Promise<void> | null = null;
   private operationTail: Promise<void> = Promise.resolve();
+  private readonly concurrentOperations = new Set<Promise<void>>();
   private compatibilityHold = false;
   private forceClosed = false;
   private pendingAcquires = 0;
@@ -260,7 +283,7 @@ export class CloakCdpTransport implements CdpTransport {
     method: string,
     params: Record<string, unknown> = {},
   ): Promise<T> {
-    return this.enqueueOperation(async () => {
+    return this.dispatch(method, async () => {
       await this.ensureConnected();
       return this.sendForOwner<T>(null, method, params);
     });
@@ -287,6 +310,7 @@ export class CloakCdpTransport implements CdpTransport {
     this.compatibilityHold = false;
     if (this.connectPromise) await this.connectPromise.catch(() => undefined);
     await this.operationTail.catch(() => undefined);
+    await this.waitForConcurrentOperations();
     await this.detach("CDP session closed");
   }
 
@@ -319,11 +343,40 @@ export class CloakCdpTransport implements CdpTransport {
     if (!this.leases.has(lease) || !lease.acceptsCommands()) {
       throw targetError("CDP_DETACHED", "CDP lease has been released", this.target);
     }
-    return this.enqueueOperation(() => this.sendForOwner<T>(lease, method, params));
+    return this.dispatch(method, () => this.sendForOwner<T>(lease, method, params));
   }
 
   async releaseLease(lease: CloakCdpLease): Promise<void> {
     await this.enqueueOperation(() => this.releaseLeaseNow(lease));
+  }
+
+  /**
+   * Only domain enable/disable and lease release need a total order, so the
+   * claim recorded by an in-flight enable is visible to the release behind it.
+   * Every other command runs concurrently: CDP multiplexes by message id, and
+   * serializing them would let one Fetch.getResponseBody on a never-ending
+   * stream stall all other commands for this target.
+   */
+  private dispatch<T>(method: string, operation: () => Promise<T>): Promise<T> {
+    if (parseDomainCommand(method)) return this.enqueueOperation(operation);
+    return this.trackConcurrent(operation);
+  }
+
+  private trackConcurrent<T>(operation: () => Promise<T>): Promise<T> {
+    const result = operation();
+    const settled = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.concurrentOperations.add(settled);
+    void settled.finally(() => this.concurrentOperations.delete(settled));
+    return result;
+  }
+
+  private async waitForConcurrentOperations(): Promise<void> {
+    while (this.concurrentOperations.size > 0) {
+      await Promise.allSettled([...this.concurrentOperations]);
+    }
   }
 
   private async releaseLeaseNow(lease: CloakCdpLease): Promise<void> {
@@ -632,6 +685,7 @@ const FORWARDED_CDP_EVENTS = [
   "Fetch.requestPaused",
   "Network.requestWillBeSent",
   "Network.responseReceived",
+  "Network.dataReceived",
   "Network.loadingFinished",
   "Network.loadingFailed",
   "Network.webSocketCreated",
@@ -978,6 +1032,47 @@ export class CloakBrowserTarget implements BrowserTarget {
     return this.playwrightPage as T;
   }
 
+  getHumanInput(): HumanInput {
+    const page = this.playwrightPage;
+    const assertOpen = (): void => this.assertOpen();
+    const centerOf = async (
+      selector: string,
+    ): Promise<{ x: number; y: number } | null> => {
+      const box = await page
+        .locator(selector)
+        .first()
+        .boundingBox()
+        .catch(() => null);
+      if (!box) return null;
+      return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+    };
+    return {
+      async click({ selector, x, y, clickCount = 1 }): Promise<void> {
+        assertOpen();
+        let point = x != null && y != null ? { x, y } : null;
+        if (!point && selector) point = await centerOf(selector);
+        if (!point) throw new Error(`Cannot resolve click target ${selector ?? "(no coordinates)"}`);
+        // page.mouse.click is patched by Cloak to humanize the approach + press.
+        await page.mouse.click(point.x, point.y, { clickCount });
+      },
+      async type({ selector, text }): Promise<void> {
+        assertOpen();
+        if (selector) await page.locator(selector).first().focus();
+        // page.keyboard.type is patched to emit per-key events with human delays.
+        await page.keyboard.type(text);
+      },
+      async scroll({ x = 0, y = 0, deltaX, deltaY }): Promise<void> {
+        assertOpen();
+        if (x || y) await page.mouse.move(x, y);
+        await page.mouse.wheel(deltaX, deltaY);
+      },
+      async move(points): Promise<void> {
+        assertOpen();
+        for (const point of points) await page.mouse.move(point.x, point.y);
+      },
+    };
+  }
+
   emitStateChanged(): void {
     if (this.closed) return;
     this.emit({
@@ -1069,6 +1164,10 @@ export class CloakBrowserTarget implements BrowserTarget {
           `Failed to refresh Cloak bindings for target ${this.tabId}`,
           error,
         );
+        this.owner.reportTargetWarning(
+          this,
+          `Deep-mode instrumentation failed to attach on this page: ${errorMessage(error)}`,
+        );
       }
     });
     void this.refreshState(false);
@@ -1140,6 +1239,10 @@ export class CloakBrowserContext implements BrowserContext {
   private readonly bindingChannels = new Map<
     Page,
     Promise<CloakTargetBindingChannel>
+  >();
+  private readonly frameBindingSessions = new Map<
+    Frame,
+    Promise<OopifFrameBindingState>
   >();
   private readonly bindingRefreshes = new Map<Page, Promise<void>>();
   private readonly activeRawBindings = new Map<Page, Map<string, string>>();
@@ -1463,6 +1566,8 @@ export class CloakBrowserContext implements BrowserContext {
       this.bindingNamesByRaw.set(page, namesByRaw);
     }
 
+    const failures: unknown[] = [];
+    const oopifFrames = new Set<Frame>();
     for (const registration of registrations) {
       const previousRawName = activeBindings.get(registration.name) ?? null;
       const nextRawName = createRawBindingName();
@@ -1470,34 +1575,42 @@ export class CloakBrowserContext implements BrowserContext {
         name: nextRawName,
       });
       namesByRaw.set(nextRawName, registration.name);
+      const mainFrame = target.playwrightPage.mainFrame();
       const frames = target.playwrightPage.frames();
       try {
         const results = await Promise.allSettled(
-          frames.map(async (frame) => {
-            let attached = await frame.evaluate<boolean>(
-              `globalThis[${JSON.stringify(registration.attachName)}]?.(${JSON.stringify(nextRawName)}) === true`,
-            );
-            if (!attached) {
-              await frame.evaluate(registration.source);
-              attached = await frame.evaluate<boolean>(
-                `globalThis[${JSON.stringify(registration.attachName)}]?.(${JSON.stringify(nextRawName)}) === true`,
-              );
-            }
-            return attached;
-          }),
+          frames.map((frame) =>
+            attachBindingToFrame(frame, registration, nextRawName),
+          ),
         );
-        const failedFrameIndex = results.findIndex(
-          (result, index) =>
-            (result.status === "rejected" || !result.value) &&
-            !frames[index].isDetached(),
-        );
-        if (failedFrameIndex >= 0) {
-          const failedFrame = results[failedFrameIndex];
+        // Runtime.addBinding is delivered through the main frame's CDP session,
+        // so an out-of-process (cross-origin) iframe cannot see the raw binding
+        // and attach() returns false there. The main frame is required; each
+        // failed cross-process frame is instead handled by its own CDP session
+        // (see syncOopifFrameBindings) so a third-party widget neither rolls
+        // back the page's hooks nor loses its own.
+        for (let index = 0; index < frames.length; index += 1) {
+          const frame = frames[index];
+          const result = results[index];
+          const failed = result.status === "rejected" || !result.value;
+          if (failed && frame !== mainFrame && !frame.isDetached()) {
+            oopifFrames.add(frame);
+          }
+        }
+        const mainFrameIndex = frames.indexOf(mainFrame);
+        const mainFrameResult = results[mainFrameIndex];
+        if (
+          mainFrameResult &&
+          (mainFrameResult.status === "rejected" || !mainFrameResult.value) &&
+          !mainFrame.isDetached()
+        ) {
           throw targetError(
             "BACKEND_FAILURE",
             `Failed to attach Cloak binding ${registration.name}`,
             target,
-            failedFrame.status === "rejected" ? failedFrame.reason : undefined,
+            mainFrameResult.status === "rejected"
+              ? mainFrameResult.reason
+              : undefined,
           );
         }
 
@@ -1529,8 +1642,158 @@ export class CloakBrowserContext implements BrowserContext {
         await channel.lease
           .send("Runtime.removeBinding", { name: nextRawName })
           .catch(() => undefined);
-        throw error;
+        // Keep going so one broken binding cannot prevent the others (for
+        // example hooks vs. interaction recording) from being reattached.
+        failures.push(error);
       }
+    }
+
+    if (oopifFrames.size > 0) {
+      await this.syncOopifFrameBindings(target, registrations, [...oopifFrames]);
+    }
+    if (failures.length > 0) throw failures[0];
+  }
+
+  /**
+   * Attach bindings inside out-of-process iframes. Each cross-origin frame runs
+   * in its own renderer, so the page-level CDP session cannot reach it; a frame
+   * -scoped CDP session (context.newCDPSession(frame)) can. Best-effort: a
+   * failure here only warns, because the main-frame hooks are already live.
+   */
+  private async syncOopifFrameBindings(
+    target: CloakBrowserTarget,
+    registrations: readonly CloakBindingRegistration[],
+    frames: readonly Frame[],
+  ): Promise<void> {
+    const page = target.playwrightPage;
+    const namesByRaw = this.bindingNamesByRaw.get(page);
+    if (!namesByRaw) return;
+
+    this.pruneDetachedFrameSessions();
+    for (const frame of frames) {
+      if (frame.isDetached() || target.isClosed() || this.isClosed()) continue;
+      let state: OopifFrameBindingState;
+      try {
+        state = await this.ensureFrameBindingSession(target, frame);
+      } catch (error) {
+        if (!target.isClosed()) {
+          console.warn(
+            `Failed to open a CDP session for a cross-origin frame on ${target.tabId}`,
+            error,
+          );
+        }
+        continue;
+      }
+
+      for (const registration of registrations) {
+        const previousRawName = state.activeRawByName.get(registration.name) ?? null;
+        const nextRawName = createRawBindingName();
+        try {
+          await state.session.send("Runtime.addBinding", { name: nextRawName });
+          namesByRaw.set(nextRawName, registration.name);
+          const attached = await attachBindingToFrame(frame, registration, nextRawName);
+          if (!attached) {
+            namesByRaw.delete(nextRawName);
+            await state.session
+              .send("Runtime.removeBinding", { name: nextRawName })
+              .catch(() => undefined);
+            continue;
+          }
+          state.activeRawByName.set(registration.name, nextRawName);
+          if (previousRawName) {
+            namesByRaw.delete(previousRawName);
+            await state.session
+              .send("Runtime.removeBinding", { name: previousRawName })
+              .catch(() => undefined);
+          }
+        } catch (error) {
+          namesByRaw.delete(nextRawName);
+          if (!frame.isDetached()) {
+            console.warn(
+              `Failed to attach Cloak binding ${registration.name} in a cross-origin frame`,
+              error,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  private async ensureFrameBindingSession(
+    target: CloakBrowserTarget,
+    frame: Frame,
+  ): Promise<OopifFrameBindingState> {
+    const existing = this.frameBindingSessions.get(frame);
+    if (existing) return existing;
+
+    const creation = (async (): Promise<OopifFrameBindingState> => {
+      const session = await this.playwrightContext.newCDPSession(frame);
+      const emitter = session as unknown as {
+        on(event: string, listener: (params: Record<string, unknown>) => void): void;
+      };
+      const handler = (params: Record<string, unknown>): void => {
+        this.handleBindingMessage(target, {
+          method: "Runtime.bindingCalled",
+          params,
+          sessionId: target.sessionId,
+        });
+      };
+      emitter.on("Runtime.bindingCalled", handler);
+      await session.send("Runtime.enable");
+      const state: OopifFrameBindingState = {
+        session,
+        page: target.playwrightPage,
+        activeRawByName: new Map(),
+        handler,
+      };
+      return state;
+    })();
+
+    this.frameBindingSessions.set(frame, creation);
+    try {
+      return await creation;
+    } catch (error) {
+      if (this.frameBindingSessions.get(frame) === creation) {
+        this.frameBindingSessions.delete(frame);
+      }
+      throw error;
+    }
+  }
+
+  private pruneDetachedFrameSessions(): void {
+    for (const [frame, statePromise] of [...this.frameBindingSessions]) {
+      if (!frame.isDetached()) continue;
+      this.frameBindingSessions.delete(frame);
+      void this.disposeFrameBindingSession(statePromise);
+    }
+  }
+
+  private async disposeFrameBindingSession(
+    statePromise: Promise<OopifFrameBindingState>,
+  ): Promise<void> {
+    const state = await statePromise.catch(() => null);
+    if (!state) return;
+    const namesByRaw = this.bindingNamesByRaw.get(state.page);
+    for (const rawName of state.activeRawByName.values()) {
+      namesByRaw?.delete(rawName);
+    }
+    const emitter = state.session as unknown as {
+      off(event: string, listener: (params: Record<string, unknown>) => void): void;
+    };
+    emitter.off("Runtime.bindingCalled", state.handler);
+    await state.session.detach().catch(() => undefined);
+  }
+
+  private disposeFrameBindingSessionsForPage(page: Page): void {
+    for (const [frame, statePromise] of [...this.frameBindingSessions]) {
+      void statePromise.then(
+        (state) => {
+          if (state.page !== page) return;
+          this.frameBindingSessions.delete(frame);
+          void this.disposeFrameBindingSession(statePromise);
+        },
+        () => this.frameBindingSessions.delete(frame),
+      );
     }
   }
 
@@ -1659,6 +1922,7 @@ export class CloakBrowserContext implements BrowserContext {
     const channelPromise = this.bindingChannels.get(page);
     this.bindingChannels.delete(page);
     this.bindingRefreshes.delete(page);
+    this.disposeFrameBindingSessionsForPage(page);
     await refresh?.catch(() => undefined);
     if (!channelPromise) return;
     const channel = await channelPromise.catch(() => null);
@@ -1724,6 +1988,19 @@ export class CloakBrowserContext implements BrowserContext {
       } else if (event.type === "target-crashed") {
         this.emit(event);
       }
+    });
+  }
+
+  reportTargetWarning(target: CloakBrowserTarget, message: string): void {
+    if (this.isClosed() || target.isClosed()) return;
+    this.afterAnnouncement(target, () => {
+      this.emit({
+        type: "target-warning",
+        sessionId: this.sessionId,
+        contextId: this.id,
+        tabId: target.tabId,
+        message,
+      });
     });
   }
 
@@ -1985,6 +2262,10 @@ export class CloakBrowserContext implements BrowserContext {
     void Promise.allSettled(
       bindingPages.map((page) => this.releaseTargetBindingChannel(page)),
     );
+    for (const statePromise of this.frameBindingSessions.values()) {
+      void this.disposeFrameBindingSession(statePromise);
+    }
+    this.frameBindingSessions.clear();
     this.listeners.clear();
     this.targetsById.clear();
     this.targetsByPage.clear();

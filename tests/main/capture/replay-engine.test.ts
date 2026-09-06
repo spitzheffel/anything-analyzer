@@ -324,6 +324,35 @@ describe("ReplayEngine", () => {
     },
   );
 
+  it("routes replay through humanized input when the backend provides it", async () => {
+    const harness = createHarness();
+    const humanCalls: Array<{ method: string; arg: unknown }> = [];
+    const human = {
+      click: vi.fn(async (arg: unknown) => { humanCalls.push({ method: "click", arg }); }),
+      type: vi.fn(async (arg: unknown) => { humanCalls.push({ method: "type", arg }); }),
+      scroll: vi.fn(async (arg: unknown) => { humanCalls.push({ method: "scroll", arg }); }),
+      move: vi.fn(async (arg: unknown) => { humanCalls.push({ method: "move", arg }); }),
+    };
+    (harness.target as unknown as { getHumanInput: () => unknown }).getHumanInput = () => human;
+    const engine = new ReplayEngine();
+
+    const result = await engine.replay(
+      harness.target,
+      [
+        interaction({ type: "click", selector: "#submit" }),
+        interaction({ id: 2, sequence: 2, type: "input", selector: "#email", input_value: "a@b.co", timestamp: 1_001 }),
+      ],
+      { speed: 1, skipMoves: false },
+    );
+
+    expect(result).toEqual({ success: true, stepsCompleted: 2 });
+    // Human input is used; no raw Input.* CDP commands are sent.
+    expect(human.click).toHaveBeenCalledWith({ selector: "#submit", clickCount: 1 });
+    expect(human.type).toHaveBeenCalledWith({ selector: "#email", text: "a@b.co" });
+    expect(harness.send.mock.calls.some(([method]) => String(method).startsWith("Input."))).toBe(false);
+    expectSharedTransportPreserved(harness);
+  });
+
   it("does not acquire a lease when the target is already closed", async () => {
     const harness = createHarness();
     harness.setClosed(true);

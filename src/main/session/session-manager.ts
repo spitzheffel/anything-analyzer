@@ -101,6 +101,7 @@ export class SessionManager {
   private readonly preparedElectronStealthTargets = new WeakSet<BrowserTarget>();
   private readonly openingSessions = new Set<string>();
   private readonly sessionErrors = new Map<string, string>();
+  private readonly sessionWarnings = new Map<string, string>();
   private readonly intentionalContextCloses = new Set<string>();
   private readonly crashRecoveryAttempts = new Map<string, number>();
   private shuttingDown = false;
@@ -263,6 +264,7 @@ export class SessionManager {
       await this.browserCoordinator.setActiveSession(sessionId);
       this.activeBrowserSessionId = sessionId;
       this.sessionErrors.delete(sessionId);
+      if (!wasOpen) this.sessionWarnings.delete(sessionId);
       if (!wasOpen) {
         await this.initializeOpenedContext(session, context);
       } else {
@@ -686,6 +688,7 @@ export class SessionManager {
           ? session.last_browser_version ?? this.cloakRuntime?.getStatus().actualVersion ?? null
           : process.versions.chrome ?? null,
       error,
+      warning: this.sessionWarnings.get(resolvedId) ?? null,
     };
   }
 
@@ -1472,6 +1475,11 @@ export class SessionManager {
           event.reason,
         ),
       );
+      return;
+    } else if (event.type === "target-warning") {
+      // Non-fatal: capture keeps running, but the renderer should surface that
+      // Deep-mode hooks did not fully attach on this page.
+      this.sessionWarnings.set(event.sessionId, event.message);
       return;
     } else if (event.type === "target-closed") {
       await this.detachCapture(event.sessionId, event.tabId);

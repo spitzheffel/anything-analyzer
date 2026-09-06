@@ -179,6 +179,8 @@ class FakeTransport implements CdpTransport {
   private resultFor(method: string): unknown {
     if (method === 'Network.getCookies') return { cookies: [] }
     if (method === 'Runtime.evaluate') return { result: { value: '{}' } }
+    if (method === 'DOMStorage.getDOMStorageItems') return { entries: [] }
+    if (method === 'Network.streamResourceContent') return { bufferedData: '' }
     if (method.endsWith('.getResponseBody')) {
       return { body: '{"ok":true}', base64Encoded: false }
     }
@@ -304,6 +306,132 @@ describe('CdpManager leases and capture modes', () => {
     expect(methods.indexOf('Fetch.getResponseBody')).toBeLessThan(methods.indexOf('Fetch.disable'))
   })
 
+  it('deep mode never fetches the body of a streaming or upgraded response', async () => {
+    const transport = new FakeTransport()
+    const manager = new CdpManager()
+    const responses: Array<Record<string, unknown>> = []
+    manager.on('response-captured', response => responses.push(response))
+    await manager.start(createTarget(transport), 'deep')
+
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'sse',
+      request: { method: 'GET', url: 'https://example.com/stream', headers: {} },
+    })
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'ws',
+      request: {
+        method: 'GET',
+        url: 'wss://example.com/socket',
+        headers: { Upgrade: 'websocket' },
+      },
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'sse',
+      responseStatusCode: 200,
+      responseHeaders: [{ name: 'Content-Type', value: 'text/event-stream; charset=utf-8' }],
+    })
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'ws',
+      responseStatusCode: 101,
+      responseHeaders: [],
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(transport.commands.some(command => command.method === 'Fetch.getResponseBody')).toBe(false)
+    expect(transport.commands.filter(command => command.method === 'Fetch.continueResponse')).toHaveLength(2)
+    expect(responses).toHaveLength(2)
+    expect(responses.find(r => r.url === 'https://example.com/stream')).toMatchObject({
+      isStreaming: true,
+      responseBody: null,
+    })
+    expect(responses.find(r => r.url === 'wss://example.com/socket')).toMatchObject({
+      isWebSocket: true,
+      responseBody: null,
+    })
+    await manager.stop()
+  })
+
+  it('accumulates a deep SSE stream body and emits it once the stream ends', async () => {
+    const transport = new FakeTransport()
+    const manager = new CdpManager()
+    const responses: Array<Record<string, unknown>> = []
+    manager.on('response-captured', response => responses.push(response))
+    await manager.start(createTarget(transport), 'deep')
+
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'fetch-1',
+      request: { method: 'GET', url: 'https://example.com/stream', headers: {} },
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'fetch-1',
+      networkId: 'net-1',
+      responseStatusCode: 200,
+      responseHeaders: [{ name: 'content-type', value: 'text/event-stream' }],
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Body is not emitted until the stream ends.
+    expect(responses).toHaveLength(0)
+    expect(transport.commands.some(c => c.method === 'Network.streamResourceContent')).toBe(true)
+    expect(transport.commands.some(c => c.method === 'Fetch.getResponseBody')).toBe(false)
+
+    transport.emit('Network.dataReceived', {
+      requestId: 'net-1',
+      data: Buffer.from('data: one\n\n').toString('base64'),
+    })
+    transport.emit('Network.dataReceived', {
+      requestId: 'net-1',
+      data: Buffer.from('data: two\n\n').toString('base64'),
+    })
+    transport.emit('Network.loadingFinished', { requestId: 'net-1' })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(responses).toHaveLength(1)
+    expect(responses[0]).toMatchObject({
+      url: 'https://example.com/stream',
+      isStreaming: true,
+      responseBody: 'data: one\n\ndata: two\n\n',
+    })
+    await manager.stop()
+  })
+
+  it('flushes an open passive stream body when capture stops', async () => {
+    const transport = new FakeTransport()
+    const manager = new CdpManager()
+    const responses: Array<Record<string, unknown>> = []
+    manager.on('response-captured', response => responses.push(response))
+    await manager.start(createTarget(transport), 'passive')
+
+    transport.emit('Network.requestWillBeSent', {
+      requestId: 'net-2',
+      request: { method: 'GET', url: 'https://example.com/live', headers: {} },
+    })
+    transport.emit('Network.responseReceived', {
+      requestId: 'net-2',
+      response: { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    transport.emit('Network.dataReceived', {
+      requestId: 'net-2',
+      data: Buffer.from('partial chunk').toString('base64'),
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    // Still open — nothing emitted yet.
+    expect(responses).toHaveLength(0)
+
+    // Stopping capture flushes whatever the stream has produced so far.
+    await manager.stop()
+    expect(responses).toHaveLength(1)
+    expect(responses[0]).toMatchObject({
+      url: 'https://example.com/live',
+      isStreaming: true,
+      responseBody: 'partial chunk',
+    })
+  })
+
   it('cleans enabled domains and its lease after partial startup failure', async () => {
     const transport = new FakeTransport()
     transport.failMethod = 'Page.enable'
@@ -375,10 +503,16 @@ describe('CdpManager leases and capture modes', () => {
     storage.triggerCollection()
     await stopping
 
+    // Two collections (initial + final on stop), each reading cookies plus
+    // local/session storage over the browser-side DOMStorage domain.
     const storageCommands = transport.commands.filter(command =>
-      command.method === 'Network.getCookies' || command.method === 'Runtime.evaluate'
+      command.method === 'Network.getCookies' ||
+      command.method === 'DOMStorage.getDOMStorageItems'
     )
     expect(storageCommands).toHaveLength(6)
+    expect(
+      transport.commands.some(command => command.method === 'Runtime.evaluate'),
+    ).toBe(false)
     expect(transport.lifecycle.at(-1)).toMatch(/^release:capture:storage:/)
   })
 })

@@ -17,6 +17,7 @@ export class StorageCollector extends EventEmitter {
   private unsubscribeDisconnect: Unsubscribe | null = null
   private stopPromise: Promise<void> | null = null
   private stopping = false
+  private domStorageEnabled = false
 
   async start(sessionId: string, target: BrowserTarget): Promise<void> {
     if (this.lease || this.stopPromise) await this.stop()
@@ -28,6 +29,7 @@ export class StorageCollector extends EventEmitter {
     this.sessionId = sessionId
     this.target = target
     this.lease = lease
+    this.domStorageEnabled = false
     try {
       this.unsubscribeDisconnect = lease.onDisconnect(() => {
         if (this.lease !== lease) return
@@ -37,6 +39,16 @@ export class StorageCollector extends EventEmitter {
           console.warn('[StorageCollector] Failed to release disconnected lease:', (error as Error).message)
         })
       })
+
+      // Prefer reading DOM storage over the CDP DOMStorage domain (browser-side,
+      // no page script execution). page.evaluate would inject observable script
+      // into the page context, which anti-bot systems flag.
+      try {
+        await lease.send('DOMStorage.enable')
+        this.domStorageEnabled = true
+      } catch {
+        this.domStorageEnabled = false
+      }
 
       await this.collectAll()
       if (this.lease !== lease || lease.released || !lease.connected || this.stopping) return
@@ -77,6 +89,9 @@ export class StorageCollector extends EventEmitter {
       if (this.collectionInFlight) await this.collectionInFlight
       if (this.lease === lease && lease.connected && !lease.released) {
         await this.collectAll(true)
+        if (this.domStorageEnabled) {
+          await lease.send('DOMStorage.disable').catch(() => undefined)
+        }
       }
       this.unsubscribeDisconnect?.()
       this.unsubscribeDisconnect = null
@@ -96,6 +111,7 @@ export class StorageCollector extends EventEmitter {
     this.lease = null
     this.sessionId = null
     this.stopping = false
+    this.domStorageEnabled = false
   }
 
   private async collectAll(force = false): Promise<void> {
@@ -107,11 +123,12 @@ export class StorageCollector extends EventEmitter {
     if (!target || !lease || !sessionId || target.isClosed() || !lease.connected) return
 
     const domain = this.getCurrentDomain(target)
+    const origin = this.getCurrentOrigin(target)
     const timestamp = Date.now()
     this.collectionInFlight = Promise.allSettled([
       this.collectCookies(target, lease, domain, timestamp),
-      this.collectLocalStorage(lease, domain, timestamp),
-      this.collectSessionStorage(lease, domain, timestamp)
+      this.collectDomStorage(lease, domain, origin, timestamp, true),
+      this.collectDomStorage(lease, domain, origin, timestamp, false)
     ]).then(() => undefined)
     try {
       await this.collectionInFlight
@@ -142,49 +159,72 @@ export class StorageCollector extends EventEmitter {
     }
   }
 
-  private async collectLocalStorage(
+  private async collectDomStorage(
     lease: CdpLease,
     domain: string,
-    timestamp: number
+    origin: string | null,
+    timestamp: number,
+    isLocalStorage: boolean
   ): Promise<void> {
-    try {
-      const result = await lease.send<{ result?: { value?: string } }>('Runtime.evaluate', {
-        expression: 'JSON.stringify(localStorage)',
-        returnByValue: true,
-      })
-      this.emit('storage-collected', {
-        domain,
-        storageType: 'localStorage',
-        data: result.result?.value || '{}',
-        timestamp,
-      })
-    } catch (err) {
-      console.warn('[StorageCollector] collectLocalStorage failed:', (err as Error).message)
+    const storageType = isLocalStorage ? 'localStorage' : 'sessionStorage'
+    // Preferred path: read the storage area straight from the browser process,
+    // so nothing is injected into the page. Needs a real (non-null) origin.
+    if (this.domStorageEnabled && origin) {
+      try {
+        const result = await lease.send<{ entries?: Array<[string, string]> }>(
+          'DOMStorage.getDOMStorageItems',
+          { storageId: { securityOrigin: origin, isLocalStorage } }
+        )
+        const data: Record<string, string> = {}
+        for (const entry of result.entries ?? []) {
+          if (Array.isArray(entry) && typeof entry[0] === 'string') {
+            data[entry[0]] = typeof entry[1] === 'string' ? entry[1] : ''
+          }
+        }
+        this.emit('storage-collected', {
+          domain,
+          storageType,
+          data: JSON.stringify(data),
+          timestamp,
+        })
+        return
+      } catch (err) {
+        // Fall through to the page-script fallback below (e.g. opaque origin).
+        console.warn(`[StorageCollector] DOMStorage read (${storageType}) failed:`, (err as Error).message)
+      }
     }
-  }
 
-  private async collectSessionStorage(
-    lease: CdpLease,
-    domain: string,
-    timestamp: number
-  ): Promise<void> {
+    // Fallback: only used when the DOMStorage domain is unavailable or the
+    // origin is opaque. Still functional, but visible to the page.
     try {
+      const expression = isLocalStorage
+        ? 'JSON.stringify(localStorage)'
+        : 'JSON.stringify(sessionStorage)'
       const result = await lease.send<{ result?: { value?: string } }>('Runtime.evaluate', {
-        expression: 'JSON.stringify(sessionStorage)',
+        expression,
         returnByValue: true,
       })
       this.emit('storage-collected', {
         domain,
-        storageType: 'sessionStorage',
+        storageType,
         data: result.result?.value || '{}',
         timestamp,
       })
     } catch (err) {
-      console.warn('[StorageCollector] collectSessionStorage failed:', (err as Error).message)
+      console.warn(`[StorageCollector] collect ${storageType} failed:`, (err as Error).message)
     }
   }
 
   private getCurrentDomain(target: BrowserTarget): string {
     try { return new URL(target.url).hostname || 'unknown' } catch { return 'unknown' }
+  }
+
+  private getCurrentOrigin(target: BrowserTarget): string | null {
+    try {
+      const origin = new URL(target.url).origin
+      return origin && origin !== 'null' ? origin : null
+    } catch {
+      return null
+    }
   }
 }

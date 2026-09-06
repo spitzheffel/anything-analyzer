@@ -1,26 +1,17 @@
-import type { ContextBudgetConfig, ContextMode, CompressionMode } from "@shared/types";
+import type { ContextBudgetConfig } from "@shared/types";
 import {
   estimateTextTokens,
   estimateTextTokensRaw,
   calibrateTokenEstimate,
 } from "@shared/token-estimate";
+import { DEFAULT_CONTEXT_BUDGET, normalizeContextBudget } from "@shared/context-budget-config";
+
+export { DEFAULT_CONTEXT_BUDGET, normalizeContextBudget };
+export { resolveContextBudget } from "@shared/model-context-windows";
 
 export const DEFAULT_CHAT_CONTEXT_CHARS = 60_000;
 export const KEEP_RECENT_TOOL_CONTEXTS = 2;
 export const CHARS_PER_TOKEN = 4;
-
-export const DEFAULT_CONTEXT_BUDGET: ContextBudgetConfig = {
-  maxContextTokens: 200_000,
-  compressionPeak: 0.85,
-  compressionTarget: 0.55,
-  reserveCompletionTokens: 8_192,
-  contextMode: "index_first",
-  compressionMode: "rules",
-  subagentEnabled: true,
-  subagentThreshold: 400,
-  subagentChunkSize: 120,
-  maxSubagents: 3,
-};
 
 export interface MessageLike {
   role: "system" | "user" | "assistant" | "tool";
@@ -33,37 +24,6 @@ export interface CompactResult {
   beforeTokens: number;
   afterTokens: number;
   mode: "none" | "rules" | "hybrid";
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-export function normalizeContextBudget(
-  partial?: Partial<ContextBudgetConfig> | null,
-): ContextBudgetConfig {
-  const merged: ContextBudgetConfig = {
-    ...DEFAULT_CONTEXT_BUDGET,
-    ...(partial ?? {}),
-  };
-
-  const contextMode: ContextMode =
-    merged.contextMode === "legacy_inline" ? "legacy_inline" : "index_first";
-  const compressionMode: CompressionMode =
-    merged.compressionMode === "hybrid" ? "hybrid" : "rules";
-
-  return {
-    maxContextTokens: Math.max(4_096, Math.floor(merged.maxContextTokens || DEFAULT_CONTEXT_BUDGET.maxContextTokens)),
-    compressionPeak: clamp(merged.compressionPeak || DEFAULT_CONTEXT_BUDGET.compressionPeak, 0.5, 0.95),
-    compressionTarget: clamp(merged.compressionTarget || DEFAULT_CONTEXT_BUDGET.compressionTarget, 0.2, 0.8),
-    reserveCompletionTokens: Math.max(256, Math.floor(merged.reserveCompletionTokens || DEFAULT_CONTEXT_BUDGET.reserveCompletionTokens)),
-    contextMode,
-    compressionMode,
-    subagentEnabled: merged.subagentEnabled !== false,
-    subagentThreshold: Math.max(100, Math.floor(merged.subagentThreshold || DEFAULT_CONTEXT_BUDGET.subagentThreshold)),
-    subagentChunkSize: Math.max(40, Math.min(250, Math.floor(merged.subagentChunkSize || DEFAULT_CONTEXT_BUDGET.subagentChunkSize))),
-    maxSubagents: Math.max(1, Math.min(8, Math.floor(merged.maxSubagents || DEFAULT_CONTEXT_BUDGET.maxSubagents))),
-  };
 }
 
 export function estimateTokens(text: string): number {

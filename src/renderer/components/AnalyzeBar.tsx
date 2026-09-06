@@ -6,6 +6,7 @@ import styles from './AnalyzeBar.module.css'
 interface AnalyzeBarProps {
   onAnalyze: (purpose?: string) => void
   onExport: () => void
+  onExportHar?: () => void
   hasRequests: boolean
   isAnalyzing: boolean
   isStopped: boolean
@@ -16,6 +17,7 @@ interface AnalyzeBarProps {
 const AnalyzeBar: React.FC<AnalyzeBarProps> = ({
   onAnalyze,
   onExport,
+  onExportHar,
   hasRequests,
   isAnalyzing,
   isStopped,
@@ -97,6 +99,17 @@ const AnalyzeBar: React.FC<AnalyzeBarProps> = ({
       >
         ⬇ {t('data.export')}
       </button>
+      {onExportHar && (
+        <button
+          className={styles.analyzeBtnDim}
+          disabled={!(isStopped && hasRequests) || isAnalyzing}
+          onClick={onExportHar}
+          style={{ marginLeft: 6 }}
+          title="HTTP Archive 1.2"
+        >
+          ⬇ {t('data.exportHar')}
+        </button>
+      )}
     </div>
   )
 }

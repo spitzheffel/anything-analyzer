@@ -20,6 +20,8 @@ import {
   resolveContextUsedTokens,
 } from '@shared/token-estimate'
 import { stripToolContext } from '@shared/types'
+import type { LLMProviderConfig } from '@shared/types'
+import { resolveContextBudget } from '@shared/model-context-windows'
 import InteractionLog from './components/InteractionLog'
 import { useSession } from './hooks/useSession'
 import { useCapture } from './hooks/useCapture'
@@ -129,37 +131,41 @@ function App(): React.ReactElement {
   /** Ref to browser placeholder for reporting exact bounds to main process */
   const placeholderRef = useRef<HTMLDivElement>(null)
 
-  const { requests, hooks, snapshots, reports, interactions, isAnalyzing, analysisError, streamingContent, startAnalysis, cancelAnalysis, chatHistory, latestContextUsage, isChatting, chatError, sendFollowUp, clearCaptureData } = useCapture(currentSessionId)
+  const { requests, hooks, snapshots, reports, interactions, isAnalyzing, analysisError, streamingContent, streamingReasoning, startAnalysis, cancelAnalysis, chatHistory, latestContextUsage, isChatting, chatError, sendFollowUp, clearCaptureData, replaceReport } = useCapture(currentSessionId)
 
-  const [budgetCfg, setBudgetCfg] = useState({
-    maxContextTokens: 200_000,
-    reserveCompletionTokens: 8_192,
-    compressionPeak: 0.85,
-  })
+  const [llmConfig, setLlmConfig] = useState<LLMProviderConfig | null>(null)
   const [defaultModel, setDefaultModel] = useState('')
   const [selectedAnalysisModel, setSelectedAnalysisModel] = useState('')
   const [reportModelOptions, setReportModelOptions] = useState<string[]>([])
   const [isLoadingReportModels, setIsLoadingReportModels] = useState(false)
   const reportModelsLoadedRef = useRef(false)
 
+  // 启动时读一次；设置弹窗关闭后再读一次，让保存的模型 / 窗口设置立刻生效
   useEffect(() => {
+    if (settingsOpen) return
     let alive = true
     window.electronAPI.getLLMConfig().then((config) => {
       if (!alive || !config) return
+      setLlmConfig(config)
       setDefaultModel(config.model)
       setSelectedAnalysisModel(prev => prev || config.model)
       setReportModelOptions(prev => [...new Set([...prev, config.model].filter(Boolean))])
-      if (config.contextBudget) {
-        const b = config.contextBudget
-        setBudgetCfg({
-          maxContextTokens: b.maxContextTokens ?? 200_000,
-          reserveCompletionTokens: b.reserveCompletionTokens ?? 8_192,
-          compressionPeak: b.compressionPeak ?? 0.85,
-        })
-      }
     }).catch(() => {})
     return () => { alive = false }
-  }, [])
+  }, [settingsOpen])
+
+  // 上下文预算跟随当前选中的模型（自动窗口模式下不同模型窗口不同）
+  const budgetCfg = useMemo(() => {
+    const budget = resolveContextBudget({
+      model: selectedAnalysisModel || reports[0]?.llm_model || llmConfig?.model || '',
+      contextBudget: llmConfig?.contextBudget,
+    })
+    return {
+      maxContextTokens: budget.maxContextTokens,
+      reserveCompletionTokens: budget.reserveCompletionTokens,
+      compressionPeak: budget.compressionPeak,
+    }
+  }, [llmConfig, selectedAnalysisModel, reports])
 
   const loadReportModels = useCallback(async () => {
     setIsLoadingReportModels(true)
@@ -308,6 +314,38 @@ function App(): React.ReactElement {
       console.error('Export failed:', err)
     }
   }, [currentSessionId])
+
+  const handleExportHar = useCallback(async () => {
+    if (!currentSessionId) return
+    try {
+      await window.electronAPI.exportHar(currentSessionId)
+    } catch (err) {
+      console.error('HAR export failed:', err)
+      toast.error(err instanceof Error ? err.message : String(err))
+    }
+  }, [currentSessionId, toast])
+
+  // 报告正文里的 [#12] / 面板端点点击：定位到请求并切到检查器
+  const handleCiteClick = useCallback((seq: number) => {
+    const target = requests.find((r) => r.sequence === seq)
+    if (!target) {
+      toast.warning(`#${seq} ${t('report.citeNotFound')}`)
+      return
+    }
+    setSelectedRequestId(target.id)
+    setActiveTab('requests')
+    setActiveView('inspector')
+  }, [requests, toast, t])
+
+  const handleEnsureSpec = useCallback(async (reportId: string) => {
+    try {
+      const updated = await window.electronAPI.ensureReportSpec(reportId)
+      replaceReport(updated)
+      if (updated.spec_error) toast.error(updated.spec_error)
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : String(err))
+    }
+  }, [replaceReport, toast])
 
   // Clear browser environment (with confirmation)
   // Hide native WebContentsView so the confirm dialog is not obscured
@@ -684,6 +722,7 @@ function App(): React.ReactElement {
           <AnalyzeBar
             onAnalyze={handleAnalyze}
             onExport={handleExport}
+            onExportHar={handleExportHar}
             hasRequests={requests.length > 0}
             isAnalyzing={isAnalyzing}
             isStopped={currentSession.status !== 'running'}
@@ -706,6 +745,7 @@ function App(): React.ReactElement {
           isAnalyzing={isAnalyzing}
           analysisError={analysisError}
           streamingContent={streamingContent}
+          streamingReasoning={streamingReasoning}
           onReAnalyze={handleReportAnalyze}
           onCancelAnalysis={handleCancelAnalysis}
           chatHistory={chatHistory}
@@ -722,6 +762,8 @@ function App(): React.ReactElement {
           isLoadingModels={isLoadingReportModels}
           onModelChange={setSelectedAnalysisModel}
           onRefreshModels={loadReportModels}
+          onCiteClick={handleCiteClick}
+          onEnsureSpec={handleEnsureSpec}
         />
       ) : (
         renderEmptyGuide()

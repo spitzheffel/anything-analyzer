@@ -3,6 +3,8 @@
  * 支持用真实 usage 做 EMA 校准。
  */
 
+import { clampReserveCompletionTokens } from "./context-budget-config";
+
 export interface TokenEstimateCalibration {
   /** actual / rawEstimate 的平滑系数，默认 1 */
   ratio: number;
@@ -197,7 +199,7 @@ export function buildContextUsageSnapshot(
   } = {},
 ): ContextUsageSnapshot {
   const maxContextTokens = Math.max(4096, opts.maxContextTokens ?? 200_000);
-  const reserveCompletionTokens = Math.max(256, opts.reserveCompletionTokens ?? 8_192);
+  const reserveCompletionTokens = clampReserveCompletionTokens(opts.reserveCompletionTokens ?? 8_192, maxContextTokens);
   const peakRatio = Math.min(0.95, Math.max(0.5, opts.compressionPeak ?? 0.85));
   const usableTokens = Math.max(1024, maxContextTokens - reserveCompletionTokens);
   const usageRatio = usedTokens / usableTokens;

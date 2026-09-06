@@ -83,8 +83,12 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("ai:chat", sessionId, reportId, history, userMessage),
   getChatMessages: (reportId: string) =>
     ipcRenderer.invoke("data:chatMessages", reportId),
-  saveChatMessages: (reportId: string, messages: unknown[]) =>
-    ipcRenderer.invoke("data:saveChatMessages", reportId, messages),
+  ensureReportSpec: (reportId: string) =>
+    ipcRenderer.invoke("report:ensureSpec", reportId),
+  exportReportSpec: (reportId: string) =>
+    ipcRenderer.invoke("report:exportSpec", reportId),
+  exportReportOpenApi: (reportId: string) =>
+    ipcRenderer.invoke("report:exportOpenApi", reportId),
 
   // Browser bounds sync (renderer → main, fire-and-forget)
   syncBrowserBounds: (bounds: {
@@ -126,6 +130,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   // Export requests
   exportRequests: (sessionId: string) =>
     ipcRenderer.invoke("data:exportRequests", sessionId),
+  exportHar: (sessionId: string) =>
+    ipcRenderer.invoke("data:exportHar", sessionId),
 
   // AI Request Logs
   getAiRequestLogs: (sessionId: string) => ipcRenderer.invoke("data:aiRequestLogs", sessionId),
@@ -216,8 +222,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
   onStorageCaptured: (callback: (data: unknown) => void) => {
     ipcRenderer.on("capture:storage", (_event, data) => callback(data));
   },
-  onAnalysisProgress: (callback: (chunk: string) => void) => {
-    ipcRenderer.on("ai:progress", (_event, chunk) => callback(chunk));
+  onAnalysisProgress: (callback: (event: unknown) => void) => {
+    ipcRenderer.on("ai:progress", (_event, payload) => callback(payload));
   },
 
   // Log files

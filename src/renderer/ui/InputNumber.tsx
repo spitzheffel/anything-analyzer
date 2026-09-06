@@ -33,8 +33,13 @@ export const InputNumber = forwardRef<HTMLInputElement, InputNumberProps>(
     const [internalValue, setInternalValue] = React.useState<string>(
       defaultValue !== undefined ? String(defaultValue) : ''
     )
+    // 受控时若用户输入的原文解析后与受控值相同（如 "0." 与 0），保留原文，避免小数点被吃掉
     const displayValue =
-      controlledValue !== undefined ? String(controlledValue) : internalValue
+      controlledValue === undefined
+        ? internalValue
+        : internalValue !== '' && parseFloat(internalValue) === controlledValue
+          ? internalValue
+          : String(controlledValue)
 
     const clamp = (v: number): number => {
       if (min !== undefined && v < min) return min

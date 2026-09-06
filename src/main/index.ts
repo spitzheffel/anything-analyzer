@@ -268,6 +268,7 @@ app.whenReady().then(async () => {
         jsHooksRepo,
         storageSnapshotsRepo,
         reportsRepo,
+        chatMessagesRepo,
         interactionEventsRepo,
       },
       mcpServerConfig.port,

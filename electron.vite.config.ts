@@ -6,12 +6,15 @@ export default defineConfig(({ mode }) => {
   const buildChannel = mode === 'internal' ? 'internal' : 'public'
   const outputRoot = buildChannel === 'internal' ? 'out-internal' : 'out'
 
+  // AI SDK 系列包是 ESM-only，主进程产物是 CJS，必须打进 bundle 而不能 externalize
+  const esmOnlyMainDeps = ['ai', '@ai-sdk/openai', '@ai-sdk/anthropic', '@ai-sdk/openai-compatible']
+
   return {
     main: {
       define: {
         __AA_BUILD_CHANNEL__: JSON.stringify(buildChannel)
       },
-      plugins: [externalizeDepsPlugin()],
+      plugins: [externalizeDepsPlugin({ exclude: esmOnlyMainDeps })],
       resolve: {
         alias: {
           '@shared': resolve('src/shared')

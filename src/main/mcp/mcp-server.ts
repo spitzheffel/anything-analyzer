@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import {
@@ -23,10 +23,16 @@ import type {
   JsHooksRepo,
   StorageSnapshotsRepo,
   AnalysisReportsRepo,
+  ChatMessagesRepo,
   InteractionEventsRepo,
 } from "../db/repositories";
-import type { ChatMessage, InteractionType } from "@shared/types";
+import type { AnalysisReport, ChatMessage, InteractionType } from "@shared/types";
+import { stripToolContext } from "@shared/types";
+import { parseProtocolSpecJson, type ProtocolSpec } from "@shared/protocol-spec";
+import { buildOpenApiDocument } from "@shared/openapi-export";
 import { loadLLMConfig, loadProxyConfig } from "../ipc";
+import { findTemplate } from "../prompt-templates";
+import { DataAssembler } from "../ai/data-assembler";
 import { ReplayEngine } from "../capture/replay-engine";
 import { formatMCPServerUrl, normalizeMCPListenHost } from "./mcp-server-listen";
 
@@ -39,6 +45,7 @@ export interface MCPServerDeps {
   jsHooksRepo: JsHooksRepo;
   storageSnapshotsRepo: StorageSnapshotsRepo;
   reportsRepo: AnalysisReportsRepo;
+  chatMessagesRepo: ChatMessagesRepo;
   interactionEventsRepo: InteractionEventsRepo;
 }
 
@@ -46,9 +53,12 @@ let httpServer: Server | null = null;
 const transports = new Map<string, StreamableHTTPServerTransport>();
 // Per-session McpServer instances (one per transport/session)
 const mcpServers = new Map<string, McpServer>();
-// Per-session chat history for chat_followup tool
-const chatHistories = new Map<string, ChatMessage[]>();
 let currentDeps: MCPServerDeps | null = null;
+
+/** get_session_brief 里各列表的上限，控制在 ~2k token 内 */
+const BRIEF_ENDPOINT_LIMIT = 30;
+const BRIEF_HINT_LIMIT = 10;
+const REPORT_PREVIEW_CHARS = 500;
 
 const browserSessionIdSchema = z
   .string()
@@ -254,7 +264,6 @@ export async function stopMCPServer(): Promise<void> {
     await transport.close().catch(() => {});
   }
   transports.clear();
-  chatHistories.clear();
 
   for (const srv of mcpServers.values()) {
     await srv.close().catch(() => {});
@@ -293,8 +302,17 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     jsHooksRepo,
     storageSnapshotsRepo,
     reportsRepo,
+    chatMessagesRepo,
     interactionEventsRepo,
   } = deps;
+
+  const latestReportOf = (sessionId: string): AnalysisReport | undefined => reportsRepo.findBySession(sessionId)[0];
+
+  /** 会话名等元信息；session 可能已删，缺省即可 */
+  const sessionMetaOf = (sessionId: string): { name?: string; targetUrl?: string } => {
+    const session = sessionManager.getSession(sessionId);
+    return { name: session?.name, targetUrl: session?.target_url };
+  };
 
   // -- Session Management --
 
@@ -692,8 +710,8 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     "get_request_detail",
     {
       description:
-        "Get full details of a single captured request including complete headers, body, and response body",
-      inputSchema: z.object({ requestId: z.string() }),
+        "Get full details of a single captured request by its UUID (the `id` field from get_requests). For sequence numbers cited in reports as [#12], use get_request_by_seq instead.",
+      inputSchema: z.object({ requestId: z.string().describe("Request UUID, not the #seq") }),
     },
     async ({ requestId }) => {
       const req = requestsRepo.findById(requestId);
@@ -756,20 +774,28 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
           error:
             "LLM not configured. Please configure LLM settings in the app first.",
         });
+      // 与界面路径一致：purpose 命中模板 id 时使用用户可编辑的模板
+      const template = purpose ? findTemplate(purpose) : findTemplate("auto");
       const report = await aiAnalyzer.analyze(
         sessionId,
         config,
         undefined,
         purpose,
-        undefined,
+        template ?? undefined,
         selectedSeqs,
       );
-      // Reset chat history so next chat_followup uses the new report
-      chatHistories.delete(sessionId);
+      try {
+        chatMessagesRepo.insertMany(report.id, aiAnalyzer.buildInitialChatMessages(report));
+      } catch {
+        // 初始对话落库失败不影响返回报告；chat_followup 会按需补建
+      }
       return text({
         id: report.id,
-        content: report.report_content,
+        purpose: report.purpose,
         model: report.llm_model,
+        content: report.report_content,
+        spec: aiAnalyzer.getSpec(report),
+        specError: report.spec_error,
       });
     },
   );
@@ -777,7 +803,8 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
   server.registerTool(
     "get_reports",
     {
-      description: "Get all analysis reports for a session",
+      description:
+        "List analysis reports for a session (newest first) with metadata and a short preview. Use get_report for the full content.",
       inputSchema: z.object({ sessionId: z.string() }),
     },
     async ({ sessionId }) => {
@@ -787,9 +814,12 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
           id: r.id,
           created_at: r.created_at,
           llm_model: r.llm_model,
-          content:
-            r.report_content.length > 3000
-              ? r.report_content.substring(0, 3000) + "..."
+          purpose: r.purpose,
+          hasSpec: Boolean(r.spec_json),
+          specError: r.spec_error,
+          preview:
+            r.report_content.length > REPORT_PREVIEW_CHARS
+              ? r.report_content.substring(0, REPORT_PREVIEW_CHARS) + "..."
               : r.report_content,
         })),
       );
@@ -797,10 +827,176 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
   );
 
   server.registerTool(
+    "get_report",
+    {
+      description:
+        "Get one analysis report by id. format=markdown returns the human-readable report, json returns the structured ProtocolSpec, both returns both.",
+      inputSchema: z.object({
+        reportId: z.string().describe("Report ID (from get_reports / run_analysis)"),
+        format: z.enum(["markdown", "json", "both"]).optional().default("both"),
+      }),
+    },
+    async ({ reportId, format }) => {
+      const report = reportsRepo.findById(reportId);
+      if (!report) return text({ error: "Report not found" });
+      const base = {
+        id: report.id,
+        session_id: report.session_id,
+        created_at: report.created_at,
+        llm_model: report.llm_model,
+        purpose: report.purpose,
+      };
+      if (format === "markdown") return text({ ...base, content: report.report_content });
+      const spec = aiAnalyzer.getSpec(report);
+      if (format === "json") return text({ ...base, spec, specError: report.spec_error });
+      return text({ ...base, content: report.report_content, spec, specError: report.spec_error });
+    },
+  );
+
+  server.registerTool(
+    "get_protocol_spec",
+    {
+      description:
+        "Get the structured ProtocolSpec (endpoints, auth chain, flows, storage, crypto, reproduction code) for a session's latest report or a specific report. Extracts it on demand if missing.",
+      inputSchema: z.object({
+        sessionId: z.string().optional().describe("Session ID; uses the latest report"),
+        reportId: z.string().optional().describe("Specific report ID (takes precedence over sessionId)"),
+      }),
+    },
+    async ({ sessionId, reportId }) => {
+      const target = reportId ? reportsRepo.findById(reportId) : sessionId ? latestReportOf(sessionId) : undefined;
+      if (!target) return text({ error: reportId ? "Report not found" : "No report for this session; run run_analysis first" });
+      let report = target;
+      if (!report.spec_json) {
+        const config = loadLLMConfig();
+        if (!config) return text({ error: "Spec not extracted yet and LLM not configured" });
+        report = await aiAnalyzer.ensureSpec(report.id, config);
+      }
+      const spec = aiAnalyzer.getSpec(report);
+      if (!spec) return text({ reportId: report.id, error: report.spec_error ?? "Spec extraction failed" });
+      return text({ reportId: report.id, spec });
+    },
+  );
+
+  server.registerTool(
+    "get_openapi",
+    {
+      description:
+        "Generate an OpenAPI 3.1 document from the session's structured ProtocolSpec (latest report). Extracts the spec on demand if missing.",
+      inputSchema: z.object({ sessionId: z.string() }),
+    },
+    async ({ sessionId }) => {
+      let report = latestReportOf(sessionId);
+      if (!report) return text({ error: "No report for this session; run run_analysis first" });
+      if (!report.spec_json) {
+        const config = loadLLMConfig();
+        if (!config) return text({ error: "Spec not extracted yet and LLM not configured" });
+        report = await aiAnalyzer.ensureSpec(report.id, config);
+      }
+      const spec = aiAnalyzer.getSpec(report);
+      if (!spec) return text({ reportId: report.id, error: report.spec_error ?? "Spec extraction failed" });
+      const meta = sessionMetaOf(sessionId);
+      return text(buildOpenApiDocument(spec, {
+        sessionName: meta.name,
+        targetUrl: meta.targetUrl,
+        generatedAt: report.created_at,
+      }));
+    },
+  );
+
+  server.registerTool(
+    "get_session_enrichment",
+    {
+      description:
+        "Rule-derived session facts without calling an LLM: scene hints, auth chain (token/cookie sources and consumers), storage diff, streaming request seqs.",
+      inputSchema: z.object({ sessionId: z.string() }),
+    },
+    async ({ sessionId }) => text(aiAnalyzer.getSessionEnrichment(sessionId)),
+  );
+
+  server.registerTool(
+    "get_session_brief",
+    {
+      description:
+        "Compact (~2k tokens) briefing of a session for another agent's context: counts, scene hints, auth chain, endpoint list (from the ProtocolSpec when available) and the latest report summary.",
+      inputSchema: z.object({ sessionId: z.string() }),
+    },
+    async ({ sessionId }) => {
+      const meta = sessionMetaOf(sessionId);
+      // 有报告缓存时不重新组装整个会话；只有没有 Spec 需要从索引凑端点清单时才走 assemble
+      const enrichment = aiAnalyzer.getSessionEnrichment(sessionId);
+      const report = latestReportOf(sessionId);
+      const spec = report ? aiAnalyzer.getSpec(report) : null;
+      const hookCount = jsHooksRepo.countBySession(sessionId);
+      const totalRequests = enrichment.totalRequests ?? requestsRepo.countBySession(sessionId);
+
+      const endpoints = spec
+        ? spec.endpoints.slice(0, BRIEF_ENDPOINT_LIMIT).map((endpoint) => ({
+            id: endpoint.id,
+            method: endpoint.method,
+            url: endpoint.urlTemplate,
+            purpose: endpoint.purpose,
+            auth: endpoint.auth,
+            seqs: endpoint.exampleSeqs.slice(0, 3),
+          }))
+        : (() => {
+            const assembler = new DataAssembler(requestsRepo, jsHooksRepo, storageSnapshotsRepo);
+            return dedupeEndpoints(assembler.extractSummaries(assembler.assemble(sessionId))).slice(0, BRIEF_ENDPOINT_LIMIT);
+          })();
+
+      return text({
+        session: { id: sessionId, name: meta.name, targetUrl: meta.targetUrl },
+        counts: { requests: totalRequests, analyzedRequests: enrichment.requestCount, hooks: hookCount, reports: reportsRepo.countBySession(sessionId) },
+        sceneHints: enrichment.sceneHints.slice(0, BRIEF_HINT_LIMIT).map((hint) => ({ scene: hint.scene, confidence: hint.confidence, seqs: hint.relatedRequestIds })),
+        authChain: enrichment.authChain.map((item) => ({ type: item.credentialType, source: item.source, consumers: item.consumers.slice(0, 5) })),
+        streamingSeqs: enrichment.streamingSeqs.slice(0, 20),
+        endpoints,
+        endpointsSource: spec ? "protocol-spec" : "request-index",
+        latestReport: report
+          ? {
+              id: report.id,
+              created_at: report.created_at,
+              purpose: report.purpose,
+              scene: spec?.scene ?? null,
+              summary: spec?.summary ?? report.report_content.slice(0, REPORT_PREVIEW_CHARS),
+              hasSpec: Boolean(spec),
+            }
+          : null,
+        nextSteps: [
+          "get_report(reportId) for the full markdown / spec",
+          "get_request_by_seq(sessionId, seqs) to inspect cited requests",
+          "get_openapi(sessionId) for an OpenAPI 3.1 document",
+        ],
+      });
+    },
+  );
+
+  server.registerTool(
+    "get_request_by_seq",
+    {
+      description:
+        "Get full captured requests by their sequence numbers (#seq, the numbers cited in reports as [#12]). Use this instead of get_request_detail when you have seqs rather than UUIDs.",
+      inputSchema: z.object({
+        sessionId: z.string(),
+        seqs: z.array(z.number().int()).min(1).max(20).describe("Request sequence numbers"),
+      }),
+    },
+    async ({ sessionId, seqs }) => {
+      const wanted = new Set(seqs);
+      const requests = requestsRepo.findBySession(sessionId).filter((r) => wanted.has(r.sequence));
+      const found = new Set(requests.map((r) => r.sequence));
+      return text({
+        requests,
+        missing: seqs.filter((seq) => !found.has(seq)),
+      });
+    },
+  );
+
+  server.registerTool(
     "chat_followup",
     {
       description:
-        "Send a follow-up question about a previous analysis. Maintains conversation history per session.",
+        "Send a follow-up question about the latest analysis report of a session. Conversation history is persisted per report.",
       inputSchema: z.object({
         sessionId: z.string().describe("Session ID"),
         message: z.string().describe("Follow-up question"),
@@ -809,50 +1005,23 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
     async ({ sessionId, message }) => {
       const config = loadLLMConfig();
       if (!config) return text({ error: "LLM not configured" });
+      const report = latestReportOf(sessionId);
+      if (!report) return text({ error: "No report for this session; run run_analysis first" });
 
-      // Get or initialize chat history for this session
-      if (!chatHistories.has(sessionId)) {
-        // Load existing report as context
-        const reports = reportsRepo.findBySession(sessionId);
-        const lastReport = reports[reports.length - 1];
-
-        // Build system prompt with captured data summary (consistent with IPC path)
-        const requests = requestsRepo.findBySession(sessionId);
-        const hooks = jsHooksRepo.findBySession(sessionId);
-        const reqSummary = requests.slice(0, 50).map((r) => {
-          let path = r.url;
-          try { path = new URL(r.url).pathname; } catch { /* keep full url */ }
-          return `#${r.sequence} ${r.method} ${path} → ${r.status_code ?? '?'}`;
-        }).join('\n');
-
-        const hookSummary = hooks.length > 0
-          ? '\n\nDetected hooks:\n' + hooks.slice(0, 20).map((h) =>
-              `[${h.hook_type}] ${h.function_name}`
-            ).join('\n')
-          : '';
-
-        const contextBlock = reqSummary
-          ? `\n\n<captured_data_summary>\nCaptured ${requests.length} requests:\n${reqSummary}${requests.length > 50 ? `\n... and ${requests.length - 50} more` : ''}${hookSummary}\n</captured_data_summary>`
-          : '';
-
-        const systemContent = `你是一位网站协议分析专家。基于之前的分析报告和捕获数据，回答用户的追问。保持技术精确，用中文回复。\n\n你可以使用 get_request_detail 工具，通过传入请求序号(seq)来查看任意请求的完整详情（请求头、请求体、响应头、响应体）。当用户追问某个具体请求或需要更多细节时，请主动调用此工具获取数据。${contextBlock}`;
-
-        const initialHistory: ChatMessage[] = [
-          { role: "system" as const, content: systemContent },
-        ];
-        if (lastReport) {
-          initialHistory.push({ role: "assistant" as const, content: lastReport.report_content });
-        }
-        chatHistories.set(sessionId, initialHistory);
+      let history: ChatMessage[] = chatMessagesRepo.findByReport(report.id).map((m) => ({
+        role: m.role as ChatMessage["role"],
+        content: m.content,
+      }));
+      if (history.length === 0) {
+        history = aiAnalyzer.buildInitialChatMessages(report);
+        chatMessagesRepo.insertMany(report.id, history);
       }
 
-      const history = chatHistories.get(sessionId)!;
-      const reply = await aiAnalyzer.chat(sessionId, config, history, message);
-      // Update history
-      history.push({ role: "user" as const, content: message });
-      history.push({ role: "assistant" as const, content: reply });
+      const reply = await aiAnalyzer.chat(sessionId, config, history, message, undefined, report.id);
+      chatMessagesRepo.append(report.id, "user", message);
+      chatMessagesRepo.append(report.id, "assistant", reply);
 
-      return text({ reply });
+      return text({ reportId: report.id, reply: stripToolContext(reply) });
     },
   );
 
@@ -1063,7 +1232,7 @@ function registerTools(server: McpServer, deps: MCPServerDeps): void {
 // ---- Resource Registration ----
 
 function registerResources(server: McpServer, deps: MCPServerDeps): void {
-  const { sessionManager, browserCoordinator } = deps;
+  const { sessionManager, browserCoordinator, reportsRepo } = deps;
 
   server.registerResource(
     "sessions",
@@ -1127,9 +1296,96 @@ function registerResources(server: McpServer, deps: MCPServerDeps): void {
       };
     },
   );
+
+  server.registerResource(
+    "report",
+    new ResourceTemplate("report://{reportId}", {
+      list: async () => ({
+        resources: sessionManager.listSessions().flatMap((session) =>
+          reportsRepo.findBySession(session.id).map((report) => ({
+            uri: `report://${report.id}`,
+            name: `${session.name} · ${new Date(report.created_at).toISOString()}`,
+            description: `Analysis report (${report.purpose ?? "auto"}, ${report.llm_model})`,
+            mimeType: "text/markdown",
+          })),
+        ),
+      }),
+    }),
+    { description: "Full markdown of one analysis report" },
+    async (uri, variables) => {
+      const reportId = String(variables.reportId ?? "");
+      const report = reportsRepo.findById(reportId);
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            text: report ? report.report_content : `Report ${reportId} not found`,
+            mimeType: "text/markdown",
+          },
+        ],
+      };
+    },
+  );
+
+  server.registerResource(
+    "protocol-spec",
+    new ResourceTemplate("spec://{sessionId}", {
+      list: async () => ({
+        resources: sessionManager.listSessions().flatMap((session) => {
+          const latest = reportsRepo.findBySession(session.id)[0];
+          if (!latest?.spec_json) return [];
+          return [{
+            uri: `spec://${session.id}`,
+            name: `${session.name} · ProtocolSpec`,
+            description: "Structured protocol spec of the latest report",
+            mimeType: "application/json",
+          }];
+        }),
+      }),
+    }),
+    { description: "Structured ProtocolSpec JSON of a session's latest report (already extracted only)" },
+    async (uri, variables) => {
+      const sessionId = String(variables.sessionId ?? "");
+      const latest = reportsRepo.findBySession(sessionId)[0];
+      const spec: ProtocolSpec | null = latest ? parseProtocolSpecJson(latest.spec_json) : null;
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            text: JSON.stringify(spec ?? { error: latest ? (latest.spec_error ?? "Spec not extracted yet; call get_protocol_spec") : "No report for this session" }, null, 2),
+            mimeType: "application/json",
+          },
+        ],
+      };
+    },
+  );
 }
 
 // ---- Helpers ----
+
+/** 没有 Spec 时用请求索引凑一份端点清单：按 METHOD + pathname 去重，带首个序号 */
+function dedupeEndpoints(summaries: Array<{ seq: number; method: string; url: string }>): Array<{ method: string; url: string; seqs: number[] }> {
+  const byKey = new Map<string, { method: string; url: string; seqs: number[] }>();
+  for (const summary of summaries) {
+    let path = summary.url;
+    let origin = "";
+    try {
+      const parsed = new URL(summary.url);
+      origin = parsed.origin;
+      path = parsed.pathname;
+    } catch {
+      /* keep full url */
+    }
+    const key = `${summary.method} ${origin}${path}`;
+    const existing = byKey.get(key);
+    if (existing) {
+      if (existing.seqs.length < 3) existing.seqs.push(summary.seq);
+    } else {
+      byKey.set(key, { method: summary.method, url: `${origin}${path}`, seqs: [summary.seq] });
+    }
+  }
+  return [...byKey.values()];
+}
 
 function resolveBrowserContext(
   browserCoordinator: BrowserCoordinator,

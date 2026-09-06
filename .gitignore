@@ -39,3 +39,5 @@ docs/superpowers/
 report-*copy*
 .claude/skills/version-release-pipeline/SKILL.md
 report-2026-04-17-copilot-claude-sonnet-4.6.md
+
+.codegraph/

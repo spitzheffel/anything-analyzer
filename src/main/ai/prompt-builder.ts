@@ -47,6 +47,13 @@ const DEFAULT_REQUIREMENTS = `1. 场景识别：判断用户执行了什么操�
 7. 关键依赖关系：请求之间的依赖和时序关系
 8. 复现建议：用代码伪逻辑描述如何复现整个流程`;
 
+/**
+ * 引用规则：让报告里的每个结论都能回溯到具体请求，供界面点击跳转和外部工具按序号钻取。
+ * 与 shared/citations.ts 的解析格式保持一致。
+ */
+export const CITATION_RULE =
+  "\n引用规则：报告中每个基于抓包数据的结论都必须标注依据的请求序号，格式为 [#12]，多个依据写成 [#12][#15]，序号只能取自请求索引中真实存在的 #seq。没有直接依据的判断要明确写成推断。";
+
 /** 首轮内联索引上限；超出后头尾抽样 + list_requests 分页 */
 const INDEX_INLINE_LIMIT = 120;
 const INDEX_HEAD_COUNT = 80;
@@ -75,7 +82,7 @@ export class PromptBuilder {
     const captureToolHint = "\n需要还原用户具体元素操作或检查未关联请求的 JS 调用时，主动使用 read_session_interactions / read_session_hooks。";
 
     const system = (template?.systemPrompt
-      || `你是一位网站协议分析专家。你的任务是分析用户在网站上的操作过程中产生的HTTP请求、JS调用和存储变化，识别其业务场景，并生成结构化的协议分析报告。Be precise and technical. Output in Chinese (Simplified).`) + toolHint + captureToolHint;
+      || `你是一位网站协议分析专家。你的任务是分析用户在网站上的操作过程中产生的HTTP请求、JS调用和存储变化，识别其业务场景，并生成结构化的协议分析报告。Be precise and technical. Output in Chinese (Simplified).`) + toolHint + captureToolHint + CITATION_RULE;
 
     const analysisRequirements = template?.requirements
       || this.buildAnalysisRequirements(purpose);
@@ -377,7 +384,7 @@ ${DEFAULT_REQUIREMENTS}`;
     return `${(value / (1024 * 1024)).toFixed(1)}MB`;
   }
 
-  private formatIndexLine(s: RequestSummary): string {
+  formatIndexLine(s: RequestSummary): string {
     const ct = s.contentType ? ` [${s.contentType.split(";")[0].trim()}]` : "";
     const flags: string[] = [];
     if (s.hasAuthHeader) flags.push("auth");

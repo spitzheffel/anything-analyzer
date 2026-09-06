@@ -146,6 +146,7 @@ export class RequestsRepo {
     findById: Database.Statement
     getNextSequence: Database.Statement
     deleteBySession: Database.Statement
+    countBySession: Database.Statement
   }
 
   constructor(private db: Database.Database) {
@@ -167,12 +168,18 @@ export class RequestsRepo {
       getNextSequence: db.prepare(
         'SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM requests WHERE session_id = ?'
       ),
-      deleteBySession: db.prepare('DELETE FROM requests WHERE session_id = ?')
+      deleteBySession: db.prepare('DELETE FROM requests WHERE session_id = ?'),
+      countBySession: db.prepare('SELECT COUNT(*) AS cnt FROM requests WHERE session_id = ?'),
     }
   }
 
   insert(data: Partial<CapturedRequest> & { source?: string }): void {
     this.stmts.insert.run({ ...data, source: data.source || 'cdp' })
+  }
+
+  countBySession(sessionId: string): number {
+    const row = this.stmts.countBySession.get(sessionId) as { cnt: number } | undefined
+    return row?.cnt ?? 0
   }
 
   updateResponse(data: {
@@ -268,6 +275,7 @@ export class JsHooksRepo {
     insert: Database.Statement
     findBySession: Database.Statement
     deleteBySession: Database.Statement
+    countBySession: Database.Statement
   }
 
   constructor(private db: Database.Database) {
@@ -279,7 +287,8 @@ export class JsHooksRepo {
       findBySession: db.prepare(
         'SELECT * FROM js_hooks WHERE session_id = ? ORDER BY timestamp ASC'
       ),
-      deleteBySession: db.prepare('DELETE FROM js_hooks WHERE session_id = ?')
+      deleteBySession: db.prepare('DELETE FROM js_hooks WHERE session_id = ?'),
+      countBySession: db.prepare('SELECT COUNT(*) AS cnt FROM js_hooks WHERE session_id = ?'),
     }
   }
 
@@ -289,6 +298,11 @@ export class JsHooksRepo {
 
   findBySession(sessionId: string): JsHookRecord[] {
     return this.stmts.findBySession.all(sessionId) as JsHookRecord[]
+  }
+
+  countBySession(sessionId: string): number {
+    const row = this.stmts.countBySession.get(sessionId) as { cnt: number } | undefined
+    return row?.cnt ?? 0
   }
 
   deleteBySession(sessionId: string): void {
@@ -354,25 +368,46 @@ export class AnalysisReportsRepo {
     findById: Database.Statement
     deleteBySession: Database.Statement
     deleteById: Database.Statement
+    updateSpec: Database.Statement
+    countBySession: Database.Statement
   }
 
   constructor(private db: Database.Database) {
     this.stmts = {
       insert: db.prepare(
-        `INSERT INTO analysis_reports (id, session_id, created_at, llm_provider, llm_model, prompt_tokens, completion_tokens, report_content, filter_prompt_tokens, filter_completion_tokens)
-         VALUES (@id, @session_id, @created_at, @llm_provider, @llm_model, @prompt_tokens, @completion_tokens, @report_content, @filter_prompt_tokens, @filter_completion_tokens)`
+        `INSERT INTO analysis_reports (id, session_id, created_at, llm_provider, llm_model, prompt_tokens, completion_tokens, report_content, filter_prompt_tokens, filter_completion_tokens, purpose, spec_json, spec_error, enrichment_json)
+         VALUES (@id, @session_id, @created_at, @llm_provider, @llm_model, @prompt_tokens, @completion_tokens, @report_content, @filter_prompt_tokens, @filter_completion_tokens, @purpose, @spec_json, @spec_error, @enrichment_json)`
       ),
       findBySession: db.prepare(
         'SELECT * FROM analysis_reports WHERE session_id = ? ORDER BY created_at DESC'
       ),
       findById: db.prepare('SELECT * FROM analysis_reports WHERE id = ?'),
       deleteBySession: db.prepare('DELETE FROM analysis_reports WHERE session_id = ?'),
-      deleteById: db.prepare('DELETE FROM analysis_reports WHERE id = ?')
+      deleteById: db.prepare('DELETE FROM analysis_reports WHERE id = ?'),
+      updateSpec: db.prepare(
+        'UPDATE analysis_reports SET spec_json = ?, spec_error = ? WHERE id = ?'
+      ),
+      countBySession: db.prepare('SELECT COUNT(*) AS cnt FROM analysis_reports WHERE session_id = ?'),
     }
   }
 
+  countBySession(sessionId: string): number {
+    const row = this.stmts.countBySession.get(sessionId) as { cnt: number } | undefined
+    return row?.cnt ?? 0
+  }
+
   insert(report: AnalysisReport): void {
-    this.stmts.insert.run(report)
+    this.stmts.insert.run({
+      ...report,
+      purpose: report.purpose ?? null,
+      spec_json: report.spec_json ?? null,
+      spec_error: report.spec_error ?? null,
+      enrichment_json: report.enrichment_json ?? null,
+    })
+  }
+
+  updateSpec(id: string, specJson: string | null, specError: string | null): void {
+    this.stmts.updateSpec.run(specJson, specError, id)
   }
 
   findBySession(sessionId: string): AnalysisReport[] {
@@ -742,6 +777,7 @@ export class AiRequestLogRepo {
     deleteBySession: Database.Statement;
     updateTokens: Database.Statement;
     updateTokensById: Database.Statement;
+    updateResponseBodyById: Database.Statement;
   };
 
   constructor(private db: Database.Database) {
@@ -779,6 +815,9 @@ export class AiRequestLogRepo {
       updateTokensById: db.prepare(
         'UPDATE ai_request_logs SET prompt_tokens = ?, completion_tokens = ? WHERE id = ?'
       ),
+      updateResponseBodyById: db.prepare(
+        'UPDATE ai_request_logs SET response_body = ?, duration_ms = ? WHERE id = ?'
+      ),
     };
   }
 
@@ -808,6 +847,10 @@ export class AiRequestLogRepo {
 
   updateTokensById(id: number, promptTokens: number, completionTokens: number): void {
     this.stmts.updateTokensById.run(promptTokens, completionTokens, id);
+  }
+
+  updateResponseBodyById(id: number, responseBody: string, durationMs: number): void {
+    this.stmts.updateResponseBodyById.run(responseBody, durationMs, id);
   }
 }
 

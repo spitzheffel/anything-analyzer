@@ -3,14 +3,17 @@ import {
   runMigrations,
   migrateAddStreamingAndWebSocketFlags,
   migrateAddBrowserPersistenceTables,
+  migrateAddReportArtifactColumns,
 } from "../../../src/main/db/migrations";
 import {
+  AnalysisReportsRepo,
   BrowserProfilesRepo,
   BrowserTabsRepo,
   SessionBrowserConfigRepo,
   SessionsRepo,
 } from "../../../src/main/db/repositories";
 import type {
+  AnalysisReport,
   BrowserProfile,
   BrowserTabState,
   SessionBrowserConfig,
@@ -196,6 +199,49 @@ describeDatabaseMigrations("Database Migrations", () => {
       .toBe("'electron'");
     expect(configColumns.find((column) => column.name === "capture_mode")?.dflt_value)
       .toBe("'deep'");
+  });
+
+  it("应该以幂等方式为 analysis_reports 添加结构化产物列，并支持写入 / 更新 Spec", () => {
+    expect(() => migrateAddReportArtifactColumns(db!)).not.toThrow();
+    expect(() => migrateAddReportArtifactColumns(db!)).not.toThrow();
+
+    const columns = (db!.prepare("PRAGMA table_info(analysis_reports)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(columns).toEqual(expect.arrayContaining(["purpose", "spec_json", "spec_error", "enrichment_json"]));
+
+    db!.prepare("INSERT INTO sessions (id, name, created_at) VALUES (?, ?, ?)").run("s-spec", "Spec", Date.now());
+    const repo = new AnalysisReportsRepo(db!);
+    const report: AnalysisReport = {
+      id: "r-spec",
+      session_id: "s-spec",
+      created_at: Date.now(),
+      llm_provider: "openai",
+      llm_model: "gpt-4o",
+      prompt_tokens: 1,
+      completion_tokens: 1,
+      report_content: "# r",
+      filter_prompt_tokens: null,
+      filter_completion_tokens: null,
+      purpose: "reverse-api",
+      spec_json: null,
+      spec_error: null,
+      enrichment_json: JSON.stringify({ requestCount: 0 }),
+    };
+    repo.insert(report);
+    expect(repo.findById("r-spec")).toMatchObject({ purpose: "reverse-api", spec_json: null, enrichment_json: '{"requestCount":0}' });
+
+    repo.updateSpec("r-spec", null, "boom");
+    expect(repo.findById("r-spec")).toMatchObject({ spec_json: null, spec_error: "boom" });
+    repo.updateSpec("r-spec", '{"specVersion":1}', null);
+    expect(repo.findById("r-spec")).toMatchObject({ spec_json: '{"specVersion":1}', spec_error: null });
+
+    // 老代码路径：报告对象没有新字段时也能插入（列为 NULL）
+    const legacy = { ...report, id: "r-legacy" } as Partial<AnalysisReport>;
+    delete legacy.purpose;
+    delete legacy.spec_json;
+    delete legacy.spec_error;
+    delete legacy.enrichment_json;
+    expect(() => repo.insert(legacy as AnalysisReport)).not.toThrow();
+    expect(repo.findById("r-legacy")).toMatchObject({ purpose: null, spec_json: null });
   });
 
   it("应该为没有浏览器配置的历史会话返回 electron/deep 默认值", () => {

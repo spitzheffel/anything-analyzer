@@ -114,6 +114,31 @@ export function runMigrations(db: Database.Database): void {
   migrateBackfillAnthropicCachedInputTokens(db)
   migrateAddInteractionEventsTable(db)
   migrateAddBrowserPersistenceTables(db)
+  migrateAddReportArtifactColumns(db)
+}
+
+/**
+ * Migration 012: Add structured-artifact columns to analysis_reports
+ * (purpose, ProtocolSpec JSON + extraction error, rule-derived enrichment JSON).
+ * Safe to call multiple times (handles duplicate column errors).
+ */
+export function migrateAddReportArtifactColumns(db: Database.Database): void {
+  const migrations = [
+    `ALTER TABLE analysis_reports ADD COLUMN purpose TEXT`,
+    `ALTER TABLE analysis_reports ADD COLUMN spec_json TEXT`,
+    `ALTER TABLE analysis_reports ADD COLUMN spec_error TEXT`,
+    `ALTER TABLE analysis_reports ADD COLUMN enrichment_json TEXT`,
+  ]
+
+  for (const migration of migrations) {
+    try {
+      db.exec(migration)
+    } catch (err) {
+      if (!String(err).includes('duplicate column name')) {
+        throw err
+      }
+    }
+  }
 }
 
 /**

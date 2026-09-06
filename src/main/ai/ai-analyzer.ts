@@ -2,13 +2,25 @@ import { v4 as uuidv4 } from "uuid";
 import type {
   AnalysisReport,
   AssembledData,
+  ChatMessage,
   FilteredRequest,
   LLMProviderConfig,
   PromptTemplate,
+  AiProgressEvent,
   AiRequestLogData,
   AiRequestLogType,
   RequestSummary,
 } from "@shared/types";
+import { resetEvent, statusEvent } from "@shared/ai-progress";
+import { validateCitations } from "@shared/citations";
+import {
+  isEnrichmentFresh,
+  parseProtocolSpecJson,
+  parseSessionEnrichmentJson,
+  toSessionEnrichment,
+  type ProtocolSpec,
+  type SessionEnrichment,
+} from "@shared/protocol-spec";
 import type {
   SessionsRepo,
   RequestsRepo,
@@ -21,11 +33,14 @@ import type {
 import { DataAssembler } from "./data-assembler";
 import { PromptBuilder } from "./prompt-builder";
 import { LLMRouter } from "./llm-router";
+import { resolveRoleConfig } from "./llm-roles";
+import { computeReportTokenBudget, extractProtocolSpec } from "./spec-extractor";
+import { buildInitialChatMessages } from "./chat-prompt";
 import type { MCPClientManager, MCPToolInfo } from "../mcp/mcp-manager";
 import {
   applyUsageCalibration,
   compactMessagesToBudgetAsync,
-  normalizeContextBudget,
+  resolveContextBudget,
   type MessageLike,
 } from "./context-budget";
 import { BUILTIN_REQUEST_TOOLS, dispatchBuiltinRequestTool } from "./request-tools";
@@ -44,8 +59,6 @@ import {
 const PRE_FILTER_THRESHOLD = 20;
 /** Phase 1 选出的请求少于此值时回退到全量分析 */
 const PRE_FILTER_MIN_SELECTED = 3;
-/** Phase 1 响应最大 token 数 */
-const PHASE1_MAX_TOKENS = 1024;
 /** 需要全量请求的分析目的（不跳过任何请求） */
 const SKIP_FILTER_PURPOSES = ["performance"];
 /** 预过滤每次发送的请求摘要上限，避免单次上下文膨胀 */
@@ -116,6 +129,32 @@ export class AiAnalyzer {
     }
   };
 
+  private readonly updateLogResponseBody = (
+    logId: number,
+    body: string,
+    durationMs: number,
+  ): void => {
+    try {
+      this.aiRequestLogRepo.updateResponseBodyById(logId, body, durationMs);
+    } catch (error) {
+      console.warn("[AiRequestLog] Failed to update response body:", error);
+    }
+  };
+
+  private createRouter(
+    sessionId: string,
+    reportId: string | null,
+    type: AiRequestLogType,
+    config: LLMProviderConfig,
+  ): LLMRouter {
+    return new LLMRouter(
+      config,
+      this.createLogCallback(sessionId, reportId, type, config),
+      this.updateLogTokens,
+      this.updateLogResponseBody,
+    );
+  }
+
   private createBuiltinToolRouter(
     sessionId: string,
     reportId: string | null | undefined,
@@ -163,30 +202,24 @@ export class AiAnalyzer {
     summaries: RequestSummary[],
     purpose: string | undefined,
     template: PromptTemplate | undefined,
-    onProgress?: (chunk: string) => void,
+    onProgress?: (event: AiProgressEvent) => void,
     signal?: AbortSignal,
   ): Promise<string> {
     loadTokenCalibration(config);
-    const budget = normalizeContextBudget(config.contextBudget);
+    const budget = resolveContextBudget(config);
     if (!budget.subagentEnabled || summaries.length < budget.subagentThreshold) return "";
 
-    const workerConfig: LLMProviderConfig = {
-      ...config,
-      maxTokens: Math.min(config.maxTokens || 1024, 1024),
-    };
+    const workerConfig = resolveRoleConfig(config, "subagent");
     const analysisFocus = template?.requirements || purpose || "自动识别协议场景与关键请求链路";
     const analyzer = new SubagentAnalyzer(
       async (input) => {
         signal?.throwIfAborted();
-        onProgress?.(
-          `> 子分析 ${input.chunkIndex + 1}/${input.totalChunks}：正在扫描 ${input.summaries.length} 条请求摘要...\n\n`,
-        );
+        onProgress?.(statusEvent(
+          `子分析 ${input.chunkIndex + 1}/${input.totalChunks}：正在扫描 ${input.summaries.length} 条请求摘要...`,
+        ));
 
-        const router = new LLMRouter(
-          workerConfig,
-          this.createLogCallback(sessionId, null, "subagent", workerConfig),
-          this.updateLogTokens,
-        );
+        loadTokenCalibration(workerConfig);
+        const router = this.createRouter(sessionId, null, "subagent", workerConfig);
         const messages: MessageLike[] = [
           {
             role: "system",
@@ -210,20 +243,25 @@ export class AiAnalyzer {
       },
     );
 
-    onProgress?.(
-      `> 请求数达到 ${summaries.length}，启动最多 ${budget.maxSubagents} 个并行子分析任务。\n\n`,
-    );
-    const result = await analyzer.analyze(summaries);
+    onProgress?.(statusEvent(
+      `请求数达到 ${summaries.length}，启动最多 ${budget.maxSubagents} 个并行子分析任务。`,
+    ));
+    let result: Awaited<ReturnType<SubagentAnalyzer["analyze"]>>;
+    try {
+      result = await analyzer.analyze(summaries);
+    } finally {
+      loadTokenCalibration(config);
+    }
     signal?.throwIfAborted();
     if (!result.applied || result.succeededChunks === 0 || result.findings.length === 0) {
       if (result.applied) {
-        onProgress?.("> 子分析未产生可用线索，主分析继续按请求工具链执行。\n\n");
+        onProgress?.(statusEvent("子分析未产生可用线索，主分析继续按请求工具链执行。"));
       }
       return "";
     }
-    onProgress?.(
-      `> 子分析完成：${result.succeededChunks}/${result.chunkCount} 个分块成功，聚合 ${result.findings.length} 条导航线索。\n\n`,
-    );
+    onProgress?.(statusEvent(
+      `子分析完成：${result.succeededChunks}/${result.chunkCount} 个分块成功，聚合 ${result.findings.length} 条导航线索。`,
+    ));
     return result.compactSummary;
   }
 
@@ -232,24 +270,17 @@ export class AiAnalyzer {
     config: LLMProviderConfig,
     sessionId: string,
     reportId: string | null | undefined,
-    onProgress?: (chunk: string) => void,
+    onProgress?: (event: AiProgressEvent) => void,
     signal?: AbortSignal,
   ): Promise<MessageLike[]> {
     loadTokenCalibration(config);
-    const budget = normalizeContextBudget(config.contextBudget);
+    const budget = resolveContextBudget(config);
     const summarize =
       budget.compressionMode === "hybrid"
         ? async (middleText: string) => {
-            onProgress?.("> 混合压缩：正在生成中间历史摘要...\n\n");
-            const summaryConfig: LLMProviderConfig = {
-              ...config,
-              maxTokens: Math.min(config.maxTokens || 1024, 1024),
-            };
-            const router = new LLMRouter(
-              summaryConfig,
-              this.createLogCallback(sessionId, reportId ?? null, "compress", summaryConfig),
-              this.updateLogTokens,
-            );
+            onProgress?.(statusEvent("混合压缩：正在生成中间历史摘要..."));
+            const summaryConfig = resolveRoleConfig(config, "compress");
+            const router = this.createRouter(sessionId, reportId ?? null, "compress", summaryConfig);
             const summaryMessages: MessageLike[] = [
               {
                 role: "system",
@@ -258,18 +289,24 @@ export class AiAnalyzer {
               },
               { role: "user", content: middleText },
             ];
-            const result = await router.complete(summaryMessages, undefined, signal);
-            applyUsageCalibration(summaryMessages, result.promptTokens);
-            saveTokenCalibration(summaryConfig);
-            return result.content;
+            // 校准存储是进程级单例：轻量模型的 scope 用完必须切回主模型，否则后续估算和回写都会串
+            loadTokenCalibration(summaryConfig);
+            try {
+              const result = await router.complete(summaryMessages, undefined, signal);
+              applyUsageCalibration(summaryMessages, result.promptTokens);
+              saveTokenCalibration(summaryConfig);
+              return result.content;
+            } finally {
+              loadTokenCalibration(config);
+            }
           }
         : undefined;
 
     const packed = await compactMessagesToBudgetAsync(messages, budget, summarize);
     if (packed.compressed) {
-      onProgress?.(
-        `> 上下文达到峰值（${Math.round(budget.compressionPeak * 100)}%），已${packed.mode === "hybrid" ? "混合" : "规则"}压缩 ${packed.beforeTokens} → ${packed.afterTokens} tokens。\n\n`,
-      );
+      onProgress?.(statusEvent(
+        `上下文达到峰值（${Math.round(budget.compressionPeak * 100)}%），已${packed.mode === "hybrid" ? "混合" : "规则"}压缩 ${packed.beforeTokens} → ${packed.afterTokens} tokens。`,
+      ));
     }
     return packed.messages;
   }
@@ -277,14 +314,14 @@ export class AiAnalyzer {
   async analyze(
     sessionId: string,
     config: LLMProviderConfig,
-    onProgress?: (chunk: string) => void,
+    onProgress?: (event: AiProgressEvent) => void,
     purpose?: string,
     template?: PromptTemplate,
     selectedSeqs?: number[],
     signal?: AbortSignal,
   ): Promise<AnalysisReport> {
     loadTokenCalibration(config);
-    const budget = normalizeContextBudget(config.contextBudget);
+    const budget = resolveContextBudget(config);
     const indexFirst = budget.contextMode === "index_first";
 
     const session = this.sessionsRepo.findById(sessionId);
@@ -314,23 +351,19 @@ export class AiAnalyzer {
     if (manualSelection) {
       analysisData = assembler.filterBySeqs(fullData, selectedSeqs!);
       filteredApplied = true;
-      onProgress?.(`> 使用手动选择的 ${selectedSeqs!.length} 条请求进行分析。\n\n`);
+      onProgress?.(statusEvent(`使用手动选择的 ${selectedSeqs!.length} 条请求进行分析。`));
     } else if (indexFirst) {
       analysisData = fullData;
-      onProgress?.(
-        `> 索引优先模式：向模型提供 ${fullData.requests.length} 条请求索引（不内联正文），可使用 list_requests / search_requests / get_request_detail。\n\n`,
-      );
+      onProgress?.(statusEvent(
+        `索引优先模式：向模型提供 ${fullData.requests.length} 条请求索引（不内联正文），可使用 list_requests / search_requests / get_request_detail。`,
+      ));
     } else {
       const skipFilter = purpose && SKIP_FILTER_PURPOSES.includes(purpose);
       if (!skipFilter && fullData.requests.length >= PRE_FILTER_THRESHOLD) {
         try {
-          onProgress?.(`> 请求数量较多（${fullData.requests.length} 条），正在进行智能预过滤...\n\n`);
-          const phase1Config: LLMProviderConfig = { ...config, maxTokens: PHASE1_MAX_TOKENS };
-          const phase1Router = new LLMRouter(
-            phase1Config,
-            this.createLogCallback(sessionId, null, "filter", phase1Config),
-            this.updateLogTokens,
-          );
+          onProgress?.(statusEvent(`请求数量较多（${fullData.requests.length} 条），正在进行智能预过滤...`));
+          const phase1Config = resolveRoleConfig(config, "filter");
+          const phase1Router = this.createRouter(sessionId, null, "filter", phase1Config);
           const validSeqs = new Set(fullData.requests.map((r) => r.seq));
           const selected = new Set<number>();
 
@@ -349,7 +382,7 @@ export class AiAnalyzer {
 
             const batchNumber = Math.floor(batchStart / FILTER_BATCH_SIZE) + 1;
             const batchCount = Math.ceil(allSummaries.length / FILTER_BATCH_SIZE);
-            onProgress?.(`> 正在过滤第 ${batchNumber}/${batchCount} 批请求（${batchSummaries.length} 条）...\n\n`);
+            onProgress?.(statusEvent(`正在过滤第 ${batchNumber}/${batchCount} 批请求（${batchSummaries.length} 条）...`));
             signal?.throwIfAborted();
             const phase1Result = await phase1Router.complete(phase1Messages, undefined, signal);
             filterPromptTokens = (filterPromptTokens ?? 0) + phase1Result.promptTokens;
@@ -361,14 +394,14 @@ export class AiAnalyzer {
           if (filteredSeqs.length >= PRE_FILTER_MIN_SELECTED) {
             analysisData = assembler.filterBySeqs(fullData, filteredSeqs);
             filteredApplied = true;
-            onProgress?.(
-              `> 过滤完成：从 ${fullData.requests.length} 条中选出 ${filteredSeqs.length} 条相关请求进行深度分析。\n\n`,
-            );
+            onProgress?.(statusEvent(
+              `过滤完成：从 ${fullData.requests.length} 条中选出 ${filteredSeqs.length} 条相关请求进行深度分析。`,
+            ));
           } else {
-            onProgress?.(`> 过滤结果不足，使用全部 ${fullData.requests.length} 条请求分析。\n\n`);
+            onProgress?.(statusEvent(`过滤结果不足，使用全部 ${fullData.requests.length} 条请求分析。`));
           }
         } catch {
-          onProgress?.(`> 预过滤失败，使用全部 ${fullData.requests.length} 条请求分析。\n\n`);
+          onProgress?.(statusEvent(`预过滤失败，使用全部 ${fullData.requests.length} 条请求分析。`));
         }
       }
     }
@@ -399,11 +432,7 @@ export class AiAnalyzer {
       ? `${baseUser}\n\n## 并行子分析导航（仅作定位线索，正文仍需工具验证）\n${subagentContext}`
       : baseUser;
 
-    const router = new LLMRouter(
-      config,
-      this.createLogCallback(sessionId, null, "analyze", config),
-      this.updateLogTokens,
-    );
+    const router = this.createRouter(sessionId, null, "analyze", config);
     let content = "";
     let promptTokens = 0;
     let completionTokens = 0;
@@ -445,12 +474,25 @@ export class AiAnalyzer {
         break;
       } catch (err) {
         if (signal?.aborted) throw err;
+        const message = err instanceof Error ? err.message : String(err);
         if (attempt === 1) {
-          throw new Error(`AI 分析失败（已重试）: ${(err as Error).message}`);
+          throw new Error(`AI 分析失败（已重试）: ${message}`);
         }
+        // 首次失败时可能已经流出了部分正文：先让界面清空，再提示重试，避免新旧内容拼在一起
+        onProgress?.(resetEvent());
+        onProgress?.(statusEvent(`分析请求失败（${message}），正在重试...`));
       }
     }
 
+    // 引用校验只提示不阻断：报告已经生成，未知序号更可能是模型手滑
+    const citation = validateCitations(content, allSummaries.map((summary) => summary.seq));
+    if (citation.unknown.length > 0) {
+      onProgress?.(statusEvent(
+        `报告引用了不存在的请求序号：${citation.unknown.slice(0, 10).map((seq) => `#${seq}`).join(" ")}${citation.unknown.length > 10 ? " ..." : ""}`,
+      ));
+    }
+
+    const enrichment = toSessionEnrichment(fullData, this.requestsRepo.countBySession(sessionId));
     const report: AnalysisReport = {
       id: uuidv4(),
       session_id: sessionId,
@@ -462,10 +504,102 @@ export class AiAnalyzer {
       report_content: content,
       filter_prompt_tokens: filterPromptTokens,
       filter_completion_tokens: filterCompletionTokens,
+      purpose: template?.id ?? purpose ?? null,
+      spec_json: null,
+      spec_error: null,
+      enrichment_json: JSON.stringify(enrichment),
     };
 
+    // 先落库再抽取：抽取失败或被取消时报告本身已经安全
     this.reportsRepo.insert(report);
-    return report;
+    if (signal?.aborted) return report;
+
+    onProgress?.(statusEvent("正在抽取结构化数据（ProtocolSpec）..."));
+    return this.extractAndStoreSpec(report, config, allSummaries, enrichment, signal);
+  }
+
+  /**
+   * 用轻量模型把报告抽取成 ProtocolSpec 并落库。失败只记 spec_error，永不抛出（取消除外）。
+   */
+  private async extractAndStoreSpec(
+    report: AnalysisReport,
+    config: LLMProviderConfig,
+    summaries: RequestSummary[],
+    enrichment: SessionEnrichment | null,
+    signal?: AbortSignal,
+  ): Promise<AnalysisReport> {
+    const extractConfig = resolveRoleConfig(config, "extract");
+    const router = this.createRouter(report.session_id, report.id, "extract", extractConfig);
+    try {
+      const result = await extractProtocolSpec(router, {
+        reportContent: report.report_content,
+        summaries,
+        enrichment,
+        purpose: report.purpose,
+        maxReportTokens: computeReportTokenBudget(extractConfig),
+      }, signal);
+      const specJson = JSON.stringify(result.spec);
+      this.reportsRepo.updateSpec(report.id, specJson, null);
+      return { ...report, spec_json: specJson, spec_error: null };
+    } catch (error) {
+      // 报告此时已经落库；取消抽取不应该让整次分析以失败收场，记一笔留给 ensureSpec 补抽
+      const message = signal?.aborted
+        ? "抽取已取消"
+        : error instanceof Error ? error.message : String(error);
+      if (!signal?.aborted) {
+        console.warn(`[AiAnalyzer] ProtocolSpec extraction failed for report ${report.id}: ${message}`);
+      }
+      this.reportsRepo.updateSpec(report.id, null, message);
+      return { ...report, spec_json: null, spec_error: message };
+    }
+  }
+
+  /**
+   * 保证报告带有 ProtocolSpec：已有则直接返回，否则（含上次失败）现在补抽并落库。
+   */
+  async ensureSpec(reportId: string, config: LLMProviderConfig, signal?: AbortSignal): Promise<AnalysisReport> {
+    const report = this.reportsRepo.findById(reportId);
+    if (!report) throw new Error(`Report ${reportId} not found`);
+    if (report.spec_json) return report;
+
+    const assembler = new DataAssembler(this.requestsRepo, this.jsHooksRepo, this.storageSnapshotsRepo);
+    const fullData = assembler.assemble(report.session_id);
+    const summaries = assembler.extractSummaries(fullData);
+    const enrichment = parseSessionEnrichmentJson(report.enrichment_json)
+      ?? toSessionEnrichment(fullData, this.requestsRepo.countBySession(report.session_id));
+    return this.extractAndStoreSpec(report, config, summaries, enrichment, signal);
+  }
+
+  /**
+   * 会话的规则派生数据。最新报告里缓存的一份在请求总数没变时直接复用，避免每次都重新组装整个会话。
+   */
+  getSessionEnrichment(sessionId: string): SessionEnrichment {
+    const totalRequests = this.requestsRepo.countBySession(sessionId);
+    const latest = this.reportsRepo.findBySession(sessionId)[0];
+    const cached = latest ? parseSessionEnrichmentJson(latest.enrichment_json) : null;
+    if (isEnrichmentFresh(cached, totalRequests)) return cached;
+    const assembler = new DataAssembler(this.requestsRepo, this.jsHooksRepo, this.storageSnapshotsRepo);
+    return toSessionEnrichment(assembler.assemble(sessionId), totalRequests);
+  }
+
+  /**
+   * 读取报告的结构化 Spec（不触发抽取）。
+   */
+  getSpec(report: AnalysisReport): ProtocolSpec | null {
+    return parseProtocolSpecJson(report.spec_json);
+  }
+
+  /**
+   * 一份报告的初始追问对话（system prompt + 报告正文）。渲染进程和 MCP 都从这里取，保证 prompt 一致。
+   */
+  buildInitialChatMessages(report: Pick<AnalysisReport, "session_id" | "report_content">): ChatMessage[] {
+    return buildInitialChatMessages(
+      {
+        requests: this.requestsRepo.findBySession(report.session_id),
+        hooks: this.jsHooksRepo.findBySession(report.session_id),
+      },
+      report.report_content,
+    );
   }
 
   private parseFilterResponse(raw: string, validSeqs: Set<number>): number[] | null {
@@ -487,7 +621,7 @@ export class AiAnalyzer {
     config: LLMProviderConfig,
     history: Array<{ role: "system" | "user" | "assistant"; content: string }>,
     userMessage: string,
-    onProgress?: (chunk: string) => void,
+    onProgress?: (event: AiProgressEvent) => void,
     reportId?: string,
   ): Promise<string> {
     // 从历史恢复侧态，并注入紧凑说明（无正文）
@@ -510,11 +644,7 @@ export class AiAnalyzer {
       onProgress,
     );
 
-    const router = new LLMRouter(
-      config,
-      this.createLogCallback(sessionId, reportId ?? null, "chat", config),
-      this.updateLogTokens,
-    );
+    const router = this.createRouter(sessionId, reportId ?? null, "chat", config);
 
     const assembler = new DataAssembler(
       this.requestsRepo,

@@ -353,14 +353,36 @@ HTTP_PROXY=http://127.0.0.1:8888 HTTPS_PROXY=http://127.0.0.1:8888 node app.js
 
 ### LLM
 
+模型接入基于 Vercel AI SDK，统一支持 OpenAI Chat Completions / Responses、Anthropic Messages（含 MiniMax）与 OpenAI 兼容中转，分析与追问全程流式输出，模型的思考过程会在报告页以可折叠块单独展示。
+
+**基础接入**
+
 | 配置项 | 说明 |
 |--------|------|
-| Provider | OpenAI / Anthropic / 自定义 |
-| API Type | Chat Completions / Responses API（OpenAI） |
+| Provider | OpenAI / Anthropic / MiniMax / 自定义（OpenAI 兼容） |
+| API Type | Chat Completions / Responses API（OpenAI 与自定义） |
 | Base URL | API 地址（如 `https://api.openai.com/v1`） |
 | API Key | 你的 API 密钥 |
-| Model | 模型名称（如 `gpt-4o`、`claude-sonnet-4-20250514`） |
-| Max Tokens | 最大输出 token 数 |
+| 模型 | 主分析与追问使用的模型，可点击「加载模型」从服务端拉取列表 |
+| 轻量任务模型 | 预过滤、上下文压缩、并行子分析、报告结构化抽取（ProtocolSpec）使用的便宜模型；留空则与主模型相同 |
+
+**生成参数**
+
+| 配置项 | 说明 |
+|--------|------|
+| 思考级别 | 关闭 / 低 / 中 / 高 / 最高。OpenAI 与兼容接口映射为 `reasoning_effort`，Claude 4.6+ 映射为 adaptive thinking 的 effort，旧版 Claude 自动换算思考预算。默认关闭，不发送任何思考参数 |
+| 快速模式 | Anthropic `speed=fast` / OpenAI `service_tier=fast`，其他 Provider 无效 |
+| 温度 | 留空使用模型默认值 |
+| 最大输出 tokens | 单次回复上限，同时作为上下文预算中为回复预留的空间 |
+
+**上下文**
+
+| 配置项 | 说明 |
+|--------|------|
+| 上下文模式 | 索引优先（推荐，正文按需通过工具拉取）/ 传统内联 |
+| 最大上下文 | 开启「按模型自动」后由内置的模型窗口表自动填写（覆盖 GPT / Claude / Gemini / DeepSeek / Qwen / MiniMax / GLM 等常见家族）；未识别的模型可手动填写 |
+
+**高级设置**（默认折叠）：压缩峰值 / 压缩目标 / 压缩方式、并行子分析的阈值与并发、Anthropic 思考预算 tokens，以及「额外请求参数」——一段 JSON，会浅合并进每次请求体，用于中转站或模型特有参数（例如 `{"top_k": 40}`）。
 
 ### Prompt 模板
 
@@ -380,6 +402,20 @@ HTTP_PROXY=http://127.0.0.1:8888 HTTPS_PROXY=http://127.0.0.1:8888 node app.js
 将 Anything Analyzer 的抓包和分析能力暴露为 MCP 工具：
 - 可被 Claude Desktop、Cursor 等 AI 工具直接调用
 - 配置监听端口
+
+给外部 AI 读结果时，推荐按下面的顺序用工具：
+
+| 工具 | 用途 |
+|------|------|
+| `get_session_brief` | 约 2k token 的会话简报：计数、场景线索、鉴权链、端点清单、最新报告摘要，适合直接塞进另一个 agent 的上下文 |
+| `get_reports` / `get_report` | 报告列表（只含元数据和预览）与单份报告全文；`get_report` 可选 `format: markdown \| json \| both` |
+| `get_protocol_spec` | 结构化 ProtocolSpec（端点、参数、鉴权链、流程、存储、加密、复现代码），没有时自动补抽 |
+| `get_openapi` | 由 ProtocolSpec 生成的 OpenAPI 3.1 文档 |
+| `get_session_enrichment` | 纯规则派生、不调模型：场景线索、鉴权链、存储 diff、流式请求序号 |
+| `get_request_by_seq` | 按报告里引用的 `[#12]` 序号取完整请求；`get_request_detail` 收的是 UUID |
+| `run_analysis` / `chat_followup` | 触发分析、针对最新报告追问；追问历史按报告持久化 |
+
+资源：`report://{reportId}`（报告 Markdown）、`spec://{sessionId}`（最新报告的 ProtocolSpec）。
 
 ### 代理
 
@@ -406,8 +442,9 @@ HTTP_PROXY=http://127.0.0.1:8888 HTTPS_PROXY=http://127.0.0.1:8888 node app.js
 | 筛选方法 | 点击 Method 列头漏斗图标 |
 | 筛选域名 | 点击 Domain 列头漏斗图标（支持搜索） |
 | 查看详情 | 点击请求行 |
-| 导出报告 | 报告视图工具栏「导出 .md」 |
-| 导出请求 | 检查器底栏「导出」按钮 |
+| 导出报告 | 报告视图工具栏「导出」下拉：Markdown / 结构化数据 JSON / OpenAPI 3.1 |
+| 导出请求 | 检查器底栏「导出」（原始 JSON）或「导出 HAR」（HAR 1.2，可导入 Postman / Burp / mitmproxy 等） |
+| 跳转到引用的请求 | 点击报告正文中的 `[#12]`，或右侧面板中的端点 / 鉴权链条目 |
 | 切换语言 | 标题栏 🌐 按钮 |
 | 切换主题 | 标题栏 🌙/☀ 按钮 |
 

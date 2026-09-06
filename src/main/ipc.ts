@@ -1,6 +1,7 @@
 import { ipcMain, dialog, app, session, shell } from "electron";
 import { networkInterfaces } from "os";
 import type {
+  AiProgressEvent,
   CloakRuntimePolicy,
   ChatMessage,
   CreateSessionOptions,
@@ -35,6 +36,8 @@ import {
   saveMCPServer,
   deleteMCPServer,
 } from "./mcp/mcp-config";
+import { buildHar } from "@shared/har-export";
+import { buildOpenApiDocument } from "@shared/openapi-export";
 import type {
   RequestsRepo,
   JsHooksRepo,
@@ -386,8 +389,8 @@ export function registerIpcHandlers(deps: {
 
     const win = windowManager.getMainWindow();
     const onProgress = win
-      ? (chunk: string) => {
-          win.webContents.send("ai:progress", chunk);
+      ? (event: AiProgressEvent) => {
+          win.webContents.send("ai:progress", event);
         }
       : undefined;
 
@@ -406,10 +409,23 @@ export function registerIpcHandlers(deps: {
     analysisControllers.set(sessionId, controller);
 
     try {
-      return await aiAnalyzer.analyze(sessionId, config, onProgress, purpose, template ?? undefined, selectedSeqs, controller.signal);
+      const report = await aiAnalyzer.analyze(sessionId, config, onProgress, purpose, template ?? undefined, selectedSeqs, controller.signal);
+      // 初始追问对话由主进程统一生成并落库，渲染进程之后用 data:chatMessages 读取
+      try {
+        chatMessagesRepo.insertMany(report.id, aiAnalyzer.buildInitialChatMessages(report));
+      } catch (e) {
+        console.warn("[ai:analyze] Failed to persist initial chat messages:", e);
+      }
+      return report;
     } finally {
       analysisControllers.delete(sessionId);
     }
+  });
+
+  ipcMain.handle("report:ensureSpec", async (_event, reportId: string) => {
+    const config = loadLLMConfig();
+    if (!config) throw new Error("LLM provider not configured");
+    return aiAnalyzer.ensureSpec(reportId, config);
   });
 
   ipcMain.handle("ai:cancel", async (_event, sessionId: string) => {
@@ -436,8 +452,8 @@ export function registerIpcHandlers(deps: {
 
       const win = windowManager.getMainWindow();
       const onProgress = win
-        ? (chunk: string) => {
-            win.webContents.send("ai:progress", chunk);
+        ? (event: AiProgressEvent) => {
+            win.webContents.send("ai:progress", event);
           }
         : undefined;
 
@@ -466,20 +482,18 @@ export function registerIpcHandlers(deps: {
   // ---- Chat Messages Persistence ----
 
   ipcMain.handle("data:chatMessages", async (_event, reportId: string) => {
-    return chatMessagesRepo.findByReport(reportId);
-  });
-
-  ipcMain.handle("data:saveChatMessages", async (_event, reportId: string, messages: Array<{ role: string; content: string }>) => {
+    const existing = chatMessagesRepo.findByReport(reportId);
+    if (existing.length > 0) return existing;
+    // 旧报告没有持久化过初始对话：在主进程补建，避免渲染进程自己拼 prompt
+    const report = reportsRepo.findById(reportId);
+    if (!report) return existing;
+    const initial = aiAnalyzer.buildInitialChatMessages(report);
     try {
-      chatMessagesRepo.insertMany(reportId, messages);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes('FOREIGN KEY constraint failed')) {
-        console.warn(`[data:saveChatMessages] Report ${reportId} no longer exists, skipping`);
-      } else {
-        throw e;
-      }
+      chatMessagesRepo.insertMany(reportId, initial);
+    } catch (e) {
+      console.warn(`[data:chatMessages] Failed to backfill initial messages for ${reportId}:`, e);
     }
+    return initial;
   });
 
   // ---- Settings ----
@@ -506,23 +520,46 @@ export function registerIpcHandlers(deps: {
 
   // ---- File Export ----
 
+  const saveTextFile = async (defaultName: string, content: string): Promise<boolean> => {
+    const win = windowManager.getMainWindow();
+    if (!win) return false;
+    const { canceled, filePath } = await dialog.showSaveDialog(win, {
+      defaultPath: defaultName,
+      filters: exportFiltersFor(defaultName),
+    });
+    if (canceled || !filePath) return false;
+    writeFileSync(filePath, content, "utf-8");
+    return true;
+  };
+
   ipcMain.handle(
     "dialog:exportFile",
-    async (_event, defaultName: string, content: string) => {
-      const win = windowManager.getMainWindow();
-      if (!win) return false;
-      const { canceled, filePath } = await dialog.showSaveDialog(win, {
-        defaultPath: defaultName,
-        filters: [
-          { name: "Markdown", extensions: ["md"] },
-          { name: "All Files", extensions: ["*"] },
-        ],
-      });
-      if (canceled || !filePath) return false;
-      writeFileSync(filePath, content, "utf-8");
-      return true;
-    },
+    async (_event, defaultName: string, content: string) => saveTextFile(defaultName, content),
   );
+
+  ipcMain.handle("report:exportSpec", async (_event, reportId: string) => {
+    const report = reportsRepo.findById(reportId);
+    if (!report) throw new Error(`Report ${reportId} not found`);
+    const spec = aiAnalyzer.getSpec(report);
+    if (!spec) throw new Error("该报告还没有结构化数据，请先抽取");
+    const defaultName = `protocol-spec-${new Date(report.created_at).toISOString().slice(0, 10)}.json`;
+    return saveTextFile(defaultName, JSON.stringify(spec, null, 2));
+  });
+
+  ipcMain.handle("report:exportOpenApi", async (_event, reportId: string) => {
+    const report = reportsRepo.findById(reportId);
+    if (!report) throw new Error(`Report ${reportId} not found`);
+    const spec = aiAnalyzer.getSpec(report);
+    if (!spec) throw new Error("该报告还没有结构化数据，请先抽取");
+    const sessionInfo = sessionsRepo.findById(report.session_id);
+    const document = buildOpenApiDocument(spec, {
+      sessionName: sessionInfo?.name,
+      targetUrl: sessionInfo?.target_url,
+      generatedAt: report.created_at,
+    });
+    const defaultName = `openapi-${new Date(report.created_at).toISOString().slice(0, 10)}.json`;
+    return saveTextFile(defaultName, JSON.stringify(document, null, 2));
+  });
 
   // ---- Auto Update ----
 
@@ -593,6 +630,20 @@ export function registerIpcHandlers(deps: {
     if (canceled || !filePath) return false;
     writeFileSync(filePath, JSON.stringify(requests, null, 2), "utf-8");
     return true;
+  });
+
+  ipcMain.handle("data:exportHar", async (_event, sessionId: string) => {
+    const requests = requestsRepo.findBySession(sessionId);
+    if (requests.length === 0) return false;
+    const sessionInfo = sessionsRepo.findById(sessionId);
+    const sessionName = sessionInfo?.name || "requests";
+    const timestamp = new Date().toISOString().slice(0, 10);
+    const har = buildHar(requests, {
+      name: sessionInfo?.name,
+      targetUrl: sessionInfo?.target_url,
+      appVersion: app.getVersion(),
+    });
+    return saveTextFile(`${sessionName}-${timestamp}.har`, JSON.stringify(har, null, 2));
   });
 
   // ---- AI Request Logs ----
@@ -717,6 +768,7 @@ export function registerIpcHandlers(deps: {
           jsHooksRepo,
           storageSnapshotsRepo,
           reportsRepo,
+          chatMessagesRepo,
           interactionEventsRepo,
         },
         normalizedConfig.port,
@@ -852,6 +904,17 @@ export function registerIpcHandlers(deps: {
 
   // ---- Shell ----
   ipcMain.handle("shell:openExternal", async (_event, url: string) => {
+    // 渲染层可能把模型生成的链接传过来，只放行网页和邮件协议
+    let protocol = "";
+    try {
+      protocol = new URL(url).protocol;
+    } catch {
+      return;
+    }
+    if (protocol !== "http:" && protocol !== "https:" && protocol !== "mailto:") {
+      console.warn(`[shell:openExternal] Blocked non-web URL: ${url.slice(0, 120)}`);
+      return;
+    }
     const { shell } = await import("electron");
     await shell.openExternal(url);
   });
@@ -936,6 +999,18 @@ export function registerIpcHandlers(deps: {
 }
 
 // ---- Config persistence helpers ----
+
+/** 按默认文件名的扩展名挑选保存对话框的类型过滤器 */
+function exportFiltersFor(defaultName: string): Electron.FileFilter[] {
+  const ext = defaultName.split(".").pop()?.toLowerCase();
+  const primary: Electron.FileFilter | null =
+    ext === "har" ? { name: "HAR", extensions: ["har"] }
+    : ext === "json" ? { name: "JSON", extensions: ["json"] }
+    : ext === "md" ? { name: "Markdown", extensions: ["md"] }
+    : ext === "yaml" || ext === "yml" ? { name: "YAML", extensions: ["yaml", "yml"] }
+    : null;
+  return [...(primary ? [primary] : []), { name: "All Files", extensions: ["*"] }];
+}
 
 function getConfigPath(): string {
   return join(app.getPath("userData"), "llm-config.json");

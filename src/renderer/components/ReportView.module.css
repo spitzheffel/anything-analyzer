@@ -80,6 +80,97 @@
   flex: 1;
 }
 
+/* Export dropdown in the toolbar */
+.exportMenu {
+  position: relative;
+}
+
+.exportDropdown {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  min-width: 180px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-button);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+  padding: 4px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+}
+
+.exportItem {
+  text-align: left;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: var(--font-size-xs);
+  font-family: var(--font-sans);
+  cursor: pointer;
+}
+
+.exportItem:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  color: var(--text-primary);
+}
+
+.exportItem:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Inline [#12] citations in the report body */
+.citation {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--color-accent-bg);
+  color: var(--color-accent);
+  border: 1px solid var(--color-accent-border);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.citation:hover {
+  border-color: var(--color-accent);
+}
+
+/* Structured spec sections in the context panel */
+.specSummary {
+  margin-top: 4px;
+  font-size: var(--font-size-3xs);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
+.specStatus {
+  font-size: var(--font-size-3xs);
+  color: var(--text-muted);
+}
+
+.specError {
+  margin-top: 2px;
+  color: var(--color-error);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.authBadge {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: var(--color-surface-hover);
+  color: var(--text-muted);
+  border: 1px solid var(--color-border-subtle);
+  white-space: nowrap;
+}
+
 /* Report content scrollable area */
 .reportBody {
   flex: 1;
@@ -164,6 +255,34 @@
 
 @keyframes blink {
   50% { opacity: 0; }
+}
+
+/* Reasoning (thinking) panel shown while streaming */
+.reasoningPanel {
+  margin-bottom: var(--space-md);
+}
+
+.reasoningLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-sm);
+  color: var(--text-secondary);
+}
+
+.reasoningLabel .cursor {
+  width: 6px;
+  height: 12px;
+  background: var(--text-muted);
+}
+
+.reasoningBody {
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  color: var(--text-secondary);
 }
 
 /* Analyzing state */

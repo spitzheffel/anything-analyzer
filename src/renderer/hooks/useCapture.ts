@@ -6,8 +6,10 @@ import type {
   AnalysisReport,
   ChatMessage,
   InteractionEvent,
+  AiProgressEvent,
 } from "@shared/types";
 import { IPC_CHANNELS } from "@shared/types";
+import { formatStatusLine } from "@shared/ai-progress";
 import {
   findLatestConversationTokenUsage,
   type ConversationTokenUsage,
@@ -22,6 +24,8 @@ export interface UseCaptureState {
   isAnalyzing: boolean;
   analysisError: string | null;
   streamingContent: string;
+  /** 模型思考过程的流式增量，仅在分析 / 追问进行中有值 */
+  streamingReasoning: string;
   selectedRequest: CapturedRequest | null;
   chatHistory: ChatMessage[];
   latestContextUsage: ConversationTokenUsage | null;
@@ -37,6 +41,8 @@ interface UseCaptureReturn extends UseCaptureState {
   startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) => Promise<void>;
   cancelAnalysis: (sessionId: string) => Promise<void>;
   sendFollowUp: (sessionId: string, message: string) => Promise<void>;
+  /** 用主进程返回的最新报告对象替换本地同 id 的报告（如补抽 Spec 之后） */
+  replaceReport: (report: AnalysisReport) => void;
 }
 
 export const INITIAL_CAPTURE_STATE: UseCaptureState = {
@@ -48,6 +54,7 @@ export const INITIAL_CAPTURE_STATE: UseCaptureState = {
   isAnalyzing: false,
   analysisError: null,
   streamingContent: "",
+  streamingReasoning: "",
   selectedRequest: null,
   chatHistory: [],
   latestContextUsage: null,
@@ -66,7 +73,29 @@ export function prepareStateForAnalysis(prev: UseCaptureState): UseCaptureState 
     analysisError: null,
     chatError: null,
     streamingContent: "",
+    streamingReasoning: "",
   };
+}
+
+/**
+ * 把一条进度事件合并进流式状态：text / status 进正文，reasoning 进思考区。
+ */
+export function applyProgressEvent(
+  prev: Pick<UseCaptureState, "streamingContent" | "streamingReasoning">,
+  event: AiProgressEvent,
+): Pick<UseCaptureState, "streamingContent" | "streamingReasoning"> {
+  switch (event.kind) {
+    case "text":
+      return { ...prev, streamingContent: prev.streamingContent + event.text };
+    case "status":
+      return { ...prev, streamingContent: prev.streamingContent + formatStatusLine(event.text) };
+    case "reasoning":
+      return { ...prev, streamingReasoning: prev.streamingReasoning + event.text };
+    case "reset":
+      return { ...prev, streamingContent: "", streamingReasoning: "" };
+    default:
+      return prev;
+  }
 }
 
 export function useCapture(sessionId: string | null): UseCaptureReturn {
@@ -114,42 +143,11 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
       const latestReport = sortedReports[0] ?? null;
       const latestContextUsage = findLatestConversationTokenUsage(aiRequestLogs, latestReport);
 
-      // Restore chat history for the latest report
+      // Restore chat history for the latest report.
+      // 主进程负责生成 / 补建初始 [system, assistant] 两条，渲染层不再自己拼 prompt
       let chatHistory: ChatMessage[] = [];
       if (latestReport) {
-        const savedMessages = await window.electronAPI.getChatMessages(latestReport.id);
-        if (savedMessages.length > 0) {
-          chatHistory = savedMessages as ChatMessage[];
-        } else {
-          // Legacy report without persisted chat — reconstruct [system, assistant] prefix
-          // so that chatHistory.slice(2) renders follow-up messages correctly
-          const reqSummary = requests.slice(0, 50).map(r => {
-            let path = r.url;
-            try { path = new URL(r.url).pathname; } catch { /* keep full url */ }
-            return `#${r.sequence} ${r.method} ${path} → ${r.status_code ?? '?'}`;
-          }).join('\n');
-
-          const hookSummary = hooks.length > 0
-            ? '\n\nDetected hooks:\n' + hooks.slice(0, 20).map(h =>
-                `[${h.hook_type}] ${h.function_name}`
-              ).join('\n')
-            : '';
-
-          const contextBlock = reqSummary
-            ? `\n\n<captured_data_summary>\nCaptured ${requests.length} requests:\n${reqSummary}${requests.length > 50 ? `\n... and ${requests.length - 50} more` : ''}${hookSummary}\n</captured_data_summary>`
-            : '';
-
-          const systemContent = `你是一位网站协议分析专家。基于之前的分析报告和捕获数据，回答用户的追问。保持技术精确，用中文回复。\n\n你可以使用 get_request_detail 工具，通过传入请求序号(seq)来查看任意请求的完整详情（请求头、请求体、响应头、响应体）。当用户追问某个具体请求或需要更多细节时，请主动调用此工具获取数据。${contextBlock}`;
-
-          chatHistory = [
-            { role: 'system' as const, content: systemContent },
-            { role: 'assistant' as const, content: latestReport.report_content },
-          ];
-
-          // Persist for future loads
-          window.electronAPI.saveChatMessages(latestReport.id, chatHistory)
-            .catch(err => console.error("Failed to backfill chat messages:", err));
-        }
+        chatHistory = (await window.electronAPI.getChatMessages(latestReport.id)) as ChatMessage[];
       }
 
       // Only update if session hasn't changed while loading
@@ -179,53 +177,23 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
     try {
       const report = await window.electronAPI.startAnalysis(sid, purpose, selectedSeqs, model);
 
+      // 初始对话（system prompt + 报告）已由主进程生成并落库，这里只读回来
+      const chatHistory = (await window.electronAPI.getChatMessages(report.id).catch(() => [])) as ChatMessage[];
+
       // Only update if session hasn't changed
       if (sessionIdRef.current === sid && conversationVersionRef.current === conversationVersion) {
-        // Build context summary from captured data for follow-up chat
-        // (read current state synchronously via a mini-setState that returns prev unchanged)
-        let systemContent = '';
-        setState((prev) => {
-          const reqSummary = prev.requests.slice(0, 50).map(r => {
-            let path = r.url
-            try { path = new URL(r.url).pathname } catch { /* keep full url */ }
-            return `#${r.sequence} ${r.method} ${path} → ${r.status_code ?? '?'}`
-          }).join('\n')
-
-          const hookSummary = prev.hooks.length > 0
-            ? '\n\nDetected hooks:\n' + prev.hooks.slice(0, 20).map(h =>
-                `[${h.hook_type}] ${h.function_name}`
-              ).join('\n')
-            : ''
-
-          const contextBlock = reqSummary
-            ? `\n\n<captured_data_summary>\nCaptured ${prev.requests.length} requests:\n${reqSummary}${prev.requests.length > 50 ? `\n... and ${prev.requests.length - 50} more` : ''}${hookSummary}\n</captured_data_summary>`
-            : ''
-
-          systemContent = `你是一位网站协议分析专家。基于之前的分析报告和捕获数据，回答用户的追问。保持技术精确，用中文回复。
-
-你可以使用 get_request_detail 工具，通过传入请求序号(seq)来查看任意请求的完整详情（请求头、请求体、响应头、响应体）。当用户追问某个具体请求或需要更多细节时，请主动调用此工具获取数据。${contextBlock}`
-
-          const chatHistory: ChatMessage[] = [
-            { role: 'system' as const, content: systemContent },
-            { role: 'assistant' as const, content: report.report_content },
-          ];
-
-          return {
-            ...prev,
-            isAnalyzing: false,
-            streamingContent: "",
-            reports: [report, ...prev.reports],
-            chatHistory,
-            latestContextUsage: null,
-            chatError: null,
-          }
-        });
-
-        // Persist initial chat messages (system prompt + report) to database
-        window.electronAPI.saveChatMessages(report.id, [
-          { role: 'system', content: systemContent },
-          { role: 'assistant', content: report.report_content },
-        ]).catch(err => console.error("Failed to save initial chat messages:", err));
+        setState((prev) => ({
+          ...prev,
+          isAnalyzing: false,
+          streamingContent: "",
+          streamingReasoning: "",
+          reports: [report, ...prev.reports],
+          chatHistory: chatHistory.length > 0
+            ? chatHistory
+            : [{ role: 'assistant' as const, content: report.report_content }],
+          latestContextUsage: null,
+          chatError: null,
+        }));
       }
     } catch (err) {
       console.error("Analysis failed:", err);
@@ -236,6 +204,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
           ...prev,
           isAnalyzing: false,
           streamingContent: "",
+          streamingReasoning: "",
           analysisError: isCancelled ? null : errMsg,
         }));
       }
@@ -250,6 +219,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
       ...prev,
       isAnalyzing: false,
       streamingContent: "",
+      streamingReasoning: "",
       analysisError: null,
     }));
   }, []);
@@ -258,6 +228,13 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
   useEffect(() => {
     chatHistoryRef.current = state.chatHistory;
   }, [state.chatHistory]);
+
+  const replaceReport = useCallback((report: AnalysisReport) => {
+    setState((prev) => ({
+      ...prev,
+      reports: prev.reports.map((existing) => (existing.id === report.id ? report : existing)),
+    }));
+  }, []);
 
   const sendFollowUp = useCallback(async (sid: string, message: string) => {
     const conversationVersion = conversationVersionRef.current;
@@ -277,6 +254,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
         isChatting: true,
         chatError: null,
         streamingContent: "",
+        streamingReasoning: "",
         chatHistory: [...prev.chatHistory, { role: 'user' as const, content: message }],
       };
     });
@@ -292,6 +270,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
           ...prev,
           isChatting: false,
           streamingContent: "",
+          streamingReasoning: "",
           chatHistory: [...prev.chatHistory, { role: 'assistant' as const, content: reply }],
           latestContextUsage: latestContextUsage ?? prev.latestContextUsage,
         }));
@@ -304,6 +283,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
           ...prev,
           isChatting: false,
           streamingContent: "",
+          streamingReasoning: "",
           chatError: errMsg,
           // Roll back the optimistically added user message on failure
           chatHistory: prev.chatHistory.length > 0 && prev.chatHistory[prev.chatHistory.length - 1]?.role === 'user'
@@ -364,14 +344,11 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
       storageBuffer.push(data);
     };
 
-    // Listen for analysis progress (streaming chunks)
-    const handleAnalysisProgress = (chunk: string) => {
+    // Listen for analysis progress (typed streaming events)
+    const handleAnalysisProgress = (event: AiProgressEvent) => {
       setState((prev) => {
         if (!prev.isAnalyzing && !prev.isChatting) return prev;
-        return {
-          ...prev,
-          streamingContent: prev.streamingContent + chunk,
-        };
+        return { ...prev, ...applyProgressEvent(prev, event) };
       });
     };
 
@@ -418,6 +395,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
     startAnalysis,
     cancelAnalysis,
     sendFollowUp,
+    replaceReport,
   };
 }
 

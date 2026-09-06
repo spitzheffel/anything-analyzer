@@ -1,12 +1,15 @@
 import React, { useEffect, useRef, useState } from 'react'
-import { Button, Tag, Empty, Spinner } from '../ui'
+import { Button, Tag, Empty, Spinner, Collapse } from '../ui'
 import { IconRobot, IconFileText } from '../ui/Icons'
 import { useLocale } from '../i18n'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { AnalysisReport, ChatMessage, CapturedRequest, JsHookRecord } from '@shared/types'
 import { stripToolContext } from '@shared/types'
+import { resolveContextBudget } from '@shared/model-context-windows'
+import { linkifyCitations, parseCitationHref } from '@shared/citations'
+import { parseProtocolSpecJson, type ProtocolSpec } from '@shared/protocol-spec'
 import { AiLogView } from './AiLogView'
 import ContextUsageBar from './ContextUsageBar'
 import {
@@ -22,6 +25,8 @@ interface ReportViewProps {
   isAnalyzing: boolean
   analysisError: string | null
   streamingContent: string
+  /** 模型思考过程（流式），仅在生成中展示，不落入报告 */
+  streamingReasoning?: string
   onReAnalyze: (model?: string) => void
   onCancelAnalysis: () => void
   chatHistory: ChatMessage[]
@@ -40,6 +45,10 @@ interface ReportViewProps {
   isLoadingModels?: boolean
   onModelChange?: (model: string) => void
   onRefreshModels?: () => void
+  /** 点击正文里的 [#12] 引用或面板里的端点时，跳到对应请求 */
+  onCiteClick?: (seq: number) => void
+  /** 结构化 Spec 抽取失败后的重试；返回更新后的报告 */
+  onEnsureSpec?: (reportId: string) => Promise<void>
 }
 
 function formatTokens(tokens: number | null): string {
@@ -64,6 +73,67 @@ const StreamingDisplay: React.FC<{ content: string }> = ({ content }) => {
         <span className={styles.cursor} />
       </div>
     </div>
+  )
+}
+
+const REASONING_PANEL_KEY = 'reasoning'
+
+/** react-markdown 默认只放行 http/https/mailto 等协议；引用链接用的 seq:// 需要额外放行 */
+function citationAwareUrlTransform(url: string): string {
+  return parseCitationHref(url) !== null ? url : defaultUrlTransform(url)
+}
+
+/** 报告正文是模型生成的，只有这几种协议才交给系统打开 */
+const EXTERNAL_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:'])
+
+function isSafeExternalLink(href: string | undefined): href is string {
+  if (!href) return false
+  try {
+    return EXTERNAL_LINK_PROTOCOLS.has(new URL(href).protocol)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 思考过程折叠块：正文还没开始时默认展开，正文一出现自动收起；用户随时可手动切换。
+ */
+const ReasoningPanel: React.FC<{ reasoning: string; hasContent: boolean; label: string }> = ({ reasoning, hasContent, label }) => {
+  const [open, setOpen] = useState(!hasContent)
+  const autoCollapsedRef = useRef(false)
+  const bodyRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (hasContent && !autoCollapsedRef.current) {
+      autoCollapsedRef.current = true
+      setOpen(false)
+    }
+  }, [hasContent])
+
+  useEffect(() => {
+    if (open && bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight
+  }, [reasoning, open])
+
+  if (!reasoning) return null
+
+  return (
+    <Collapse
+      className={styles.reasoningPanel}
+      activeKey={open ? [REASONING_PANEL_KEY] : []}
+      onChange={(keys) => setOpen(keys.includes(REASONING_PANEL_KEY))}
+      items={[{
+        key: REASONING_PANEL_KEY,
+        label: (
+          <span className={styles.reasoningLabel}>
+            {label}
+            {!hasContent && <span className={styles.cursor} />}
+          </span>
+        ),
+        children: (
+          <div ref={bodyRef} className={styles.reasoningBody}>{reasoning}</div>
+        ),
+      }]}
+    />
   )
 }
 
@@ -92,6 +162,16 @@ function extractEndpoints(requests: CapturedRequest[]): { method: string; path: 
     }
   }
   return endpoints.slice(0, 8) // limit to top 8
+}
+
+/** 面板里只显示路径部分；解析失败就原样返回 */
+function shortenUrlTemplate(urlTemplate: string): string {
+  try {
+    const url = new URL(urlTemplate)
+    return decodeURIComponent(url.pathname) + (url.search ? url.search : '')
+  } catch {
+    return urlTemplate
+  }
 }
 
 function getMethodColor(method: string): string {
@@ -129,6 +209,7 @@ const ReportView: React.FC<ReportViewProps> = ({
   isAnalyzing,
   analysisError,
   streamingContent,
+  streamingReasoning = '',
   onReAnalyze,
   onCancelAnalysis,
   chatHistory,
@@ -145,11 +226,65 @@ const ReportView: React.FC<ReportViewProps> = ({
   isLoadingModels = false,
   onModelChange,
   onRefreshModels,
+  onCiteClick,
+  onEnsureSpec,
 }) => {
   const { t } = useLocale()
   const [chatInput, setChatInput] = useState('')
   const [showAiLog, setShowAiLog] = useState(false)
+  const [exportMenuOpen, setExportMenuOpen] = useState(false)
+  const [isEnsuringSpec, setIsEnsuringSpec] = useState(false)
   const reportBodyRef = useRef<HTMLDivElement>(null)
+  const exportMenuRef = useRef<HTMLDivElement>(null)
+
+  const spec: ProtocolSpec | null = React.useMemo(() => parseProtocolSpecJson(report?.spec_json), [report?.spec_json])
+
+  useEffect(() => {
+    if (!exportMenuOpen) return
+    const close = (event: MouseEvent) => {
+      if (!exportMenuRef.current?.contains(event.target as Node)) setExportMenuOpen(false)
+    }
+    document.addEventListener('mousedown', close)
+    return () => document.removeEventListener('mousedown', close)
+  }, [exportMenuOpen])
+
+  // 正文里的 [#12] 引用渲染成可点击链接；seq:// 之外的链接照常交给系统浏览器
+  const markdownComponents = React.useMemo(() => ({
+    a: ({ href, children }: { href?: string; children?: React.ReactNode }) => {
+      const seq = parseCitationHref(href)
+      if (seq !== null) {
+        // 不给 href：中键 / Ctrl+点击 / 拖拽都不会让 Electron 去打开 seq://，行为完全由 onClick 控制
+        return (
+          <a
+            role="link"
+            tabIndex={0}
+            className={styles.citation}
+            title={`${t('report.jumpToRequest')} #${seq}`}
+            onClick={() => onCiteClick?.(seq)}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                onCiteClick?.(seq)
+              }
+            }}
+          >
+            {children}
+          </a>
+        )
+      }
+      return (
+        <a
+          href={href}
+          onClick={(event) => {
+            event.preventDefault()
+            if (isSafeExternalLink(href)) window.electronAPI.openExternal(href)
+          }}
+        >
+          {children}
+        </a>
+      )
+    },
+  }), [onCiteClick, t])
   const [budgetCfg, setBudgetCfg] = useState({
     maxContextTokens: 200_000,
     reserveCompletionTokens: 8_192,
@@ -159,16 +294,19 @@ const ReportView: React.FC<ReportViewProps> = ({
   useEffect(() => {
     let alive = true
     window.electronAPI.getLLMConfig?.().then((config) => {
-      if (!alive || !config?.contextBudget) return
-      const b = config.contextBudget
+      if (!alive || !config) return
+      const budget = resolveContextBudget({
+        model: selectedModel || report?.llm_model || config.model,
+        contextBudget: config.contextBudget,
+      })
       setBudgetCfg({
-        maxContextTokens: b.maxContextTokens ?? 200_000,
-        reserveCompletionTokens: b.reserveCompletionTokens ?? 8_192,
-        compressionPeak: b.compressionPeak ?? 0.85,
+        maxContextTokens: budget.maxContextTokens,
+        reserveCompletionTokens: budget.reserveCompletionTokens,
+        compressionPeak: budget.compressionPeak,
       })
     }).catch(() => { /* ignore */ })
     return () => { alive = false }
-  }, [])
+  }, [selectedModel, report?.llm_model])
 
   const localUsage = React.useMemo(() => {
     const messages = chatHistory.map((m) => ({ content: stripToolContext(m.content) }))
@@ -224,7 +362,29 @@ const ReportView: React.FC<ReportViewProps> = ({
     await window.electronAPI.exportFile(defaultName, content)
   }
 
-  const endpoints = extractEndpoints(requests)
+  const handleExportSpec = async () => {
+    if (!report) return
+    setExportMenuOpen(false)
+    await window.electronAPI.exportReportSpec(report.id)
+  }
+
+  const handleExportOpenApi = async () => {
+    if (!report) return
+    setExportMenuOpen(false)
+    await window.electronAPI.exportReportOpenApi(report.id)
+  }
+
+  const handleEnsureSpec = async () => {
+    if (!report || !onEnsureSpec || isEnsuringSpec) return
+    setIsEnsuringSpec(true)
+    try {
+      await onEnsureSpec(report.id)
+    } finally {
+      setIsEnsuringSpec(false)
+    }
+  }
+
+  const fallbackEndpoints = extractEndpoints(requests)
   const hookSummary = summarizeHooks(hooks)
   const effectiveModel = selectedModel || report?.llm_model || ''
   const modelOptions = React.useMemo(
@@ -252,11 +412,62 @@ const ReportView: React.FC<ReportViewProps> = ({
         </div>
       </div>
 
-      {/* Key endpoints */}
-      {endpoints.length > 0 && (
+      {/* Structured spec: scene + summary */}
+      {spec && (
         <div className={styles.contextSection}>
-          <div className={styles.contextLabel}>Endpoints</div>
-          {endpoints.map((ep, i) => (
+          <div className={styles.contextLabel}>{t('report.scene')}</div>
+          <div className={styles.contextItem}>
+            <div className={styles.contextDot} style={{ background: 'var(--color-accent)' }} />
+            {spec.scene}
+          </div>
+          {spec.summary && <div className={styles.specSummary}>{spec.summary}</div>}
+        </div>
+      )}
+
+      {/* Spec extraction failed / missing */}
+      {report && !spec && (
+        <div className={styles.contextSection}>
+          <div className={styles.contextLabel}>{t('report.structuredData')}</div>
+          <div className={styles.specStatus}>
+            {report.spec_error ? t('report.specFailed') : t('report.specMissing')}
+            {report.spec_error && <div className={styles.specError} title={report.spec_error}>{report.spec_error}</div>}
+          </div>
+          {onEnsureSpec && (
+            <Button size="sm" loading={isEnsuringSpec} onClick={handleEnsureSpec} style={{ marginTop: 6 }}>
+              {t('report.retrySpec')}
+            </Button>
+          )}
+        </div>
+      )}
+
+      {/* Endpoints: from the spec when available, otherwise dedupe raw requests */}
+      {spec && spec.endpoints.length > 0 ? (
+        <div className={styles.contextSection}>
+          <div className={styles.contextLabel}>{t('report.endpoints')} · {spec.endpoints.length}</div>
+          {spec.endpoints.map((ep, index) => {
+            const seq = ep.exampleSeqs[0]
+            const clickable = seq !== undefined && !!onCiteClick
+            return (
+              <div
+                key={`${ep.id}-${index}`}
+                className={`${styles.contextEndpoint} ${clickable ? styles.contextClickable : ''}`}
+                title={`${ep.purpose}${seq !== undefined ? ` · #${seq}` : ''}`}
+                onClick={clickable ? () => onCiteClick?.(seq) : undefined}
+              >
+                <span className={styles.contextMethod} style={{ color: getMethodColor(ep.method) }}>
+                  {ep.method}
+                </span>
+                <span className={styles.contextPath}>{shortenUrlTemplate(ep.urlTemplate)}</span>
+                {ep.auth !== 'none' && <span className={styles.authBadge}>{ep.auth}</span>}
+                {ep.streaming && <span className={styles.authBadge}>{ep.streaming}</span>}
+              </div>
+            )
+          })}
+        </div>
+      ) : fallbackEndpoints.length > 0 && (
+        <div className={styles.contextSection}>
+          <div className={styles.contextLabel}>{t('report.endpoints')}</div>
+          {fallbackEndpoints.map((ep, i) => (
             <div key={i} className={styles.contextEndpoint}>
               <span className={styles.contextMethod} style={{ color: getMethodColor(ep.method) }}>
                 {ep.method}
@@ -264,6 +475,29 @@ const ReportView: React.FC<ReportViewProps> = ({
               <span className={styles.contextPath}>{ep.path}</span>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Auth chain from the spec */}
+      {spec && spec.authChain.length > 0 && (
+        <div className={styles.contextSection}>
+          <div className={styles.contextLabel}>{t('report.authChain')}</div>
+          {spec.authChain.map((entry, i) => {
+            const seq = entry.evidenceSeqs[0]
+            const clickable = seq !== undefined && !!onCiteClick
+            return (
+              <div
+                key={i}
+                className={`${styles.contextItem} ${clickable ? styles.contextClickable : ''}`}
+                title={`${entry.obtainedFrom}${entry.refreshFlow ? ` · ${entry.refreshFlow}` : ''}`}
+                onClick={clickable ? () => onCiteClick?.(seq) : undefined}
+              >
+                <div className={styles.contextDot} style={{ background: 'var(--color-warning)' }} />
+                <span>{entry.credentialType}</span>
+                <span className={styles.authBadge}>{entry.carriedIn}{entry.keyName ? `:${entry.keyName}` : ''}</span>
+              </div>
+            )
+          })}
         </div>
       )}
 
@@ -340,9 +574,14 @@ const ReportView: React.FC<ReportViewProps> = ({
                   {t('report.stopAnalysis')}
                 </Button>
               </div>
+              <ReasoningPanel
+                reasoning={streamingReasoning}
+                hasContent={!!streamingContent}
+                label={t('report.reasoning')}
+              />
               {streamingContent ? (
                 <StreamingDisplay content={streamingContent} />
-              ) : (
+              ) : streamingReasoning ? null : (
                 <div className={styles.preparingState}>
                   <Spinner />
                   <div style={{ marginTop: 12 }}>{t('report.preparing')}</div>
@@ -420,7 +659,34 @@ const ReportView: React.FC<ReportViewProps> = ({
             {isLoadingModels ? '…' : '↻'}
           </button>
           <div className={styles.toolSpacer} />
-          <button className={styles.toolBtn} onClick={handleExport}>⬇ {t('report.export')}</button>
+          <div className={styles.exportMenu} ref={exportMenuRef}>
+            <button className={styles.toolBtn} onClick={() => setExportMenuOpen((open) => !open)}>
+              ⬇ {t('report.exportMenu')} ▾
+            </button>
+            {exportMenuOpen && (
+              <div className={styles.exportDropdown}>
+                <button className={styles.exportItem} onClick={() => { setExportMenuOpen(false); void handleExport() }}>
+                  {t('report.export')}
+                </button>
+                <button
+                  className={styles.exportItem}
+                  disabled={!spec}
+                  title={spec ? undefined : t('report.specMissing')}
+                  onClick={handleExportSpec}
+                >
+                  {t('report.exportSpec')}
+                </button>
+                <button
+                  className={styles.exportItem}
+                  disabled={!spec}
+                  title={spec ? undefined : t('report.specMissing')}
+                  onClick={handleExportOpenApi}
+                >
+                  {t('report.exportOpenApi')}
+                </button>
+              </div>
+            )}
+          </div>
           <button className={styles.toolBtn} disabled={isChatting} onClick={() => onReAnalyze(effectiveModel)}>↻ {t('report.reanalyze')}</button>
           <button className={styles.toolBtn} onClick={() => setShowAiLog(true)}>📋 {t('aiLog.title')}</button>
         </div>
@@ -435,10 +701,15 @@ const ReportView: React.FC<ReportViewProps> = ({
               <span>{requests.length} {t('data.requests')}</span>
             </div>
 
-            {/* Markdown content */}
+            {/* Markdown content ([#12] 引用渲染为可点击链接) */}
             <div className="report-markdown-content" style={{ overflowWrap: 'break-word', wordBreak: 'break-word' }}>
-              <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-                {report.report_content}
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                rehypePlugins={[rehypeHighlight]}
+                components={markdownComponents}
+                urlTransform={citationAwareUrlTransform}
+              >
+                {linkifyCitations(report.report_content)}
               </ReactMarkdown>
             </div>
 
@@ -450,22 +721,32 @@ const ReportView: React.FC<ReportViewProps> = ({
                   {msg.role === 'user' ? 'You' : 'AI'}
                 </Tag>
                 <div className="report-markdown-content">
-                  <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-                    {stripToolContext(msg.content)}
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeHighlight]}
+                    components={markdownComponents}
+                    urlTransform={citationAwareUrlTransform}
+                  >
+                    {linkifyCitations(stripToolContext(msg.content))}
                   </ReactMarkdown>
                 </div>
               </div>
             ))}
 
             {/* Streaming follow-up */}
-            {isChatting && streamingContent && (
+            {isChatting && (streamingContent || streamingReasoning) && (
               <div className={`${styles.chatMsg} ${styles.chatMsgAi}`}>
                 <Tag color="success" style={{ marginBottom: 4 }}>AI</Tag>
-                <StreamingDisplay content={streamingContent} />
+                <ReasoningPanel
+                  reasoning={streamingReasoning}
+                  hasContent={!!streamingContent}
+                  label={t('report.reasoning')}
+                />
+                {streamingContent && <StreamingDisplay content={streamingContent} />}
               </div>
             )}
 
-            {isChatting && !streamingContent && (
+            {isChatting && !streamingContent && !streamingReasoning && (
               <div style={{ textAlign: 'center', padding: 12 }}>
                 <Spinner size="sm" />
                 <span style={{ marginLeft: 8, color: 'var(--text-muted)' }}>{t('report.thinking')}</span>

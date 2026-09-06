@@ -11,6 +11,10 @@
  * - SceneHint, AuthChainItem: AI 分析结果类型，使用 camelCase
  */
 
+import type { AiProgressEvent } from "./ai-progress";
+
+export type { AiProgressEvent } from "./ai-progress";
+
 // ---- Session ----
 
 export type SessionStatus = "running" | "paused" | "stopped";
@@ -214,6 +218,14 @@ export interface AnalysisReport {
   report_content: string; // Markdown
   filter_prompt_tokens: number | null; // Phase 1 预过滤 token 消耗
   filter_completion_tokens: number | null;
+  /** 本次分析的目的 / 模板 id（如 auto、reverse-api 或自定义文本） */
+  purpose: string | null;
+  /** 结构化 ProtocolSpec JSON；抽取失败或尚未抽取时为 null */
+  spec_json: string | null;
+  /** 最近一次抽取失败的原因；成功时为 null */
+  spec_error: string | null;
+  /** 规则派生的 SessionEnrichment JSON（场景线索 / 鉴权链 / 存储 diff / 流式请求） */
+  enrichment_json: string | null;
 }
 
 // ---- AI Request Log ----
@@ -239,7 +251,7 @@ export interface AiRequestLog {
   created_at: number;
 }
 
-export type AiRequestLogType = 'analyze' | 'chat' | 'filter' | 'compress' | 'subagent';
+export type AiRequestLogType = 'analyze' | 'chat' | 'filter' | 'compress' | 'subagent' | 'extract';
 
 /** Data passed from LLMRouter intercept (without context fields filled by caller) */
 export interface AiRequestLogData {
@@ -275,6 +287,8 @@ export interface ContextBudgetConfig {
   subagentChunkSize: number;
   /** 最大并行子任务数；默认 3 */
   maxSubagents: number;
+  /** 为 true 时 maxContextTokens 由模型上下文窗口查表决定；默认 false（兼容旧配置） */
+  autoContextWindow?: boolean;
 }
 
 export type CompressionMode = "rules" | "hybrid";
@@ -405,6 +419,22 @@ export interface UpdateStatus {
 export type LLMProviderType = "openai" | "anthropic" | "minimax" | "custom";
 export type OpenAIApiType = "completions" | "responses";
 
+/** 思考级别；none 表示不发送任何 reasoning 参数 */
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "max";
+
+export interface LLMGenerationOptions {
+  /** 采样温度；不填则不发送 */
+  temperature?: number;
+  /** 思考级别；映射到 AI SDK 顶层 reasoning；none 或不填则不发送 */
+  reasoningEffort?: ReasoningEffort;
+  /** 高级：Anthropic budget 模式的思考预算 tokens；设置后覆盖 reasoningEffort */
+  thinkingBudgetTokens?: number;
+  /** 快速模式：Anthropic speed:'fast' / OpenAI serviceTier:'fast'；其他 provider 忽略 */
+  fastMode?: boolean;
+  /** 高级：合并进请求 JSON 的透传参数 */
+  extraBody?: Record<string, unknown>;
+}
+
 export interface LLMProviderConfig {
   name: LLMProviderType;
   apiType?: OpenAIApiType;
@@ -412,6 +442,10 @@ export interface LLMProviderConfig {
   apiKey: string;
   model: string;
   maxTokens: number;
+  /** 可选：生成参数（思考级别 / 快速模式 / 温度 / 透传） */
+  generation?: LLMGenerationOptions;
+  /** 可选：轻量任务（预过滤 / 压缩 / 子分析）使用的模型；空则沿用 model */
+  lightweightModel?: string;
   /** 可选：分析/追问上下文预算与压缩策略 */
   contextBudget?: Partial<ContextBudgetConfig>;
 }
@@ -788,7 +822,10 @@ export interface ElectronAPI {
   cancelAnalysis: (sessionId: string) => Promise<void>;
   sendFollowUp: (sessionId: string, reportId: string, history: ChatMessage[], userMessage: string) => Promise<string>;
   getChatMessages: (reportId: string) => Promise<ChatMessage[]>;
-  saveChatMessages: (reportId: string, messages: ChatMessage[]) => Promise<void>;
+  /** 确保报告有结构化 Spec（没有则用轻量模型补抽），返回更新后的报告 */
+  ensureReportSpec: (reportId: string) => Promise<AnalysisReport>;
+  exportReportSpec: (reportId: string) => Promise<boolean>;
+  exportReportOpenApi: (reportId: string) => Promise<boolean>;
   syncBrowserBounds: (bounds: {
     x: number;
     y: number;
@@ -816,7 +853,7 @@ export interface ElectronAPI {
   onRequestCaptured: (callback: (data: CapturedRequest) => void) => void;
   onHookCaptured: (callback: (data: JsHookRecord) => void) => void;
   onStorageCaptured: (callback: (data: StorageSnapshot) => void) => void;
-  onAnalysisProgress: (callback: (chunk: string) => void) => void;
+  onAnalysisProgress: (callback: (event: AiProgressEvent) => void) => void;
   removeAllListeners: (channel: string) => void;
 
   // Auto update
@@ -838,6 +875,7 @@ export interface ElectronAPI {
 
   // Export requests
   exportRequests: (sessionId: string) => Promise<boolean>;
+  exportHar: (sessionId: string) => Promise<boolean>;
 
   // AI Request Logs
   getAiRequestLogs: (sessionId: string) => Promise<AiRequestLog[]>;

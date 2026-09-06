@@ -1,31 +1,35 @@
 import React, { useState } from 'react'
 import styles from './Collapse.module.css'
 
-interface CollapseItem {
+export interface CollapseItem {
   key: string
   label: React.ReactNode
   children: React.ReactNode
 }
 
-interface CollapseProps {
+export interface CollapseProps {
   items: CollapseItem[]
   defaultActiveKey?: string[]
+  /** 受控模式：传入后由外部决定展开项 */
+  activeKey?: string[]
+  onChange?: (activeKeys: string[]) => void
   className?: string
 }
 
-export const Collapse: React.FC<CollapseProps> = ({ items, defaultActiveKey = [], className }) => {
-  const [activeKeys, setActiveKeys] = useState<Set<string>>(new Set(defaultActiveKey))
+export const Collapse: React.FC<CollapseProps> = ({ items, defaultActiveKey = [], activeKey, onChange, className }) => {
+  const [internalKeys, setInternalKeys] = useState<Set<string>>(new Set(defaultActiveKey))
+  const isControlled = activeKey !== undefined
+  const activeKeys = isControlled ? new Set(activeKey) : internalKeys
 
   const toggle = (key: string) => {
-    setActiveKeys((prev) => {
-      const next = new Set(prev)
-      if (next.has(key)) {
-        next.delete(key)
-      } else {
-        next.add(key)
-      }
-      return next
-    })
+    const next = new Set(activeKeys)
+    if (next.has(key)) {
+      next.delete(key)
+    } else {
+      next.add(key)
+    }
+    if (!isControlled) setInternalKeys(next)
+    onChange?.([...next])
   }
 
   return (

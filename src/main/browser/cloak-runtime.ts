@@ -549,6 +549,12 @@ export function buildCloakLaunchOptions(
     ...(requestedVersion ? { browserVersion: requestedVersion } : {}),
     args: [
       `--fingerprint=${profile.seed}`,
+      // The Cloak binary blocks third-party cookies by default (see README
+      // "Additional Flags"). That makes cross-site iframes throw SecurityError
+      // on sessionStorage/localStorage, which stalls embedded payment / SSO /
+      // bot-check flows (Stripe HumanSecurity, reCAPTCHA v3). Stock Chrome
+      // allows them, so re-enable for fidelity.
+      "--fingerprint-allow-3p-cookies",
       // Chromium otherwise inherits the host's system proxy configuration.
       ...(proxy ? [] : ["--no-proxy-server"]),
     ],

@@ -277,6 +277,8 @@ describe("CloakBrowser launch options", () => {
 
       expect(launchOptions.args).toContain("--no-proxy-server");
       expect(launchOptions.args).toContain("--fingerprint=12345");
+      // Cloak 二进制默认拦第三方 Cookie，会卡死 Stripe / reCAPTCHA 等嵌入式挑战
+      expect(launchOptions.args).toContain("--fingerprint-allow-3p-cookies");
       expect(launchOptions.geoip).toBe(false);
       expect(launchOptions).not.toHaveProperty("proxy");
       expect(launchOptions).not.toHaveProperty("licenseKey");
@@ -301,6 +303,7 @@ describe("CloakBrowser launch options", () => {
     );
 
     expect(launchOptions.args).not.toContain("--no-proxy-server");
+    expect(launchOptions.args).toContain("--fingerprint-allow-3p-cookies");
     expect(launchOptions.geoip).toBe(true);
     expect(launchOptions.proxy).toEqual({
       server: "socks5://127.0.0.1:1080",
@@ -318,5 +321,14 @@ describe("CloakBrowser launch options", () => {
         proxy: { type: "http", host: " ", port: 8080 },
       }),
     ).toThrow(/proxy host and port are invalid/i);
+  });
+
+  it("keeps humanize on because CloakBrowserTarget.getHumanInput relies on the patched mouse/keyboard", () => {
+    const launchOptions = buildCloakLaunchOptions("C:\\profiles\\profile-1", profile, {
+      sessionId: "session-1",
+    });
+
+    expect(launchOptions.humanize).toBe(true);
+    expect(launchOptions.headless).toBe(false);
   });
 });

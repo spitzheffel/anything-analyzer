@@ -97,6 +97,10 @@
   color: var(--color-warning);
 }
 
+.warningBanner code {
+  font-family: var(--font-mono);
+}
+
 .runtimeFacts {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

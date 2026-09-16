@@ -14,6 +14,7 @@ import type {
   CloakRuntimeStatus,
   Session,
 } from '@shared/types'
+import { cloakVersionDrift } from '@shared/browser-presentation'
 import styles from './CloakBrowserSection.module.css'
 
 const LOGIN_COMMAND = 'npx cloakbrowser login'
@@ -185,6 +186,7 @@ export default function CloakBrowserSection({ onProfileRestored }: CloakBrowserS
 
   const presentation = statePresentation[status?.state ?? 'checking']
   const isUnavailable = status?.available === false || status?.state === 'unavailable'
+  const versionDrift = cloakVersionDrift(status)
   const progress = status?.downloadProgress
   const received = formatBytes(progress?.receivedBytes)
   const total = formatBytes(progress?.totalBytes)
@@ -249,6 +251,15 @@ export default function CloakBrowserSection({ onProfileRestored }: CloakBrowserS
                 <code className={styles.version}>{status?.actualVersion ?? '未安装'}</code>
               </div>
             </div>
+
+            {versionDrift && (
+              <div className={styles.warningBanner} role="status">
+                版本已漂移：请求 <code>{versionDrift.requested}</code>，实际解析到{' '}
+                <code>{versionDrift.actual}</code>。版本固定只对付费计划生效，免费计划会被服务端
+                强制下发最新内核。浏览器可正常使用，Session 记录的是实际版本；内核变化后需重新
+                执行浏览器契约测试。
+              </div>
+            )}
 
             {!status?.loggedIn && (
               <div className={styles.loginBlock}>

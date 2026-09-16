@@ -237,6 +237,29 @@ describe("CloakRuntime lifecycle", () => {
     await expect(runtime.deleteProfile("profile-1")).resolves.toBeUndefined();
   });
 
+  it("prepares against the executable ensureBinary chose, not the pin diagnostics echo", async () => {
+    // Free plans are force-served the latest build: the wrapper silently drops
+    // the version pin, while `cloakbrowser info` — which only ever re-reads the
+    // pin we passed it — keeps echoing the requested version. Trust the
+    // executable and record the version it really is.
+    const resolvedVersion = "151.0.7922.108.6";
+    const resolvedPath = `C:\\cloakbrowser\\chromium-${resolvedVersion}-pro\\chrome.exe`;
+    completeDiagnosticsImmediately();
+    runtimeMocks.ensureBinary.mockResolvedValue(resolvedPath);
+    const runtime = new CloakRuntime({ policy: "strict" });
+    runtime.start();
+
+    const status = await runtime.prepare("strict");
+
+    expect(status).toMatchObject({
+      state: "ready",
+      configuredVersion: CLOAK_PAID_BROWSER_VERSION,
+      actualVersion: resolvedVersion,
+    });
+    expect(runtimeMocks.binaryInfo).not.toHaveBeenCalled();
+    await runtime.shutdown();
+  });
+
   it("tracks a late launch whose shutdown cleanup fails", async () => {
     completeDiagnosticsImmediately();
     const launched = deferred<PlaywrightBrowserContext>();

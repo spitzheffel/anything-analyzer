@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { access, lstat, mkdir, realpath, rm } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { app } from "electron";
 import type { BrowserContext as PlaywrightBrowserContext } from "playwright-core";
 import type { CloakRuntimePolicy, CloakRuntimeStatus } from "@shared/types";
@@ -13,7 +13,6 @@ import {
 } from "./contracts";
 
 type CloakModule = typeof import("cloakbrowser");
-type CloakBinaryInfo = import("cloakbrowser").BinaryInfo;
 type CloakLaunchOptions = import("cloakbrowser").LaunchPersistentContextOptions;
 type CloakProxy = NonNullable<
   import("cloakbrowser").LaunchPersistentContextOptions["proxy"]
@@ -71,7 +70,6 @@ export interface CloakBinaryStatus {
   requestedVersion: string | null;
   actualVersion: string;
   executablePath: string;
-  binaryInfo: CloakBinaryInfo;
 }
 
 export interface CloakRuntimeContextSnapshot {
@@ -149,11 +147,7 @@ function validateCloakApi(value: unknown): CloakModule {
     throw new Error("cloakbrowser did not expose an ES module namespace");
   }
   const api = value as Partial<CloakModule>;
-  const requiredFunctions = [
-    "launchPersistentContext",
-    "ensureBinary",
-    "binaryInfo",
-  ] as const;
+  const requiredFunctions = ["launchPersistentContext", "ensureBinary"] as const;
   for (const name of requiredFunctions) {
     if (typeof api[name] !== "function") {
       throw new Error(
@@ -359,29 +353,11 @@ export function evaluateCloakDiagnosticsStatus(
       error: "CLOAKBROWSER_BINARY_PATH overrides are not supported by the managed Cloak runtime",
     });
   }
-  if (policy === "strict" && diagnostics.binary.tier !== "pro") {
-    return diagnosticsStatus(diagnostics, policy, {
-      state: "error",
-      error: `Strict Cloak mode requires the maintained Pro binary, got ${diagnostics.binary.tier}`,
-    });
-  }
-  if (policy === "strict" && !diagnostics.binary.pinned) {
-    return diagnosticsStatus(diagnostics, policy, {
-      state: "error",
-      error: "Strict Cloak mode requires a pinned browser version",
-    });
-  }
-  if (
-    policy === "strict" &&
-    diagnostics.binary.version !== CLOAK_PAID_BROWSER_VERSION
-  ) {
-    return diagnosticsStatus(diagnostics, policy, {
-      state: "error",
-      error: `Strict Cloak version mismatch: expected ${CLOAK_PAID_BROWSER_VERSION}, got ${
-        diagnostics.binary.version ?? "unresolved"
-      }`,
-    });
-  }
+  // Strict mode *requests* CLOAK_PAID_BROWSER_VERSION; it does not police whether
+  // the wrapper granted it. The wrapper owns license/entitlement resolution and
+  // deliberately ignores a version pin on free plans (the server force-serves
+  // latest to free keys), so asserting tier/pin/version here would reject a
+  // perfectly launchable binary. prepare() records whatever actually resolved.
   if (policy === "free-latest" && diagnostics.binary.pinned) {
     return diagnosticsStatus(diagnostics, policy, {
       state: "error",
@@ -572,6 +548,30 @@ function samePath(left: string, right: string): boolean {
   return normalize(left) === normalize(right);
 }
 
+/**
+ * Recover the Chromium version from the executable the wrapper handed back.
+ *
+ * ensureBinary() returns only a path, and its own resolution (pin honored, pin
+ * dropped on a free plan, auto-update to latest) is the only authority on which
+ * build will actually launch. The wrapper caches every build in a directory it
+ * names `chromium-<version>[-pro]`, so the path itself carries the answer —
+ * including the Cloak build suffix that `chrome --version` drops. Walk up from
+ * the executable so both layouts work: `<dir>/chrome[.exe]` and macOS's
+ * `<dir>/Chromium.app/Contents/MacOS/Chromium`.
+ */
+function versionFromBinaryPath(executablePath: string): string | null {
+  const pattern = /^chromium-(\d+(?:\.\d+){3,4})(?:-pro)?$/;
+  let current = resolve(executablePath);
+  for (let depth = 0; depth < 6; depth += 1) {
+    const parent = dirname(current);
+    if (parent === current) break;
+    const matched = pattern.exec(basename(parent));
+    if (matched) return matched[1];
+    current = parent;
+  }
+  return null;
+}
+
 function isWithin(parent: string, child: string): boolean {
   const pathFromParent = relative(parent, child);
   return (
@@ -747,13 +747,15 @@ export class CloakRuntime {
     this.diagnosticsPromise = readCloakDiagnostics(policy)
       .then((diagnostics) => {
         const status = evaluateCloakDiagnosticsStatus(diagnostics, policy);
-        if (
-          status.state !== "ready" ||
-          this.prepared?.status.actualVersion !== status.actualVersion
-        ) {
-          this.prepared = null;
-        }
-        this.updateStatus(status);
+        if (status.state !== "ready") this.prepared = null;
+        // Diagnostics report the version the pin asks for, which is not
+        // necessarily the one ensureBinary resolved. Once prepare() has
+        // established the real build, keep showing that rather than flipping
+        // back to the request on every check.
+        this.updateStatus({
+          ...status,
+          actualVersion: this.prepared?.status.actualVersion ?? status.actualVersion,
+        });
         return this.getStatus();
       })
       .catch((error: unknown) => {
@@ -1172,25 +1174,17 @@ export class CloakRuntime {
       throw backendFailure(error);
     }
 
-    const diagnosedPath = afterDiagnostics.binary.path;
-    const actualVersion = afterDiagnostics.binary.version;
-    if (!diagnosedPath || !actualVersion) {
+    // ensureBinary() already picked the executable, and it is the only call that
+    // knows what the license actually entitles. The CLI diagnostics re-resolve
+    // from the requested pin alone, so they can legitimately name a different
+    // build than the one we are about to launch — trust the executable, and take
+    // the version from it so the session records what really ran.
+    const actualVersion =
+      versionFromBinaryPath(executablePath) ?? afterDiagnostics.binary.version;
+    if (!actualVersion) {
       throw backendFailure(
-        "CloakBrowser diagnostics omitted the prepared executable or version",
+        "CloakBrowser did not resolve a browser version for the prepared executable",
       );
-    }
-    const binaryInfo = api.binaryInfo(requestedVersion, CLOAK_RELEASE_CHANNEL);
-    if (
-      !samePath(diagnosedPath, executablePath) ||
-      !samePath(binaryInfo.binaryPath, executablePath)
-    ) {
-      this.prepared = null;
-      this.updateStatus({
-        state: "error",
-        error: "CloakBrowser binary status does not match the selected executable",
-        downloadProgress: null,
-      });
-      throw backendFailure(this.status.error ?? "CloakBrowser binary status mismatch");
     }
 
     const binaryStatus: CloakBinaryStatus = {
@@ -1201,11 +1195,11 @@ export class CloakRuntime {
       requestedVersion: requestedVersion ?? null,
       actualVersion,
       executablePath,
-      binaryInfo,
     };
     this.prepared = { api, policy, requestedVersion, status: binaryStatus };
     this.updateStatus({
       ...afterStatus,
+      actualVersion,
       downloadProgress: null,
     });
     return this.getStatus();

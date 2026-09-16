@@ -170,7 +170,7 @@ describe("CloakBrowser CLI diagnostics", () => {
     });
   });
 
-  it("requires the exact paid binary in strict mode", () => {
+  it("reports what the wrapper resolved in strict mode instead of policing entitlement", () => {
     const exact = parseCloakInfoJson(
       diagnosticsJson({ licenseTier: "team", pinned: true }),
     );
@@ -182,26 +182,27 @@ describe("CloakBrowser CLI diagnostics", () => {
       seats: 1,
     });
 
-    const mismatch = parseCloakInfoJson(
+    // The wrapper drops a version pin on free plans (the server force-serves
+    // latest to free keys), so a build other than the requested one is a normal
+    // outcome, not a failure. Report it; prepare() records what actually ran.
+    const otherVersion = parseCloakInfoJson(
       diagnosticsJson({
         licenseTier: "team",
         version: "151.0.7922.108.2",
         pinned: true,
       }),
     );
-    expect(evaluateCloakDiagnosticsStatus(mismatch, "strict")).toMatchObject({
-      state: "error",
+    expect(evaluateCloakDiagnosticsStatus(otherVersion, "strict")).toMatchObject({
+      state: "ready",
+      configuredVersion: CLOAK_PAID_BROWSER_VERSION,
+      actualVersion: "151.0.7922.108.2",
     });
-    expect(evaluateCloakDiagnosticsStatus(mismatch, "strict").error).toMatch(
-      /version mismatch/i,
-    );
 
     const unpinned = parseCloakInfoJson(
       diagnosticsJson({ licenseTier: "team", pinned: false }),
     );
     expect(evaluateCloakDiagnosticsStatus(unpinned, "strict")).toMatchObject({
-      state: "error",
-      error: expect.stringMatching(/pinned browser version/i),
+      state: "ready",
     });
 
     const freeBinary = parseCloakInfoJson(
@@ -212,10 +213,12 @@ describe("CloakBrowser CLI diagnostics", () => {
       }),
     );
     expect(evaluateCloakDiagnosticsStatus(freeBinary, "strict")).toMatchObject({
-      state: "error",
-      error: expect.stringMatching(/requires the maintained Pro binary/i),
+      state: "ready",
+      plan: "free",
     });
 
+    // Signed-out / rejected keys are still blocked — that is sign-in state, not
+    // an entitlement judgement, and the UI needs it to prompt a login.
     const rejectedLicense = parseCloakInfoJson(
       diagnosticsJson({ licenseTier: "free", licenseValid: false, pinned: true }),
     );

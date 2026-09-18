@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, existsSync } from "node:fs";
 import { access, lstat, mkdir, realpath, rm } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { app } from "electron";
@@ -382,14 +382,27 @@ export function evaluateCloakDiagnosticsStatus(
   });
 }
 
+const CLOAK_CLI_RELATIVE = join("node_modules", "cloakbrowser", "dist", "cli.js");
+
+/**
+ * Packaged, the CLI sits directly under the app path. In development the main
+ * bundle runs from out-internal/main, several directories below the
+ * node_modules that actually holds it, so the app path alone names a file
+ * nobody ever installed and CloakBrowser cannot start at all. Walk up until
+ * the CLI is found, and fall back to the app path so a genuine absence still
+ * reports the location it was expected in.
+ */
 function cloakCliPath(): string {
-  return join(
-    app.getAppPath(),
-    "node_modules",
-    "cloakbrowser",
-    "dist",
-    "cli.js",
-  );
+  const base = app.getAppPath();
+  let current = base;
+  for (let depth = 0; depth < 6; depth += 1) {
+    const candidate = join(current, CLOAK_CLI_RELATIVE);
+    if (existsSync(candidate)) return candidate;
+    const parent = dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return join(base, CLOAK_CLI_RELATIVE);
 }
 
 async function readCloakDiagnostics(

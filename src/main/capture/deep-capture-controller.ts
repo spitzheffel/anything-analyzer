@@ -164,7 +164,12 @@ export class DeepCaptureController {
         state.health.transport = 'push'
         await state.connection.evaluate(`${bridgeExpression}?.push()`)
       } catch {
+        // Say which transport the realm actually has and why. A document that
+        // loses its binding has only the 750ms poll left, which a navigation
+        // can outrun, so this is the difference between a realm that is slow
+        // and one that will never deliver.
         state.health.transport = 'poll'
+        state.health.reason = 'push-binding-unavailable'
       }
       await this.pollRealm(state)
     } catch {

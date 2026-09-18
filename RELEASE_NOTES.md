@@ -1,34 +1,39 @@
-# Anything Analyzer v3.6.66
+# Anything Analyzer v3.6.67
 
-本版本以 Deep 抓取的可靠性为主：worker 从第一条语句起就被覆盖，realm 的生死判断不再被重复会话误导；另外修正一处交互行为——选中 Cloak 会话不再自动弹出浏览器窗口。
+本版本修的都是 Cloak 会话的打开行为：会话现在开在它自己的目标网址上，关掉的窗口不再自己回来，开发模式下也终于能跑真实的 Cloak 后端。
 
 ## 修复
 
-- **选中 Cloak 会话会直接弹出浏览器窗口** — 在列表里点一个会话，走的是 `enableStealth`，它会激活会话并打开浏览器上下文。对内置 Electron 后端这一步是无感的（切换分区、套用指纹），但对 Cloak 就是凭空多出一个外部浏览器窗口，而这一下点击只是想「看看这个会话」。会话面板本来就有「打开浏览器」按钮，窗口却在按钮被点之前就出现了。现在选中只会接管**已经打开**的 Cloak 上下文，绝不新开；打开与聚焦仍由按钮显式触发，Electron 路径不变。
-- **已在运行的 Service Worker 被误判为已销毁，此后抓到的数据全部被丢弃** — Chromium 会为每个开启了 auto-attach 的父级各附加一次 service worker，同一个 worker 因此对应多个 CDP 会话，但它们指向同一个执行上下文、同一个 realm。此前任何一个会话断开都被当作 realm 销毁，于是关掉一个**无关页面**就会「封死」一个仍在运行的 service worker：宿主忽略它之后的全部上报，还给它记了一条 `realm-destroyed-unverified-tail`。现在只有在没有任何存活会话还能看到该 realm 时才判定其结束。
-- **module worker 被误报为缺少首语句覆盖** — ES 模块会先完成模块图实例化再执行顶层代码，因此执行上下文存在一段时间之后，被改写进入口脚本的首条语句才真正运行。此前只在上下文创建时读取一次覆盖标记，落在这个窗口里就会给一个**确已被改写**的 worker 记上缺口。现在先装钩子、再有界重读标记（50ms 内），只有结论等待，期间没有代码裸跑；超出窗口仍按「未覆盖」如实上报，不会反过来声称覆盖。
+- **Cloak 会话每次都打开在 `about:blank`，而且原有标签页不会恢复** — 恢复已保存标签页的分支会在导航到目标网址之前返回，而浏览器自带的空白起始页也被当成了「值得恢复的标签页」，于是兜底导航永远没有机会执行。这是自我维持的：浏览器开在自己的空白页，该页被持久化，之后每次打开都「恢复」它并就此停下。又因为持久化是整组替换，一次空白打开还会覆盖掉用户原有的标签页记录。现在只恢复真正有去处的标签页；保存的标签页全为空白时，会话回落到它的目标网址。
+- **手动关闭浏览器窗口后，窗口会自动重新打开** — 任何不是应用自己发起的断开都被当作崩溃并自动恢复一次，而在这一层无法区分「用户关窗」和「浏览器进程异常退出」。自动恢复的意义是保护**正在进行的抓取**；没有抓取在跑时，窗口关了就是关了，重新拉起只会覆盖用户的意图，其空白标签页还会覆盖已保存的标签页。现在仅在该会话的抓取进行中才自动恢复一次，空闲会话保持关闭，由「打开浏览器」按钮显式打开。
+- **开发模式下 CloakBrowser 完全无法启动** — CLI 路径由 `app.getAppPath()` 推导，打包后指向应用根目录（CLI 就在其下），但开发模式的主进程包运行在 `out-internal/main`，比真正存放它的 `node_modules` 深好几层，于是每次启动都以 `cli.js` 的 ENOENT 失败。现在会逐级向上查找；打包后的行为不变，仍然第一次就命中。
 
-## 新增
+## 关于「无法区分关窗与崩溃」
 
-- **Deep 抓取的持久化投递与 worker 首语句覆盖** — 抓取数据改为带确认的持久化投递（提交后才确认、推送与轮询去重、按运行轮次隔离），worker 的入口脚本在响应阶段被改写，使插桩成为脚本的第一条语句，覆盖范围涵盖专用 / 共享 / Service Worker 与 classic / module，`blob:`、`data:` 由文档侧构造函数代理兜底。无法覆盖的情况不会被粉饰，而是如实记为缺口。
-- **realm 失去推送通道时记录原因** — 注册推送绑定失败会让 realm 退化为轮询，而轮询周期是 750ms，快速导航下一个文档只存活约 300ms，这类 realm 可能带着尚未送出的数据被销毁。健康记录此前只显示 `poll` 而不给原因，现在补上 `push-binding-unavailable`，区分「慢」与「永远送不出去」。
+这一条是实测结论而非推断，记录在此以免日后重复排查：
+
+- Playwright 对「关闭窗口」和「杀掉进程」上报的事件序列完全相同，只有时间间隔不同，而间隔本身并不稳定。
+- Cloak 的 `launchPersistentContext` 返回普通的 `BrowserContext`，拿不到子进程，`browser.process()` 为 `null`，因此没有退出码。
+- Chromium 记录的 `profile.exit_type` 在进程被杀之后仍然是 `Normal`。同一个复用 profile 连跑三轮从未出现 `Crashed` —— 该标记在启动时设置但似乎并未落盘，磁盘上的值描述的是上一次退出而不是这一次。
+
+因此本版本没有去猜测意图，而是改用不需要区分的策略。
 
 ## 验证
 
-- 全量测试：536 passed，20 skipped。其中 `tests/main/db/capture-reliability.test.ts` 的 18 项需要 Electron 的原生模块 ABI，改用 `node scripts/run-electron-vitest.mjs` 运行后通过（抓取相关 5 个套件共 98 项全过）。
-- 真实 CloakBrowser 验证（`AA_REAL_CLOAK=1`）9 个场景全部通过，含此前从未跑到的 `stop-and-cross-run-isolation`、`warm-existing-service-worker`、`sqlite-reopen-durability`；连续 26 轮零失败（此前同等批次为 3/12 失败）。
-- 持久化一致性：245 条 hook / 303 条回执，重复生产序号 0，无回执的 hook 行 0。
+- 全量测试：538 passed，20 skipped。其中 `tests/main/db/capture-reliability.test.ts` 的 18 项需要 Electron 的原生模块 ABI，改用 `node scripts/run-electron-vitest.mjs` 运行后 18 项全部通过。
+- 真实 CloakBrowser 验证（`AA_REAL_CLOAK=1`）9 个场景全部通过。
+- 新增回归测试覆盖：空白标签页不再顶替目标网址、空闲会话关闭后不再自动重开、以及选中会话不会启动浏览器。两条关于「不应发生」的测试都先对旧行为验证过会失败。
 - 内部包打包、产物校验、启动冒烟与 UI 冒烟通过。
 
 ## 已知问题
 
-- 快速连续导航时，偶发（约 1/27）有文档 realm 未能建立推送通道，被下一次导航销毁时带走尚未送出的数据。该情况会如实记为缺口，不会静默丢失；本版本已加入原因字段以便定位。
+- 快速连续导航时，偶发（约 1/27）有文档执行域未能建立推送通道，被下一次导航销毁时带走尚未送出的数据。该情况会如实记为缺口，不会静默丢失。
 
 ## 下载
 
 | 平台 | 文件 |
 |------|------|
-| Windows | Anything-Analyzer-Setup-3.6.66.exe |
-| macOS (Apple Silicon) | Anything-Analyzer-3.6.66-arm64.dmg |
-| macOS (Intel) | Anything-Analyzer-3.6.66-x64.dmg |
-| Linux | Anything-Analyzer-3.6.66.AppImage |
+| Windows | Anything-Analyzer-Setup-3.6.67.exe |
+| macOS (Apple Silicon) | Anything-Analyzer-3.6.67-arm64.dmg |
+| macOS (Intel) | Anything-Analyzer-3.6.67-x64.dmg |
+| Linux | Anything-Analyzer-3.6.67.AppImage |

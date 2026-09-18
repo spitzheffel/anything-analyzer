@@ -361,9 +361,12 @@ export class SessionManager {
   }
 
   /**
-   * Kept as the selection entry point used by the current renderer. For Cloak
-   * it opens/focuses the external context and deliberately applies no Electron
-   * fingerprint overrides.
+   * The selection entry point used by the current renderer, and deliberately
+   * not a launch. Selecting a Session means "show me this Session"; for Cloak,
+   * launching would put an external browser window on screen from a click that
+   * asked for no such thing. Opening and focusing are an explicit action
+   * (focusBrowser), so selection only adopts a Cloak context that is already
+   * open. Electron fingerprint overrides are still never applied to Cloak.
    */
   async enableStealth(
     sessionId: string,
@@ -371,6 +374,15 @@ export class SessionManager {
     proxyConfig?: ProxyConfig | null,
     rendererWebContents?: WebContents,
   ): Promise<void> {
+    const session = this.requireSession(sessionId);
+    const backend = session.browser_backend ?? "electron";
+    if (backend === "cloak" && !this.browserCoordinator.hasOpenSession(sessionId)) {
+      // Remember what an activation would have recorded: focusBrowser reads
+      // both back when the user does ask for the window.
+      if (rendererWebContents) this.rendererWebContents = rendererWebContents;
+      if (proxyConfig !== undefined) this.lastProxyConfig = proxyConfig;
+      return;
+    }
     await this.activateSession(
       sessionId,
       rendererWebContents,

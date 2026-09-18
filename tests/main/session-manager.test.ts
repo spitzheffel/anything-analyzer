@@ -948,6 +948,38 @@ describe("SessionManager browser lifecycle", () => {
     expect(cloak.browser_profile_id).toBeTruthy();
   });
 
+  it("does not launch a Cloak browser when the renderer only selects the Session", async () => {
+    const fixture = createFixture();
+    const cloak = fixture.manager.createSession("Cloak", "cloak.test", {
+      backend: "cloak",
+    });
+
+    // Selecting a Session in the list is not a request for its window.
+    await fixture.manager.enableStealth(cloak.id);
+    expect(fixture.cloakBackend.openAttempts).toEqual([]);
+    expect(fixture.coordinator.hasOpenSession(cloak.id)).toBe(false);
+
+    // Asking for it explicitly is.
+    await fixture.manager.focusBrowser(cloak.id);
+    expect(fixture.cloakBackend.openAttempts.map((attempt) => attempt.sessionId))
+      .toEqual([cloak.id]);
+
+    // Selecting it again adopts the open Context rather than opening a second.
+    await fixture.manager.enableStealth(cloak.id);
+    expect(fixture.cloakBackend.openAttempts).toHaveLength(1);
+    expect(fixture.manager.getActiveBrowserSessionId()).toBe(cloak.id);
+  });
+
+  it("still activates an Electron Session on selection", async () => {
+    const fixture = createFixture();
+    const electron = fixture.manager.createSession("Electron", "electron.test");
+
+    await fixture.manager.enableStealth(electron.id);
+
+    expect(fixture.electronBackend.openAttempts.map((attempt) => attempt.sessionId))
+      .toEqual([electron.id]);
+  });
+
   it("closes a newly opened Cloak Context when Context activation fails", async () => {
     const fixture = createFixture();
     const retained = fixture.manager.createSession("Retained", "retained.test", {

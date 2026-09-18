@@ -30,6 +30,12 @@ class FakeWebSocket extends EventTarget {
   readonly contexts = new Map<string, FakeContext[]>()
   /** Response bodies the router asked for, keyed by the intercepted request id. */
   readonly interceptedBodies = new Map<string, string>()
+  /** Entry-script URLs the router actually rewrote, and each session's URL. */
+  readonly rewrittenUrls = new Set<string>()
+  readonly sessionUrls = new Map<string, string>()
+  readonly pausedUrls = new Map<string, string>()
+  /** Sessions whose instance carries no marker, as if started from a script cache. */
+  readonly sessionsStartedFromCache = new Set<string>()
   readyState = 0
 
   constructor(readonly url: string) {
@@ -58,8 +64,16 @@ class FakeWebSocket extends EventTarget {
         : command.method === 'Fetch.getResponseBody'
           ? { body: this.interceptedBodies.get(command.params.requestId as string) ?? '', base64Encoded: false }
           : command.method === 'Runtime.evaluate'
-            ? { result: { type: 'undefined' } }
+            ? String(command.params.expression).includes('__aaReliableCaptureEntryScript')
+              ? { result: { type: 'boolean',
+                  value: !this.sessionsStartedFromCache.has(command.sessionId!) &&
+                    this.rewrittenUrls.has(this.sessionUrls.get(command.sessionId!) ?? '') } }
+              : { result: { type: 'undefined' } }
             : {}
+      if (command.method === 'Fetch.fulfillRequest') {
+        const url = this.pausedUrls.get(command.params.requestId as string)
+        if (url) this.rewrittenUrls.add(url)
+      }
       this.respond(command, result)
     })
   }
@@ -89,6 +103,7 @@ class FakeWebSocket extends EventTarget {
   ): Promise<void> {
     const requestId = `intercept-${this.interceptedBodies.size + 1}`
     this.interceptedBodies.set(requestId, body)
+    this.pausedUrls.set(requestId, url)
     this.event('Fetch.requestPaused', {
       requestId,
       request: { url },
@@ -110,6 +125,7 @@ class FakeWebSocket extends EventTarget {
     url = `https://fixture.invalid/${sessionId}.js`
   ): void {
     this.contexts.set(sessionId, contexts)
+    this.sessionUrls.set(sessionId, url)
     this.event('Target.attachedToTarget', {
       sessionId, waitingForDebugger, targetInfo: { targetId, type: kind, url }
     }, parentSessionId)
@@ -319,7 +335,10 @@ describe('CloakRealmRouter', () => {
     expect(fulfil).toBeDefined()
     expect(fulfil!.params.responseCode).toBe(203)
     const body = Buffer.from(fulfil!.params.body as string, 'base64').toString('utf8')
-    expect(body.startsWith(options.bootstrapSource)).toBe(true)
+    // The marker rides ahead of the bootstrap so the realm can prove later
+    // that it started from these bytes rather than a cached copy.
+    expect(body.startsWith('globalThis["__aaReliableCaptureEntryScript"]=true;')).toBe(true)
+    expect(body).toContain(options.bootstrapSource)
     expect(body.endsWith('globalThis.original = 1')).toBe(true)
     expect(socket.commands.some((command) => command.method === 'Fetch.continueRequest')).toBe(false)
   })
@@ -384,6 +403,19 @@ describe('CloakRealmRouter', () => {
     // Still published and released: an uninstrumented worker is observable.
     expect(socket.commands.some((command) =>
       command.sessionId === 'worker-session' && command.method === 'Runtime.runIfWaitingForDebugger')).toBe(true)
+  })
+
+  it('asks the worker instance, not the URL, whether it started from rewritten bytes', async () => {
+    const { router, socket } = await connect()
+    // A service worker can restart from its script cache without re-fetching,
+    // so an earlier rewrite of this URL says nothing about this instance.
+    await socket.interceptScript('https://fixture.invalid/cached-worker.js')
+    socket.sessionsStartedFromCache.add('cached-worker')
+    socket.attach('cached-worker', 'service_worker', [{ id: 1, uniqueId: 'cached-main' }])
+    await flushProtocol()
+    expect(realms[0].info.earlyInjection).toBe(false)
+    expect(router.capabilities.workerStartupInjection).toBe('degraded')
+    expect(options.onFailure).toHaveBeenCalledWith(expect.stringContaining('was not rewritten'))
   })
 
   it('matches rewrites to workers by exact entry URL', async () => {
@@ -456,6 +488,29 @@ describe('CloakRealmRouter', () => {
     await flushProtocol()
     expect(realms[1].info.earlyInjection).toBe(true)
     expect(options.onClosed).toHaveBeenCalledExactlyOnceWith(realms[0].info.realmId)
+  })
+
+  it('keeps a service worker realm open while another session still observes it', async () => {
+    const { socket } = await connect()
+    // Chromium attaches the same service worker once per parent that auto-attaches.
+    socket.attach('sw-via-page', 'service_worker', [{ id: 7, uniqueId: 'sw-world' }],
+      false, 'page-session', 'sw-target')
+    await flushProtocol()
+    socket.attach('sw-via-browser', 'service_worker', [{ id: 7, uniqueId: 'sw-world' }],
+      false, undefined, 'sw-target')
+    await flushProtocol()
+    const realmId = realms[0].info.realmId
+    expect(realms.every(realm => realm.info.realmId === realmId)).toBe(true)
+
+    // The page goes away; the worker it spoke to is still running.
+    socket.event('Target.detachedFromTarget', { sessionId: 'sw-via-page' })
+    await flushProtocol()
+    expect(options.onClosed).not.toHaveBeenCalled()
+
+    // Only when the last view of it is gone is the realm actually closed.
+    socket.event('Target.detachedFromTarget', { sessionId: 'sw-via-browser' })
+    await flushProtocol()
+    expect(options.onClosed).toHaveBeenCalledExactlyOnceWith(realmId)
   })
 
   it('releases an idle service worker with no execution context and never polls for its revival', async () => {

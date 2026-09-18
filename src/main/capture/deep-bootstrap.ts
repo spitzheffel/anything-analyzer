@@ -40,6 +40,7 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
   const verifiers = new Map<string, (() => boolean) | null>()
   const repairs = new Map<string, () => void>()
   const installed: CaptureProducerStatus['installed'] = {}
+  const installedAtBootstrap: CaptureProducerStatus['installedAtBootstrap'] = {}
   const flushCallbacks: Array<() => void> = []
   let currentRunId = runId
   let recording = Boolean(runId)
@@ -68,7 +69,8 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
       runId: currentRunId,
       producerId,
       events,
-      status: { installed: { ...installed }, pendingEvents: queued.length, pendingBytes,
+      status: { installed: { ...installed }, installedAtBootstrap: { ...installedAtBootstrap },
+        pendingEvents: queued.length, pendingBytes,
         generatedSequence, droppedEvents, droppedThroughSequence, recording },
     }
   }
@@ -145,6 +147,9 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
         try { installed[name] = !verify || verify() ? 'installed' : 'failed' }
         catch { installed[name] = 'failed' }
       }
+      // Repairs re-enter here, so only the first verdict describes what was in
+      // place before this realm started running its own code.
+      if (!(name in installedAtBootstrap)) installedAtBootstrap[name] = installed[name]
     },
     registerFlush(flush) { flushCallbacks.push(flush) },
     registerRepair(name, repair) { repairs.set(name, repair) },

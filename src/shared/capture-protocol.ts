@@ -3,6 +3,14 @@ export const CAPTURE_PROTOCOL_VERSION = 1 as const
 export const CAPTURE_BRIDGE_NAME = '__aaReliableCapture'
 export const CAPTURE_PUSH_BINDING = '__aaReliableCapturePush'
 export const CAPTURE_WORKER_PATCH_FLAG = '__aaReliableCaptureWorkerPatch'
+/**
+ * Set by the copy of the bootstrap the router prepends to a worker's entry
+ * script, and by nothing else. Its presence in a realm is the only proof that
+ * *this* worker instance started from rewritten bytes — a service worker can
+ * start again from its script cache without re-fetching, so the URL the router
+ * rewrote earlier says nothing about what the current instance is running.
+ */
+export const CAPTURE_ENTRY_SCRIPT_FLAG = '__aaReliableCaptureEntryScript'
 
 export type CaptureRealmKind = 'document' | 'worker' | 'shared_worker' | 'service_worker'
 export type CaptureStream = 'hook' | 'interaction' | 'control'
@@ -23,8 +31,18 @@ export interface CaptureBatch {
   status: CaptureProducerStatus
 }
 
+export type CaptureHookInstallationState = 'installed' | 'failed' | 'not-applicable' | 'overwritten'
+
 export interface CaptureProducerStatus {
-  installed: Record<string, 'installed' | 'failed' | 'not-applicable' | 'overwritten'>
+  /** Live verdict, re-measured on every snapshot and revised by repairs. */
+  installed: Record<string, CaptureHookInstallationState>
+  /**
+   * The first verdict for each hook, written once when it was installed and
+   * never revised. A hook that failed at bootstrap and was repaired afterwards
+   * reads as `installed` live, but everything the realm ran in between went
+   * unhooked — only this field can tell the two apart.
+   */
+  installedAtBootstrap?: Record<string, CaptureHookInstallationState>
   pendingEvents: number
   pendingBytes: number
   generatedSequence: number
@@ -56,6 +74,7 @@ export interface CaptureRealmHealth extends CaptureRealmInfo {
   state: CaptureHealthState
   transport: 'push' | 'poll' | 'unavailable'
   installed: CaptureProducerStatus['installed']
+  installedAtBootstrap: CaptureProducerStatus['installedAtBootstrap']
   pendingEvents: number
   pendingBytes: number
   droppedEvents: number

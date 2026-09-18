@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
+import { CAPTURE_ENTRY_SCRIPT_FLAG } from '../../shared/capture-protocol'
 import type { CaptureRealmInfo, CaptureRealmKind } from '../../shared/capture-protocol'
 
 export interface CaptureRealmConnection {
@@ -95,12 +96,11 @@ interface RealmState {
  * worker loads: the router prepends the bootstrap to the response body, so the
  * bootstrap literally is the entry script's first statement.
  *
- * Coverage is therefore evidence, not intent: the router rewrote this exact
- * URL, or it did not and the realm reports a coverage gap. It is read when a
- * realm is published rather than at attach, because the two orders both occur
- * — a dedicated or shared worker's script is fetched before its target exists,
- * while `navigator.serviceWorker.register()` creates the target first and
- * fetches the script afterwards.
+ * Coverage is therefore evidence, not intent, and the evidence lives in the
+ * realm: the rewritten bytes set a marker the router reads back from the
+ * instance in front of it. Having rewritten that URL earlier is a weaker
+ * claim — a service worker can start again from its script cache without
+ * re-fetching, so a later instance may be running a copy the router never saw.
  */
 interface WorkerEntry {
   url: string
@@ -244,8 +244,6 @@ export class CloakRealmRouter {
     documentInitScript: 'unknown',
     workerStartupInjection: 'unknown'
   }
-  /** Entry-script URLs this router prepended the bootstrap to. */
-  private readonly patchedScriptUrls = new Set<string>()
   private nextCommandId = 1
   private nextGeneration = 1
   private closed = false
@@ -395,13 +393,13 @@ export class CloakRealmRouter {
       return
     }
     if (message.method === 'Target.attachedToTarget') {
-      const targetInfo = parameters.targetInfo as { type?: unknown; url?: unknown } | undefined
-      traceRouterEvent(`attached session=${String(parameters.sessionId)} type=${String(targetInfo?.type)} waiting=${String(parameters.waitingForDebugger === true)}`)
+      const targetInfo = parameters.targetInfo as { targetId?: unknown; type?: unknown; url?: unknown } | undefined
+      traceRouterEvent(`attached session=${String(parameters.sessionId)} target=${String(targetInfo?.targetId)} parent=${String(message.sessionId)} type=${String(targetInfo?.type)} waiting=${String(parameters.waitingForDebugger === true)}`)
       this.attachTarget(parameters, message.sessionId)
       return
     }
     if (message.method === 'Target.detachedFromTarget' && typeof parameters.sessionId === 'string') {
-      traceRouterEvent(`detached session=${parameters.sessionId}`)
+      traceRouterEvent(`detached session=${parameters.sessionId} target=${String(this.sessions.get(parameters.sessionId)?.targetId)} kind=${String(this.sessions.get(parameters.sessionId)?.kind)}`)
       this.closeSession(parameters.sessionId)
       return
     }
@@ -462,14 +460,16 @@ export class CloakRealmRouter {
       const original = body.base64Encoded === true
         ? Buffer.from(encoded, 'base64').toString('utf8')
         : encoded
-      const patched = `${this.options.bootstrapSource}\n;${original}`
+      // The marker rides with these bytes, so the realm that runs them can be
+      // asked directly whether it started rewritten.
+      const patched = `globalThis[${JSON.stringify(CAPTURE_ENTRY_SCRIPT_FLAG)}]=true;\n` +
+        `${this.options.bootstrapSource}\n;${original}`
       await this.sendCommand('Fetch.fulfillRequest', {
         requestId,
         responseCode: typeof parameters.responseStatusCode === 'number' ? parameters.responseStatusCode : 200,
         responseHeaders: rewrittenResponseHeaders(parameters.responseHeaders),
         body: Buffer.from(patched, 'utf8').toString('base64')
       }, sessionId)
-      this.patchedScriptUrls.add(url)
       traceRouterEvent(`rewrote entry script ${url}`)
     } catch (error) {
       // Never strand the request: an unrewritten worker still runs, and the
@@ -659,15 +659,22 @@ export class CloakRealmRouter {
 
   private async initializeContext(target: TargetSession, realm: RealmState): Promise<void> {
     let bootstrapInstalled = false
+    let entryScriptRewritten = false
     const startedWhilePaused = target.waitingForDebugger && !target.resumeStarted
     try {
-      // Workers already carry the bootstrap inside their rewritten entry
-      // script; this re-entry is idempotent and exists to bind the producer to
-      // this run before the target is released.
+      // For a worker, read the entry-script marker and install in one round
+      // trip: the marker has to be read before this re-entry installs anything,
+      // and a second evaluation would be another way for the realm to stall.
+      // The re-entry itself is idempotent; it exists to bind the producer to
+      // this run, since the bytes the worker started from carry whatever runId
+      // was current when they were rewritten.
       const bootstrapExpression = target.workerEntry
-        ? `${this.options.bootstrapSource}\n//# sourceURL=${WORKER_BOOTSTRAP_SOURCE_URL}`
+        ? `(() => { const covered = globalThis[${JSON.stringify(CAPTURE_ENTRY_SCRIPT_FLAG)}] === true;\n` +
+          `${this.options.bootstrapSource}\nreturn covered })()\n` +
+          `//# sourceURL=${WORKER_BOOTSTRAP_SOURCE_URL}`
         : this.options.bootstrapSource
-      await this.evaluateInRealm(target, realm, bootstrapExpression)
+      const evaluated = await this.evaluateInRealm<unknown>(target, realm, bootstrapExpression)
+      entryScriptRewritten = evaluated === true
       bootstrapInstalled = true
     } catch (error) {
       if (realm.active && !this.disposing && !this.closed) {
@@ -679,17 +686,17 @@ export class CloakRealmRouter {
     const injectedBeforeResume = startedWhilePaused && !target.resumeStarted
     const documentHasStartupCoverage = target.scriptIdentifier !== null &&
       (realm.createdAfterRegistration || injectedBeforeResume)
-    // A worker is covered from its first statement exactly when its entry
-    // script was rewritten — never because the attach happened to be early.
-    // Read now, not at attach: the context exists, so the script has loaded
-    // and any rewrite of it has already happened.
+    // A worker is covered from its first statement exactly when the instance
+    // in front of us started from rewritten bytes. Having rewritten that URL
+    // earlier is not the same claim: a service worker can start again from its
+    // script cache without re-fetching, so a later instance may be running a
+    // copy the router never saw.
     const entry = target.workerEntry
-    const entryScriptPatched = entry !== null && this.patchedScriptUrls.has(entry.url)
     const earlyInjection = bootstrapInstalled &&
-      (realmKind === 'document' ? documentHasStartupCoverage : entryScriptPatched)
+      (realmKind === 'document' ? documentHasStartupCoverage : entryScriptRewritten)
     if (realmKind !== 'document') {
       this.recordCapability('workerStartupInjection', earlyInjection)
-      if (!entryScriptPatched) {
+      if (!entryScriptRewritten) {
         this.reportFailure(
           `Worker entry script was not rewritten for ${target.targetId} (${entry?.url || 'unknown URL'}); ` +
           'its first statements ran without instrumentation'
@@ -777,11 +784,30 @@ export class CloakRealmRouter {
         pending.reject(new Error(`${pending.method}: capture realm ${realm.realmId} is closed`))
       }
     }
-    if (realm.reported) {
+    if (realm.reported && !this.realmObservedElsewhere(target, realm)) {
       try { this.options.onClosed(realm.realmId) } catch (error) {
         this.reportFailure(`Realm close callback failed: ${describeError(error)}`)
       }
     }
+  }
+
+  /**
+   * A worker target is attached once per parent that auto-attaches: the same
+   * target, the same execution context, and therefore the same realm id, seen
+   * through several sessions. Losing one of those views is not the realm going
+   * away — a page that closes takes its session with it while the service
+   * worker it spoke to keeps running and keeps queueing. Report a closure only
+   * when no live session can still see the realm, or the host seals a realm
+   * that is still producing and ignores everything it sends afterwards.
+   */
+  private realmObservedElsewhere(closing: TargetSession, realm: RealmState): boolean {
+    for (const other of this.sessions.values()) {
+      if (other === closing || !other.active || other.targetId !== closing.targetId) continue
+      for (const candidate of other.realms.values()) {
+        if (candidate.active && candidate.realmId === realm.realmId) return true
+      }
+    }
+    return false
   }
 
   private closeSession(sessionId: string): void {

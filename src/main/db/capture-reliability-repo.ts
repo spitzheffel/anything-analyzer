@@ -161,7 +161,14 @@ function validateBatch(batch: CaptureBatch, runId: string, realm: CaptureRealmIn
   requireValid(Buffer.byteLength(serializeCanonical(batch), 'utf8') <= MAX_BATCH_BYTES)
   const status = batch.status
   requireValid(isObject(status) && isObject(status.installed))
-  requireValid(Object.values(status.installed).every((state) => INSTALLATION_STATES.has(String(state))))
+  // installedAtBootstrap is additive and stays optional: a service worker
+  // revived from its script cache still runs the bootstrap that was rewritten
+  // into it by an earlier build, and rejecting its batches outright would lose
+  // real capture data to report a missing diagnostic field.
+  requireValid(status.installedAtBootstrap === undefined || isObject(status.installedAtBootstrap))
+  for (const map of [status.installed, status.installedAtBootstrap ?? {}]) {
+    requireValid(Object.values(map as object).every((state) => INSTALLATION_STATES.has(String(state))))
+  }
   for (const field of ['pendingEvents', 'pendingBytes', 'generatedSequence', 'droppedEvents', 'droppedThroughSequence'] as const) {
     requireValid(isCounter(status[field]))
   }

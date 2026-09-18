@@ -38,6 +38,11 @@ import {
   RequestsRepo,
   StorageSnapshotsRepo,
 } from "../../src/main/db/repositories";
+import {
+  CAPTURE_BRIDGE_NAME,
+  CAPTURE_ENTRY_SCRIPT_FLAG,
+  CAPTURE_PUSH_BINDING,
+} from "../../src/shared/capture-protocol";
 import type {
   CaptureAcceptedRecord,
   CaptureHealthSnapshot,
@@ -58,6 +63,40 @@ interface ScenarioReport {
   counts?: Record<string, number>;
 }
 
+/**
+ * Read — never write — the realm's capture state at the instant a fixture runs.
+ * A realm can report healthy to the host and still be the wrong realm, or carry
+ * a run label the host has already sealed; only the fixture itself can say which.
+ */
+const WITNESS_SOURCE = `
+  const witnessCapture = () => {
+    try {
+      const bridge = globalThis[${JSON.stringify(CAPTURE_BRIDGE_NAME)}];
+      const status = bridge && bridge.snapshot ? bridge.snapshot().status : null;
+      const isNative = (fn) => {
+        try { return /\\[native code\\]/.test(Function.prototype.toString.call(fn)); }
+        catch (error) { return null; }
+      };
+      return JSON.stringify({
+        bridge: typeof bridge,
+        runId: bridge ? String(bridge.runId) : null,
+        recording: bridge ? bridge.recording : null,
+        entryScript: globalThis[${JSON.stringify(CAPTURE_ENTRY_SCRIPT_FLAG)}] === true,
+        push: typeof globalThis[${JSON.stringify(CAPTURE_PUSH_BINDING)}],
+        seq: status ? status.generatedSequence : null,
+        pending: status ? status.pendingEvents : null,
+        dropped: status ? status.droppedEvents : null,
+        atobNative: isNative(globalThis.atob),
+        fetchNative: isNative(globalThis.fetch),
+        atobHook: status ? status.installed.atob : null,
+        fetchHook: status ? status.installed.fetch : null,
+      });
+    } catch (error) {
+      return JSON.stringify({ error: String(error) });
+    }
+  };
+`;
+
 interface ManifestEntry {
   marker: string;
   encodedMarker: string;
@@ -68,6 +107,8 @@ interface ManifestEntry {
   executions: number;
   apiRequests: number;
   observations: number;
+  /** What the realm's capture bridge looked like at the instant the fixture ran. */
+  witnesses: string[];
 }
 
 interface HookRow {
@@ -234,6 +275,7 @@ class LocalFixtures {
       executions: 1,
       apiRequests: 0,
       observations: 0,
+      witnesses: [],
     };
     this.manifest.push(entry);
     return entry;
@@ -272,12 +314,16 @@ class LocalFixtures {
   serviceWorker(label: string, boot: ManifestEntry, install?: ManifestEntry): string {
     return this.script(label, `
       const bootPromise = ${this.operation(boot)};
+      ${WITNESS_SOURCE}
       const operate = (parameters) => {
+        const witness = witnessCapture();
         const decodedMarker = atob(parameters.encodedMarker);
         if (decodedMarker !== parameters.marker) throw new Error("Synthetic parameters mismatch");
+        const afterAtob = witnessCapture();
         return Promise.all([
           fetch(parameters.apiUrl).then(response => response.json()),
-          fetch(parameters.observationUrl)
+          fetch(parameters.observationUrl + "&witness=" + encodeURIComponent(witness)
+            + "&witnessAfterAtob=" + encodeURIComponent(afterAtob))
         ]).then(([body]) => {
           if (body.fixture !== parameters.marker) throw new Error("Synthetic response mismatch");
           return true;
@@ -344,6 +390,9 @@ class LocalFixtures {
         }
         if (requestUrl.pathname === "/observed") {
           entry.observations += 1;
+          const witness = requestUrl.searchParams.get("witness");
+          const afterAtob = requestUrl.searchParams.get("witnessAfterAtob");
+          if (witness) entry.witnesses.push(afterAtob ? `${witness} -> ${afterAtob}` : witness);
           response.writeHead(204);
           response.end();
           return;
@@ -436,10 +485,12 @@ async function assertManifest(
         };
         return { fixtureOrdinal: index, kind: entry.realmKind, marker: entry.marker,
           counts: countHooks(allRows, entry), executions: entry.observations,
+          witnesses: entry.witnesses, controllerRunId: controller.runId,
           atobByRealm: byRealm("atob"), fetchByRealm: byRealm("window.fetch") };
       }),
       realms: health.realms.map(realm => ({ realmId: realm.realmId, kind: realm.kind, state: realm.state,
-        earlyInjection: realm.earlyInjection, pendingEvents: realm.pendingEvents, installed: realm.installed,
+        earlyInjection: realm.earlyInjection, pendingEvents: realm.pendingEvents,
+        installed: realm.installed, installedAtBootstrap: realm.installedAtBootstrap,
         droppedEvents: realm.droppedEvents, transport: realm.transport, reason: realm.reason })),
       gaps: health.gaps.map(gap => ({ reason: gap.reason, certainty: gap.certainty, realmId: gap.realmId })),
     }));
@@ -912,7 +963,28 @@ describe.skipIf(process.env.AA_REAL_CLOAK !== "1").sequential("real Cloak deep c
       for (const entry of strictEntries) {
         if (entry.realmKind === "service_worker") entry.executions = entry.observations;
       }
-      await assertManifest(database, firstController, strictEntries);
+      // A service worker instance that started from its script cache never ran
+      // the rewritten bytes, so its first statements are genuinely uncaptured.
+      // The contract is not that this cannot happen — it is that it can never
+      // happen silently: hold such an entry to the same rule the shared-worker
+      // path uses, a shortfall only where the realm declared a durable gap.
+      const serviceWorkerGapRealms = new Set(firstController.getHealth().gaps
+        .filter(gap => gap.certainty === "unknown-coverage" && gap.realmId !== null)
+        .map(gap => gap.realmId));
+      const uncoveredServiceRealms = new Set(firstController.getHealth().realms
+        .filter(realm => realm.kind === "service_worker" && !realm.earlyInjection)
+        .map(realm => realm.realmId));
+      const declaredServiceWorkerGap = [...uncoveredServiceRealms].some(realmId =>
+        serviceWorkerGapRealms.has(realmId)) ||
+        firstController.getHealth().gaps.some(gap => gap.reason === "worker-entry-script-unrewritten");
+      const strictlyCounted = strictEntries.filter(entry => entry.realmKind !== "service_worker"
+        || uncoveredServiceRealms.size === 0);
+      if (strictlyCounted.length !== strictEntries.length) {
+        expect(declaredServiceWorkerGap,
+          "an uninstrumented service-worker start requires a durable realm coverage gap").toBe(true);
+        expect(firstController.getHealth().workerCoverage).toBe("late-attachment");
+      }
+      await assertManifest(database, firstController, strictlyCounted);
       activePhase = "stop-and-cross-run-isolation";
       // Hold the server response explicitly; wall-clock delays cannot prove an epoch boundary.
       const pendingEntry = fixtures.createEntry("old-run-delayed-response", firstController.runId, "document", fixtures.primaryOrigin, -1);

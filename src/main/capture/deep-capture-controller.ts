@@ -145,7 +145,7 @@ export class DeepCaptureController {
         evaluate: <Value>(expression: string) => withCaptureDeadline(connection.evaluate<Value>(expression), 2000, 'Realm evaluation'),
       }, processing: null, closed: false, producerStopped: false, recoveryUntil: Date.now() + 10000, pendingPush: null,
       health: { ...connection.info, runId: this.runId, producerId: previous?.health.producerId ?? null, state: 'starting',
-        transport: 'unavailable', installed: {}, pendingEvents: 0, pendingBytes: 0,
+        transport: 'unavailable', installed: {}, installedAtBootstrap: {}, pendingEvents: 0, pendingBytes: 0,
         droppedEvents: previous?.health.droppedEvents ?? 0, lastConfirmedAt: null, reason: null },
     }
     this.realms.set(connection.info.realmId, state)
@@ -191,6 +191,7 @@ export class DeepCaptureController {
         const previousDropped = state.health.droppedEvents
         state.health.producerId = batch.producerId
         state.health.installed = batch.status.installed
+        state.health.installedAtBootstrap = batch.status.installedAtBootstrap ?? {}
         state.health.pendingEvents = batch.status.pendingEvents
         state.health.pendingBytes = batch.status.pendingBytes
         state.health.droppedEvents = Math.max(previousDropped, batch.status.droppedEvents)

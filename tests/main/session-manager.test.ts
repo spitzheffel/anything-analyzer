@@ -1442,12 +1442,13 @@ describe("SessionManager browser lifecycle", () => {
     expect(fixture.captureEngine.stop).toHaveBeenCalledOnce();
   });
 
-  it("recovers one unexpected Cloak exit but never starts a second recovery", async () => {
+  it("recovers one unexpected Cloak exit during capture but never starts a second recovery", async () => {
     const fixture = createFixture();
     const session = fixture.manager.createSession("Cloak", "cloak.test", {
       backend: "cloak",
     });
-    await fixture.manager.activateSession(session.id);
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+    await fixture.manager.startCapture(session.id, undefined, renderer as never);
     const firstContext = fixture.cloakBackend.contexts.get(session.id)!;
 
     firstContext.disconnect("first crash");
@@ -1468,7 +1469,29 @@ describe("SessionManager browser lifecycle", () => {
     expect(fixture.cloakBackend.openAttempts).toHaveLength(2);
   });
 
-  it("recovers an inactive Cloak Context once without changing active routing", async () => {
+  it("does not reopen a Cloak browser the user closed while nothing was capturing", async () => {
+    const fixture = createFixture();
+    const session = fixture.manager.createSession("Idle", "idle.test", {
+      backend: "cloak",
+    });
+    await fixture.manager.activateSession(session.id);
+    expect(fixture.cloakBackend.openAttempts).toHaveLength(1);
+
+    fixture.cloakBackend.contexts.get(session.id)!.disconnect("window closed");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Queued behind the disconnect handler, so by the time this resolves any
+    // reopening it would have started has already happened. Waiting on a
+    // status instead would sample a state the recovery passes through.
+    await fixture.manager.deactivateBrowser();
+
+    expect(fixture.cloakBackend.openAttempts).toHaveLength(1);
+    expect(fixture.coordinator.hasOpenSession(session.id)).toBe(false);
+    // And it stays available to open again deliberately.
+    await fixture.manager.focusBrowser(session.id);
+    expect(fixture.cloakBackend.openAttempts).toHaveLength(2);
+  });
+
+  it("leaves an idle Cloak Context closed when it disconnects, without changing active routing", async () => {
     const fixture = createFixture(2);
     const background = fixture.manager.createSession("Background", "background.test", {
       backend: "cloak",
@@ -1478,35 +1501,18 @@ describe("SessionManager browser lifecycle", () => {
     });
     await fixture.manager.activateSession(background.id);
     await fixture.manager.activateSession(foreground.id);
-    const originalBackgroundContext = fixture.cloakBackend.contexts.get(background.id)!;
 
-    originalBackgroundContext.disconnect("first background crash");
-    await vi.waitFor(() => {
-      expect(
-        fixture.cloakBackend.openAttempts.filter(
-          (attempt) => attempt.sessionId === background.id,
-        ),
-      ).toHaveLength(2);
-    });
+    // Nothing can tell this from the user closing that window, and with no
+    // capture in flight there is nothing reopening it would protect.
+    fixture.cloakBackend.contexts.get(background.id)!.disconnect("background window closed");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await fixture.manager.focusBrowser(foreground.id);
 
-    const recoveredBackgroundContext = fixture.cloakBackend.contexts.get(background.id)!;
-    expect(recoveredBackgroundContext).not.toBe(originalBackgroundContext);
-    expect(fixture.coordinator.getActiveSessionId()).toBe(foreground.id);
-    expect(fixture.manager.getActiveBrowserSessionId()).toBe(foreground.id);
-    expect(fixture.manager.getBrowserSessionStatus(background.id).state).toBe("ready");
-
-    recoveredBackgroundContext.disconnect("second background crash");
-    await vi.waitFor(() => {
-      expect(fixture.manager.getBrowserSessionStatus(background.id)).toMatchObject({
-        state: "error",
-        error: "CloakBrowser exited again after one automatic recovery",
-      });
-    });
     expect(
       fixture.cloakBackend.openAttempts.filter(
         (attempt) => attempt.sessionId === background.id,
       ),
-    ).toHaveLength(2);
+    ).toHaveLength(1);
     expect(fixture.coordinator.getActiveSessionId()).toBe(foreground.id);
     expect(fixture.manager.getActiveBrowserSessionId()).toBe(foreground.id);
   });
@@ -1518,7 +1524,8 @@ describe("SessionManager browser lifecycle", () => {
       "https://recovery-navigation.test/",
       { backend: "cloak", captureMode: "deep" },
     );
-    await fixture.manager.activateSession(session.id);
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+    await fixture.manager.startCapture(session.id, undefined, renderer as never);
     await fixture.manager.createBrowserTab(
       "https://recovery-navigation.test/second",
     );
@@ -1556,7 +1563,7 @@ describe("SessionManager browser lifecycle", () => {
       backend: "cloak",
     });
     const renderer = { isDestroyed: () => false, send: vi.fn() };
-    await fixture.manager.activateSession(session.id, renderer as never);
+    await fixture.manager.startCapture(session.id, undefined, renderer as never);
     const originalContext = fixture.cloakBackend.contexts.get(session.id)!;
     renderer.send.mockClear();
 
@@ -1605,7 +1612,8 @@ describe("SessionManager browser lifecycle", () => {
     const session = fixture.manager.createSession("Recovery race", "race.test", {
       backend: "cloak",
     });
-    await fixture.manager.activateSession(session.id);
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+    await fixture.manager.startCapture(session.id, undefined, renderer as never);
     const recoveryGate = deferred();
     fixture.cloakBackend.openGates.set(session.id, recoveryGate.promise);
 

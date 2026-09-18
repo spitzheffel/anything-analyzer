@@ -1632,6 +1632,24 @@ export class SessionManager {
       );
     });
     if (intentional || this.shuttingDown) return;
+    // Nothing available here tells a user closing the window from the browser
+    // dying: Playwright reports the same events in the same order for both,
+    // the Cloak wrapper exposes no process handle, and Chromium's recorded
+    // exit_type still reads "Normal" after a kill because the marker never
+    // reaches disk. So stop guessing. Reopening exists to protect a capture
+    // that is still in flight; with none, a window that went away is just a
+    // window that went away, and resurrecting it overrides the only party who
+    // could have meant it — then overwrites their saved tabs with its blank
+    // one.
+    const disconnected = this.sessionsRepo.findById(sessionId);
+    const capturing =
+      this.currentSessionId === sessionId &&
+      Boolean(disconnected) &&
+      disconnected!.status !== "stopped";
+    if (!capturing) {
+      this.crashRecoveryAttempts.delete(sessionId);
+      return;
+    }
     const wasActive = this.activeBrowserSessionId === sessionId;
     const attempts = this.crashRecoveryAttempts.get(sessionId) ?? 0;
     if (attempts >= 1) {

@@ -1215,10 +1215,28 @@ export class SessionManager {
     if (targets.length === 0) targets = [await context.createTarget()];
     await this.prepareTargetsForMode(session, targets);
 
-    if ((session.browser_backend ?? "electron") === "cloak") {
-      const savedTabs = session.browser_profile_id
-        ? this.browserTabsRepo.findByProfileId(session.browser_profile_id)
+    const backendKind = session.browser_backend ?? "electron";
+    // Restoring is for tabs that carry somewhere to go back to. A blank tab
+    // does not, and treating it as one is self-perpetuating: the browser opens
+    // on its own blank page, that page gets persisted, and every later open
+    // "restores" it and returns before the target URL is ever considered.
+    const savedTabs =
+      backendKind === "cloak" && session.browser_profile_id
+        ? this.browserTabsRepo
+            .findByProfileId(session.browser_profile_id)
+            .filter((tab) => tab.url && tab.url !== "about:blank")
         : [];
+    // A Session that opens blank instead of on its target URL leaves no trace
+    // of which input decided that, so state them all: the branch taken depends
+    // on the saved tabs, and the navigation on the URL the target reports.
+    console.info(
+      `[SessionManager] Opened ${session.id}: backend=${backendKind} ` +
+      `targets=${targets.length} savedTabs=${savedTabs.length} ` +
+      `urls=${JSON.stringify(targets.map((candidate) => candidate.url))} ` +
+      `targetUrl=${JSON.stringify(session.target_url ?? null)}`,
+    );
+
+    if (backendKind === "cloak") {
       if (savedTabs.length > 0) {
         while (targets.length < savedTabs.length) {
           const target = await context.createTarget();
@@ -1245,11 +1263,12 @@ export class SessionManager {
 
     const target =
       targets.find((candidate) => candidate.getState().isActive) ?? targets[0];
-    if (
+    const shouldNavigate = Boolean(
       target &&
       session.target_url &&
-      (!target.url || target.url === "about:blank")
-    ) {
+      (!target.url || target.url === "about:blank"),
+    );
+    if (shouldNavigate) {
       await target.navigate(session.target_url);
     }
   }

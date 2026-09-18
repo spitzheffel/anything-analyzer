@@ -948,6 +948,27 @@ describe("SessionManager browser lifecycle", () => {
     expect(cloak.browser_profile_id).toBeTruthy();
   });
 
+  it("opens a Cloak Session on its target URL rather than restoring a blank tab", async () => {
+    const fixture = createFixture();
+    const session = fixture.manager.createSession("Blank", "https://blank-restore.test", {
+      backend: "cloak",
+    });
+    const profileId = fixture.manager.getSession(session.id)!.browser_profile_id!;
+    // What the browser's own start page leaves behind once it is persisted.
+    fixture.tabs.tabs.set(profileId, [{
+      id: "stale-blank", profile_id: profileId, url: "about:blank",
+      title: "", position: 0, active: true, updated_at: 1,
+    }]);
+
+    await fixture.manager.activateSession(session.id);
+
+    const [target] = await fixture.cloakBackend.contexts.get(session.id)!.targets();
+    expect(target.url).toBe(session.target_url);
+    expect(fixture.log).toContain(
+      `navigate:${session.id}:${target.tabId}:${session.target_url}`,
+    );
+  });
+
   it("does not launch a Cloak browser when the renderer only selects the Session", async () => {
     const fixture = createFixture();
     const cloak = fixture.manager.createSession("Cloak", "cloak.test", {

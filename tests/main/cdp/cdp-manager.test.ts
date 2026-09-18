@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { CdpManager } from '../../../src/main/cdp/cdp-manager'
 import { StorageCollector } from '../../../src/main/capture/storage-collector'
 import type {
@@ -60,7 +60,7 @@ class FakeLease implements CdpLease {
 
 class FakeTransport implements CdpTransport {
   readonly targetId = 'target-1'
-  readonly commands: Array<{ owner: string; method: string }> = []
+  readonly commands: Array<{ owner: string; method: string; params: Record<string, unknown> }> = []
   readonly lifecycle: string[] = []
   closeCalls = 0
   forceCloseCalls = 0
@@ -98,10 +98,10 @@ class FakeTransport implements CdpTransport {
   async sendForLease<T>(
     lease: FakeLease,
     method: string,
-    _params: Record<string, unknown>
+    params: Record<string, unknown>
   ): Promise<T> {
     if (lease.released || !this.leases.has(lease)) throw new Error('released lease')
-    this.commands.push({ owner: lease.owner, method })
+    this.commands.push({ owner: lease.owner, method, params })
     this.lifecycle.push(`send:${lease.owner}:${method}`)
     if (method === this.failMethod) throw new Error(`failed ${method}`)
     const domainOperation = /^(Fetch|Network|Page)\.(enable|disable)$/.exec(method)
@@ -304,6 +304,119 @@ describe('CdpManager leases and capture modes', () => {
     expect(responses[0]?.responseBody).toBe('{"ok":true}')
     const methods = transport.commands.map(command => command.method)
     expect(methods.indexOf('Fetch.getResponseBody')).toBeLessThan(methods.indexOf('Fetch.disable'))
+  })
+
+  it.each([false, true])('recovers a failed Fetch body through Network, stopping=%s', async (stopDuringRecovery) => {
+    const transport = new FakeTransport()
+    const manager = new CdpManager()
+    const responses: Array<Record<string, unknown>> = []
+    manager.on('response-captured', response => responses.push(response))
+    await manager.start(createTarget(transport), 'deep')
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'fetch-script',
+      request: { method: 'GET', url: 'https://example.com/app.js', headers: {} },
+    })
+    transport.failMethod = 'Fetch.getResponseBody'
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'fetch-script',
+      networkId: 'network-script',
+      responseStatusCode: 200,
+      responseHeaders: [{ name: 'content-type', value: 'application/javascript' }],
+    })
+    await vi.waitFor(() => expect(transport.commands.some(command => command.method === 'Fetch.continueResponse')).toBe(true))
+    expect(responses).toHaveLength(0)
+
+    const stopping = stopDuringRecovery ? manager.stop() : null
+    if (stopping) {
+      transport.emit('Fetch.requestPaused', {
+        requestId: 'late-request',
+        request: { method: 'GET', url: 'https://example.com/late', headers: {} },
+      })
+      expect(transport.commands).toContainEqual(expect.objectContaining({
+        method: 'Fetch.continueRequest', params: { requestId: 'late-request' },
+      }))
+      expect(transport.commands.some(command => command.method === 'Fetch.disable')).toBe(false)
+    }
+    transport.emit('Network.loadingFinished', { requestId: 'network-script' })
+    await vi.waitFor(() => expect(responses).toHaveLength(1))
+    expect(responses[0]).toMatchObject({ responseBody: '{"ok":true}', statusCode: 200 })
+    expect(transport.commands).toContainEqual(expect.objectContaining({
+      method: 'Network.getResponseBody', params: { requestId: 'network-script' },
+    }))
+    expect(transport.commands.filter(command => command.method === 'Fetch.continueResponse')).toHaveLength(1)
+    await (stopping ?? manager.stop())
+    expect(transport.commands.findIndex(command => command.method === 'Network.getResponseBody'))
+      .toBeLessThan(transport.commands.findIndex(command => command.method === 'Fetch.disable'))
+  })
+
+  it.each(['network-read-failure', 'disconnect', 'missing-completion-event'])(
+    'finishes body recovery safely after %s',
+    async (failureKind) => {
+      vi.useFakeTimers()
+      const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+      const transport = new FakeTransport()
+      const manager = new CdpManager()
+      const responses: Array<Record<string, unknown>> = []
+      manager.on('response-captured', response => responses.push(response))
+      try {
+        await manager.start(createTarget(transport), 'deep')
+        transport.emit('Fetch.requestPaused', {
+          requestId: 'fetch-failure',
+          request: { method: 'POST', url: 'https://example.com/api?token=private', headers: {} },
+        })
+        transport.failMethod = 'Fetch.getResponseBody'
+        transport.emit('Fetch.requestPaused', {
+          requestId: 'fetch-failure',
+          networkId: 'network-failure',
+          responseStatusCode: 200,
+          responseHeaders: [{ name: 'content-type', value: 'application/json' }],
+        })
+        await vi.advanceTimersByTimeAsync(0)
+        if (failureKind === 'disconnect') {
+          transport.disconnectUnexpectedly()
+        } else if (failureKind === 'network-read-failure') {
+          transport.failMethod = 'Network.getResponseBody'
+          transport.emit('Network.loadingFinished', { requestId: 'network-failure' })
+        } else {
+          await vi.advanceTimersByTimeAsync(2000)
+        }
+        await manager.stop()
+        expect(responses).toHaveLength(1)
+        expect(transport.leaseCount).toBe(0)
+        expect(vi.getTimerCount()).toBe(0)
+        if (failureKind === 'missing-completion-event') {
+          expect(responses[0].responseBody).toBe('{"ok":true}')
+          expect(warning).not.toHaveBeenCalled()
+        } else {
+          expect(responses[0].responseBody).toBeNull()
+          expect(warning).toHaveBeenCalledWith('[CdpManager] Response body unavailable', expect.objectContaining({
+            sessionId: 'session-1', requestId: 'fetch-failure', error: expect.any(Error), recoveryError: expect.any(Error),
+          }))
+          expect(JSON.stringify(warning.mock.calls)).not.toContain('private')
+        }
+      } finally {
+        warning.mockRestore()
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it.each([
+    ['HEAD', 200], ['GET', 204], ['GET', 304], ['GET', 302],
+  ])('does not read an absent body for %s %s', async (method, statusCode) => {
+    const transport = new FakeTransport()
+    const manager = new CdpManager()
+    await manager.start(createTarget(transport), 'deep')
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'no-body', request: { method, url: 'https://example.com', headers: {} },
+    })
+    transport.emit('Fetch.requestPaused', {
+      requestId: 'no-body', responseStatusCode: statusCode,
+      responseHeaders: [{ name: 'content-type', value: 'text/html' }],
+    })
+    await manager.stop()
+    expect(transport.commands.some(command => command.method.endsWith('.getResponseBody'))).toBe(false)
+    expect(transport.commands.filter(command => command.method === 'Fetch.continueResponse')).toHaveLength(1)
   })
 
   it('deep mode never fetches the body of a streaming or upgraded response', async () => {

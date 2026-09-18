@@ -6,6 +6,7 @@ import StatusBar from './components/StatusBar'
 import SessionList from './components/SessionList'
 import BrowserPanel from './components/BrowserPanel'
 import ExternalBrowserSurface from './components/ExternalBrowserSurface'
+import CaptureHealthPanel from './components/CaptureHealthPanel'
 import TabBar from './components/TabBar'
 import AnalyzeBar from './components/AnalyzeBar'
 import SettingsModal from './components/SettingsModal'
@@ -131,7 +132,7 @@ function App(): React.ReactElement {
   /** Ref to browser placeholder for reporting exact bounds to main process */
   const placeholderRef = useRef<HTMLDivElement>(null)
 
-  const { requests, hooks, snapshots, reports, interactions, isAnalyzing, analysisError, streamingContent, streamingReasoning, startAnalysis, cancelAnalysis, chatHistory, latestContextUsage, isChatting, chatError, sendFollowUp, clearCaptureData, replaceReport } = useCapture(currentSessionId)
+  const { requests, hooks, snapshots, reports, interactions, captureHealth, isAnalyzing, analysisError, streamingContent, streamingReasoning, startAnalysis, cancelAnalysis, chatHistory, latestContextUsage, isChatting, chatError, sendFollowUp, clearCaptureData, replaceReport } = useCapture(currentSessionId)
 
   const [llmConfig, setLlmConfig] = useState<LLMProviderConfig | null>(null)
   const [defaultModel, setDefaultModel] = useState('')
@@ -570,7 +571,9 @@ function App(): React.ReactElement {
 
           {currentSession.browser_backend === 'cloak' ? (
             <ExternalBrowserSurface
+              key={currentSession.id}
               session={currentSession}
+              captureHealth={captureHealth}
               onCaptureModeChange={(mode) => setCaptureMode(currentSession.id, mode)}
             />
           ) : (
@@ -658,6 +661,13 @@ function App(): React.ReactElement {
             >
               {t('data.interactions')} <span style={inspectorTabCountStyle}>{interactions.length}</span>
             </button>
+            <button
+              style={activeTab === 'health' ? inspectorTabActiveStyle : inspectorTabStyle}
+              onClick={() => setActiveTab('health')}
+            >
+              {appLocale === 'zh' ? '抓取健康' : 'Capture health'}
+              {!!captureHealth?.gaps.length && <span style={inspectorTabCountStyle}>{captureHealth.gaps.length}</span>}
+            </button>
 
             {/* Spacer */}
             <div style={{ flex: 1 }} />
@@ -715,6 +725,15 @@ function App(): React.ReactElement {
           ) : activeTab === 'interactions' ? (
             <div style={{ flex: 1, overflow: 'hidden', padding: '0 12px' }}>
               <InteractionLog interactions={interactions} captureMode={currentSession.capture_mode} />
+            </div>
+          ) : activeTab === 'health' ? (
+            <div style={{ flex: 1, overflow: 'auto', padding: 16 }}>
+              <CaptureHealthPanel
+                key={currentSession.id}
+                sessionId={currentSession.id}
+                captureHealth={captureHealth}
+                captureMode={currentSession.capture_mode}
+              />
             </div>
           ) : null}
 
@@ -823,6 +842,7 @@ function App(): React.ReactElement {
       {/* Status bar */}
       <StatusBar
         status={currentSession?.status ?? null}
+        captureHealth={captureHealth}
         requestCount={requests.length}
         hookCount={hooks.length}
         interactionCount={interactions.length}

@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { CaptureHealthSnapshot } from "../shared/capture-protocol";
 
 // Forward JS hook messages from the target page context to the main process.
 // The hook script (injected via executeJavaScript) uses window.postMessage
@@ -73,6 +74,10 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("data:reports", sessionId),
   clearCaptureData: (sessionId: string) =>
     ipcRenderer.invoke("data:clear", sessionId),
+  getCaptureHealth: (sessionId: string) =>
+    ipcRenderer.invoke("capture:health:get", sessionId),
+  getCaptureDiagnostics: (sessionId: string) =>
+    ipcRenderer.invoke("data:diagnostics", sessionId),
 
   // AI analysis
   startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) =>
@@ -221,6 +226,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
   },
   onStorageCaptured: (callback: (data: unknown) => void) => {
     ipcRenderer.on("capture:storage", (_event, data) => callback(data));
+  },
+  onCaptureHealth: (callback: (snapshot: CaptureHealthSnapshot) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, snapshot: CaptureHealthSnapshot) => callback(snapshot);
+    ipcRenderer.on("capture:health", listener);
+    return () => ipcRenderer.removeListener("capture:health", listener);
   },
   onAnalysisProgress: (callback: (event: unknown) => void) => {
     ipcRenderer.on("ai:progress", (_event, payload) => callback(payload));

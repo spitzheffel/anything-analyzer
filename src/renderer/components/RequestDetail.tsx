@@ -109,6 +109,11 @@ const ResponseTab: React.FC<{ request: CapturedRequest }> = ({ request }) => (
       <div className={styles.metaValue}>{request.content_type ?? '--'}</div>
       <div className={styles.metaLabel}>Duration</div>
       <div className={styles.metaValue}>{request.duration_ms != null ? `${request.duration_ms} ms` : '--'}</div>
+      <div className={styles.metaLabel}>Body capture</div>
+      <div className={styles.metaValue} style={{ color: request.body_status === 'unavailable' || request.body_status === 'truncated' ? 'var(--color-warning)' : undefined }}>
+        {request.body_status ?? 'unknown (legacy record)'}
+        {request.body_error ? `: ${request.body_error}` : ''}
+      </div>
     </div>
     <div className={styles.sectionLabel}>RESPONSE BODY</div>
     <pre className={styles.codeBlock}>{formatContent(request.response_body, request.content_type)}</pre>

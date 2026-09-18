@@ -2,6 +2,7 @@ import { EventEmitter } from 'events'
 import type { WebContents } from 'electron'
 import type { CapturedRequest, JsHookRecord, StorageSnapshot } from '@shared/types'
 import type { RequestsRepo, JsHooksRepo, StorageSnapshotsRepo } from '../db/repositories'
+import type { CaptureAcceptedRecord, ResponseBodyStatus } from '@shared/capture-protocol'
 
 /**
  * CaptureEngine — Aggregates data from CDP, JS hooks, and storage collectors,
@@ -29,6 +30,16 @@ export class CaptureEngine extends EventEmitter {
     this.rendererWebContents = null
   }
 
+  notifyCommitted(data: CaptureAcceptedRecord): void {
+    if (data.record.session_id !== this.sessionId) return
+    if (data.stream === 'hook') this.sendToRenderer('capture:hook', data.record)
+    if (data.stream === 'interaction') {
+      this.sendToRenderer('interaction:recorded', {
+        ...data.record, sessionId: data.record.session_id,
+      })
+    }
+  }
+
   handleResponseCaptured(data: {
     requestId: string; method: string; url: string;
     requestHeaders: string; requestBody: string | null;
@@ -37,6 +48,8 @@ export class CaptureEngine extends EventEmitter {
     initiator: string | null; durationMs: number | null;
     isOptions: boolean; isStatic: boolean; isStreaming: boolean; isWebSocket: boolean; truncated: boolean; timestamp: number;
     source?: 'cdp' | 'proxy'
+    bodyStatus?: ResponseBodyStatus
+    bodyError?: string | null
   }): void {
     if (!this.sessionId) return
 
@@ -63,6 +76,7 @@ export class CaptureEngine extends EventEmitter {
       })
     } catch (err) {
       console.warn('[CaptureEngine] Insert failed:', (err as Error).message)
+      return
     }
 
     try {
@@ -72,9 +86,13 @@ export class CaptureEngine extends EventEmitter {
         response_body: data.responseBody,
         content_type: data.contentType, duration_ms: data.durationMs || 0,
         is_streaming: data.isStreaming ? 1 : 0,
-        is_websocket: data.isWebSocket ? 1 : 0
+        is_websocket: data.isWebSocket ? 1 : 0,
+        body_status: data.bodyStatus ?? 'unknown', body_error: data.bodyError ?? null,
       })
-    } catch { /* ignore */ }
+    } catch (error) {
+      console.warn('[CaptureEngine] Response persistence failed:', error)
+      return
+    }
 
     const captured: CapturedRequest = {
       id: uniqueId, session_id: this.sessionId, sequence,
@@ -84,7 +102,8 @@ export class CaptureEngine extends EventEmitter {
       response_body: data.responseBody, content_type: data.contentType,
       initiator: data.initiator, duration_ms: data.durationMs,
       is_streaming: data.isStreaming, is_websocket: data.isWebSocket,
-      source: data.source || 'cdp'
+      source: data.source || 'cdp',
+      body_status: data.bodyStatus ?? 'unknown', body_error: data.bodyError ?? null,
     }
     this.sendToRenderer('capture:request', captured)
   }

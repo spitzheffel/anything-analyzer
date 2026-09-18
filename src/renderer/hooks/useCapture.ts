@@ -14,6 +14,7 @@ import {
   findLatestConversationTokenUsage,
   type ConversationTokenUsage,
 } from "@shared/token-estimate";
+import type { CaptureGap, CaptureHealthSnapshot } from "@shared/capture-protocol";
 
 export interface UseCaptureState {
   requests: CapturedRequest[];
@@ -34,6 +35,7 @@ export interface UseCaptureState {
 }
 
 interface UseCaptureReturn extends UseCaptureState {
+  captureHealth: CaptureHealthSnapshot | null;
   loadData: (sessionId: string) => Promise<void>;
   clearData: () => void;
   clearCaptureData: (sessionId: string) => Promise<void>;
@@ -98,28 +100,132 @@ export function applyProgressEvent(
   }
 }
 
+export function reconcileCaptureHealth(
+  current: CaptureHealthSnapshot | null,
+  incoming: CaptureHealthSnapshot,
+  sessionId: string,
+  retiredRunIds: ReadonlySet<string> = new Set(),
+): CaptureHealthSnapshot | null {
+  if (incoming.sessionId !== sessionId) return current;
+  const previous = current?.sessionId === sessionId ? current : null;
+  if (incoming.runId !== null && retiredRunIds.has(incoming.runId)) return previous;
+  if (previous) {
+    if (previous.runId === incoming.runId && incoming.revision <= previous.revision) return previous;
+    if (previous.runId !== null && incoming.runId === null) return previous;
+  }
+
+  // Recovery changes present health, not the historical coverage of earlier runs.
+  const gaps = new Map<string, CaptureGap>();
+  for (const gap of [...(previous?.gaps ?? []), ...incoming.gaps]) {
+    const identity = JSON.stringify([gap.runId, gap.realmId, gap.startedAt, gap.reason, gap.certainty]);
+    const existing = gaps.get(identity);
+    gaps.set(identity, {
+      ...gap,
+      endedAt: gap.endedAt ?? existing?.endedAt ?? null,
+      droppedEvents: gap.droppedEvents ?? existing?.droppedEvents ?? null,
+    });
+  }
+  return { ...incoming, gaps: [...gaps.values()] };
+}
+
+export function useCaptureHealth(sessionId: string | null, refreshVersion = 0): CaptureHealthSnapshot | null {
+  const [healthState, setHealthState] = useState<{
+    snapshot: CaptureHealthSnapshot;
+    scopeVersion: number;
+    refreshVersion: number;
+  } | null>(null);
+  const scopeRef = useRef({ sessionId, version: 0 });
+  if (scopeRef.current.sessionId !== sessionId) {
+    scopeRef.current = { sessionId, version: scopeRef.current.version + 1 };
+  }
+
+  useEffect(() => {
+    setHealthState(null);
+    if (!sessionId) return;
+    const scopeVersion = scopeRef.current.version;
+    let active = true;
+    let current: CaptureHealthSnapshot | null = null;
+    let eventVersion = 0;
+    let refreshing = false;
+    const canQueryHealth = typeof window.electronAPI.getCaptureHealth === 'function';
+    const retiredRunIds = new Set<string>();
+    const isCurrentScope = () => active && scopeRef.current.version === scopeVersion;
+    const accept = (snapshot: CaptureHealthSnapshot) => {
+      if (!isCurrentScope()) return;
+      const next = reconcileCaptureHealth(current, snapshot, sessionId, retiredRunIds);
+      if (next === current) return;
+      if (current?.runId && current.runId !== next?.runId) retiredRunIds.add(current.runId);
+      current = next;
+      setHealthState(next ? { snapshot: next, scopeVersion, refreshVersion } : null);
+    };
+    const unsubscribe = window.electronAPI.onCaptureHealth?.((snapshot) => {
+      if (!isCurrentScope() || snapshot.sessionId !== sessionId) return;
+      eventVersion += 1;
+      accept(snapshot);
+    });
+    const refresh = async () => {
+      if (!isCurrentScope() || refreshing || !canQueryHealth) return;
+      refreshing = true;
+      const requestedEventVersion = eventVersion;
+      try {
+        const snapshot = await window.electronAPI.getCaptureHealth(sessionId);
+        // A push event may have established a new run while this query was in flight.
+        if (isCurrentScope() && eventVersion === requestedEventVersion) accept(snapshot);
+      } catch {
+        // Old preload mocks and unavailable historical health remain explicitly unknown.
+      } finally {
+        refreshing = false;
+      }
+    };
+    void refresh();
+    const timer = canQueryHealth ? setInterval(() => void refresh(), 2000) : null;
+    return () => {
+      active = false;
+      if (timer !== null) clearInterval(timer);
+      unsubscribe?.();
+    };
+  }, [sessionId, refreshVersion]);
+
+  return healthState?.scopeVersion === scopeRef.current.version
+    && healthState.refreshVersion === refreshVersion
+    && healthState.snapshot.sessionId === sessionId ? healthState.snapshot : null;
+}
+
 export function useCapture(sessionId: string | null): UseCaptureReturn {
   const [state, setState] = useState<UseCaptureState>(INITIAL_CAPTURE_STATE);
+  const [stateScopeVersion, setStateScopeVersion] = useState(0);
   const sessionIdRef = useRef(sessionId);
   const conversationVersionRef = useRef(0);
+  const captureDataVersionRef = useRef(0);
+  const sessionScopeVersionRef = useRef(0);
+  const [healthRefreshVersion, setHealthRefreshVersion] = useState(0);
+  const captureHealth = useCaptureHealth(sessionId, healthRefreshVersion);
 
-  // Keep ref in sync for use in callbacks
-  useEffect(() => {
+  // Invalidate callbacks before effects run, including a quick switch back to a session.
+  if (sessionIdRef.current !== sessionId) {
     sessionIdRef.current = sessionId;
     conversationVersionRef.current += 1;
-  }, [sessionId]);
+    captureDataVersionRef.current += 1;
+    sessionScopeVersionRef.current += 1;
+  }
 
   // Clear all data
   const clearData = useCallback(() => {
     conversationVersionRef.current += 1;
+    captureDataVersionRef.current += 1;
     setState(INITIAL_CAPTURE_STATE);
   }, []);
 
   // Clear all capture data from DB and reset local state
   const clearCaptureData = useCallback(async (sid: string) => {
+    const conversationVersion = conversationVersionRef.current;
+    captureDataVersionRef.current += 1;
     await window.electronAPI.clearCaptureData(sid);
+    if (sessionIdRef.current !== sid || conversationVersionRef.current !== conversationVersion) return;
     conversationVersionRef.current += 1;
+    captureDataVersionRef.current += 1;
     setState(INITIAL_CAPTURE_STATE);
+    setHealthRefreshVersion((previous) => previous + 1);
   }, []);
 
   // Select a request for detail view
@@ -130,6 +236,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
   // Load all data for a session from main process
   const loadData = useCallback(async (sid: string) => {
     const conversationVersion = conversationVersionRef.current;
+    const captureDataVersion = captureDataVersionRef.current;
     try {
       const [requests, hooks, snapshots, reports, interactions, aiRequestLogs] = await Promise.all([
         window.electronAPI.getRequests(sid),
@@ -151,7 +258,8 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
       }
 
       // Only update if session hasn't changed while loading
-      if (sessionIdRef.current === sid && conversationVersionRef.current === conversationVersion) {
+      if (sessionIdRef.current === sid && conversationVersionRef.current === conversationVersion
+        && captureDataVersionRef.current === captureDataVersion) {
         setState((prev) => ({
           ...prev,
           requests: requests.sort((a, b) => a.sequence - b.sequence),
@@ -296,10 +404,16 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
 
   // Set up IPC event listeners for real-time updates
   useEffect(() => {
+    clearData();
+    setStateScopeVersion(sessionScopeVersionRef.current);
     if (!sessionId) {
-      clearData();
       return;
     }
+    let active = true;
+    const listenerScopeVersion = sessionScopeVersionRef.current;
+    let bufferVersion = captureDataVersionRef.current;
+    const isCurrentSession = () => active && sessionIdRef.current === sessionId
+      && sessionScopeVersionRef.current === listenerScopeVersion;
 
     // Load initial data
     loadData(sessionId);
@@ -311,6 +425,14 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
     let flushTimer: ReturnType<typeof setInterval> | null = null;
 
     const flush = () => {
+      if (!isCurrentSession()) return;
+      if (bufferVersion !== captureDataVersionRef.current) {
+        requestBuffer.length = 0;
+        hookBuffer.length = 0;
+        storageBuffer.length = 0;
+        bufferVersion = captureDataVersionRef.current;
+        return;
+      }
       if (requestBuffer.length > 0 || hookBuffer.length > 0 || storageBuffer.length > 0) {
         const reqBatch = requestBuffer.splice(0);
         const hookBatch = hookBuffer.splice(0);
@@ -328,24 +450,28 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
 
     // Listen for new captured requests — buffer instead of immediate setState
     const handleRequest = (data: CapturedRequest) => {
-      if (data.session_id !== sessionIdRef.current) return;
+      if (!isCurrentSession() || data.session_id !== sessionId) return;
+      if (bufferVersion !== captureDataVersionRef.current) flush();
       requestBuffer.push(data);
     };
 
     // Listen for new hook records — buffer instead of immediate setState
     const handleHook = (data: JsHookRecord) => {
-      if (data.session_id !== sessionIdRef.current) return;
+      if (!isCurrentSession() || data.session_id !== sessionId) return;
+      if (bufferVersion !== captureDataVersionRef.current) flush();
       hookBuffer.push(data);
     };
 
     // Listen for new storage snapshots — buffer instead of immediate setState
     const handleStorage = (data: StorageSnapshot) => {
-      if (data.session_id !== sessionIdRef.current) return;
+      if (!isCurrentSession() || data.session_id !== sessionId) return;
+      if (bufferVersion !== captureDataVersionRef.current) flush();
       storageBuffer.push(data);
     };
 
     // Listen for analysis progress (typed streaming events)
     const handleAnalysisProgress = (event: AiProgressEvent) => {
+      if (!isCurrentSession()) return;
       setState((prev) => {
         if (!prev.isAnalyzing && !prev.isChatting) return prev;
         return { ...prev, ...applyProgressEvent(prev, event) };
@@ -360,10 +486,13 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
     // Listen for interaction recording events (debounced to avoid excessive DB queries)
     let interactionDebounceTimer: ReturnType<typeof setTimeout> | null = null;
     window.electronAPI.onInteractionRecorded(() => {
+      if (!isCurrentSession()) return;
       if (interactionDebounceTimer) clearTimeout(interactionDebounceTimer);
       interactionDebounceTimer = setTimeout(() => {
-        if (sessionIdRef.current) {
-          window.electronAPI.getInteractions(sessionIdRef.current).then((interactions: InteractionEvent[]) => {
+        const requestedDataVersion = captureDataVersionRef.current;
+        if (isCurrentSession()) {
+          window.electronAPI.getInteractions(sessionId).then((interactions: InteractionEvent[]) => {
+            if (!isCurrentSession() || captureDataVersionRef.current !== requestedDataVersion) return;
             setState((prev) => ({
               ...prev,
               interactions: (interactions || []).sort((a, b) => a.sequence - b.sequence),
@@ -375,9 +504,9 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
 
     // Cleanup listeners on unmount or session change
     return () => {
+      active = false;
       if (flushTimer) clearInterval(flushTimer);
       if (interactionDebounceTimer) clearTimeout(interactionDebounceTimer);
-      flush(); // flush remaining buffered items
       window.electronAPI.removeAllListeners(IPC_CHANNELS.CAPTURE_REQUEST);
       window.electronAPI.removeAllListeners(IPC_CHANNELS.CAPTURE_HOOK);
       window.electronAPI.removeAllListeners(IPC_CHANNELS.CAPTURE_STORAGE);
@@ -387,7 +516,8 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
   }, [sessionId, loadData, clearData]);
 
   return {
-    ...state,
+    ...(stateScopeVersion === sessionScopeVersionRef.current ? state : INITIAL_CAPTURE_STATE),
+    captureHealth,
     loadData,
     clearData,
     clearCaptureData,

@@ -27,7 +27,8 @@ export function migrateAddStreamingAndWebSocketFlags(db: Database.Database): voi
  * Safe to call multiple times (uses IF NOT EXISTS).
  */
 export function runMigrations(db: Database.Database): void {
-  db.exec(`
+  db.transaction(() => {
+    db.exec(`
     -- Sessions table
     CREATE TABLE IF NOT EXISTS sessions (
       id          TEXT PRIMARY KEY,
@@ -103,18 +104,71 @@ export function runMigrations(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_js_hooks_session ON js_hooks(session_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_storage_session ON storage_snapshots(session_id, timestamp);
     CREATE INDEX IF NOT EXISTS idx_reports_session ON analysis_reports(session_id);
-  `)
+    `)
 
-  // Run additional migrations
-  migrateAddStreamingAndWebSocketFlags(db)
-  migrateAddFilterTokenColumns(db)
-  migrateAddSourceColumn(db)
-  migrateAddChatMessagesTable(db)
-  migrateAddAiRequestLogsTable(db)
-  migrateBackfillAnthropicCachedInputTokens(db)
-  migrateAddInteractionEventsTable(db)
-  migrateAddBrowserPersistenceTables(db)
-  migrateAddReportArtifactColumns(db)
+    // Run additional migrations in the same atomic schema update.
+    migrateAddStreamingAndWebSocketFlags(db)
+    migrateAddFilterTokenColumns(db)
+    migrateAddSourceColumn(db)
+    migrateAddChatMessagesTable(db)
+    migrateAddAiRequestLogsTable(db)
+    migrateBackfillAnthropicCachedInputTokens(db)
+    migrateAddInteractionEventsTable(db)
+    migrateAddBrowserPersistenceTables(db)
+    migrateAddReportArtifactColumns(db)
+    migrateAddCaptureReliability(db)
+  })()
+}
+
+/** Add durable run identities, delivery receipts and honest capture history. */
+export function migrateAddCaptureReliability(db: Database.Database): void {
+  db.transaction(() => {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS capture_runs (
+        run_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+        state TEXT NOT NULL CHECK (state IN ('active', 'draining', 'stopped', 'paused', 'interrupted')),
+        started_at INTEGER NOT NULL,
+        ended_at INTEGER,
+        reason TEXT,
+        realm_bindings_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_capture_runs_session ON capture_runs(session_id, started_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_capture_runs_open_session
+        ON capture_runs(session_id) WHERE state IN ('active', 'draining');
+      CREATE TABLE IF NOT EXISTS capture_receipts (
+        run_id TEXT NOT NULL REFERENCES capture_runs(run_id) ON DELETE CASCADE,
+        realm_id TEXT NOT NULL,
+        producer_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence > 0),
+        payload_hash TEXT NOT NULL,
+        committed_at INTEGER NOT NULL,
+        PRIMARY KEY (run_id, realm_id, producer_id, sequence)
+      );
+      CREATE TABLE IF NOT EXISTS capture_health (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        snapshot_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `)
+
+    const additionalColumns: Record<string, Record<string, string>> = {
+      requests: { body_status: "TEXT DEFAULT 'unknown'", body_error: 'TEXT' },
+      js_hooks: { run_id: 'TEXT', realm_id: 'TEXT', producer_sequence: 'INTEGER' },
+      interaction_events: { run_id: 'TEXT', realm_id: 'TEXT', producer_sequence: 'INTEGER' },
+    }
+    for (const [tableName, columnDefinitions] of Object.entries(additionalColumns)) {
+      const existingColumns = new Set(
+        (db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>)
+          .map((column) => column.name),
+      )
+      for (const [columnName, definition] of Object.entries(columnDefinitions)) {
+        if (!existingColumns.has(columnName)) {
+          db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`)
+        }
+      }
+    }
+  })()
 }
 
 /**

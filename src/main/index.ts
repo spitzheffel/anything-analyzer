@@ -23,6 +23,7 @@ import {
   BrowserTabsRepo,
 } from "./db/repositories";
 import { CaptureEngine } from "./capture/capture-engine";
+import { CaptureReliabilityRepo } from "./db/capture-reliability-repo";
 import { SessionManager } from "./session/session-manager";
 import { AiAnalyzer } from "./ai/ai-analyzer";
 import { WindowManager } from "./window";
@@ -171,6 +172,8 @@ app.whenReady().then(async () => {
     jsHooksRepo,
     storageSnapshotsRepo,
   );
+  const captureReliabilityRepo = new CaptureReliabilityRepo(db);
+  captureReliabilityRepo.recoverInterruptedRuns();
 
   // Initialize session manager
   const sessionManager = new SessionManager(
@@ -183,6 +186,7 @@ app.whenReady().then(async () => {
     browserProfilesRepo,
     browserTabsRepo,
     cloakRuntime,
+    captureReliabilityRepo,
   );
   sessionManagerRef = sessionManager;
 
@@ -198,6 +202,7 @@ app.whenReady().then(async () => {
     reportsRepo,
     aiRequestLogRepo,
     interactionEventsRepo,
+    sessionId => sessionManager.getCaptureHealth(sessionId),
   );
 
   // Apply proxy config from saved settings (before IPC handlers)

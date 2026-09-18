@@ -12,8 +12,10 @@
  */
 
 import type { AiProgressEvent } from "./ai-progress";
+import type { CaptureHealthSnapshot, ResponseBodyStatus } from "./capture-protocol";
 
 export type { AiProgressEvent } from "./ai-progress";
+export type { CaptureHealthSnapshot, ResponseBodyStatus } from "./capture-protocol";
 
 // ---- Session ----
 
@@ -174,6 +176,9 @@ export interface CapturedRequest {
   is_streaming: boolean; // 用于识别 SSE（Server-Sent Events）响应，Content-Type 为 text/event-stream 时为 true
   is_websocket: boolean; // 用于标记 WebSocket 升级请求，Upgrade 头为 websocket 时为 true
   source?: 'cdp' | 'proxy';
+  /** Missing on legacy rows; never infer that a missing body was captured. */
+  body_status?: ResponseBodyStatus;
+  body_error?: string | null;
 }
 
 // ---- JS Hook Record ----
@@ -190,6 +195,59 @@ export interface JsHookRecord {
   result: string | null; // JSON
   call_stack: string | null;
   related_request_id: string | null;
+  run_id?: string | null;
+  realm_id?: string | null;
+  producer_sequence?: number | null;
+}
+
+/** Synthetic, metadata-only diagnostics. Existing raw-data query arrays stay unchanged. */
+export interface CaptureDiagnosticsBundle {
+  schemaVersion: 1;
+  protocolVersion: 1;
+  exportedAt: number;
+  privacy: {
+    payloadsIncluded: false;
+    urlsIncluded: false;
+    freeTextReasonsIncluded: false;
+  };
+  session: {
+    id: string;
+    browserBackend: BrowserBackendKind;
+    captureMode: CaptureMode;
+    status: SessionStatus;
+  };
+  health: CaptureHealthSnapshot;
+  counts: {
+    requests: number;
+    hooks: number;
+    storageSnapshots: number;
+    interactions: number;
+  };
+  requests: Array<{
+    id: string;
+    sequence: number;
+    timestamp: number;
+    statusCode: number | null;
+    source: 'cdp' | 'proxy' | 'unknown';
+    bodyStatus: ResponseBodyStatus;
+    bodyErrorPresent: boolean;
+  }>;
+  hooks: Array<{
+    id: number;
+    timestamp: number;
+    hookType: HookType;
+    runId: string | null;
+    realmId: string | null;
+    producerSequence: number | null;
+  }>;
+  interactions: Array<{
+    id: number;
+    sequence: number;
+    timestamp: number;
+    runId: string | null;
+    realmId: string | null;
+    producerSequence: number | null;
+  }>;
 }
 
 // ---- Storage Snapshot ----
@@ -532,6 +590,9 @@ export interface InteractionEvent {
   sequence: number;
   type: InteractionType;
   timestamp: number;
+  run_id?: string | null;
+  realm_id?: string | null;
+  producer_sequence?: number | null;
   // Position
   x: number | null;
   y: number | null;
@@ -702,6 +763,7 @@ export const IPC_CHANNELS = {
   DATA_STORAGE: "data:storage",
   DATA_CLEAR: "data:clear",
   DATA_EXPORT_REQUESTS: "data:exportRequests",
+  DATA_DIAGNOSTICS: "data:diagnostics",
 
   // AI Request Log
   DATA_AI_LOGS: "data:aiRequestLogs",
@@ -736,6 +798,8 @@ export const IPC_CHANNELS = {
   CAPTURE_REQUEST: "capture:request",
   CAPTURE_HOOK: "capture:hook",
   CAPTURE_STORAGE: "capture:storage",
+  CAPTURE_HEALTH: "capture:health",
+  CAPTURE_HEALTH_GET: "capture:health:get",
 
   // Update
   APP_VERSION: "app:version",
@@ -817,6 +881,8 @@ export interface ElectronAPI {
   getStorage: (sessionId: string) => Promise<StorageSnapshot[]>;
   getReports: (sessionId: string) => Promise<AnalysisReport[]>;
   clearCaptureData: (sessionId: string) => Promise<void>;
+  getCaptureHealth: (sessionId: string) => Promise<CaptureHealthSnapshot>;
+  getCaptureDiagnostics: (sessionId: string) => Promise<CaptureDiagnosticsBundle>;
 
   startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) => Promise<AnalysisReport>;
   cancelAnalysis: (sessionId: string) => Promise<void>;
@@ -853,6 +919,7 @@ export interface ElectronAPI {
   onRequestCaptured: (callback: (data: CapturedRequest) => void) => void;
   onHookCaptured: (callback: (data: JsHookRecord) => void) => void;
   onStorageCaptured: (callback: (data: StorageSnapshot) => void) => void;
+  onCaptureHealth: (callback: (snapshot: CaptureHealthSnapshot) => void) => () => void;
   onAnalysisProgress: (callback: (event: AiProgressEvent) => void) => void;
   removeAllListeners: (channel: string) => void;
 

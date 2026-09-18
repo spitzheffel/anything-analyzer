@@ -1,4 +1,5 @@
 import type { CapturedRequest } from "./types";
+import type { CaptureHealthSnapshot, ResponseBodyStatus } from './capture-protocol';
 
 /**
  * HAR 1.2 导出（纯函数）。自定义字段按规范以 `_` 前缀标注：
@@ -49,6 +50,8 @@ export interface HarEntry {
   _streaming: boolean;
   _websocket: boolean;
   _source?: string;
+  _bodyStatus?: ResponseBodyStatus;
+  _bodyError?: string | null;
 }
 
 export interface HarLog {
@@ -57,6 +60,7 @@ export interface HarLog {
     creator: { name: string; version: string };
     comment?: string;
     entries: HarEntry[];
+    _captureHealth?: { state: CaptureHealthSnapshot['state']; workerCoverage: CaptureHealthSnapshot['workerCoverage']; gapCount: number; knownDroppedEvents: number };
   };
 }
 
@@ -64,6 +68,7 @@ export interface HarSessionMeta {
   name?: string;
   targetUrl?: string;
   appVersion?: string;
+  captureHealth?: CaptureHealthSnapshot | null;
 }
 
 function parseHeaderRecord(json: string | null | undefined): Record<string, string> {
@@ -210,6 +215,9 @@ export function toHarEntry(request: CapturedRequest): HarEntry {
     };
   }
   if (request.source) entry._source = request.source;
+  const quality = request as CapturedRequest & { body_status?: ResponseBodyStatus; body_error?: string | null };
+  if (quality.body_status) entry._bodyStatus = quality.body_status;
+  if (quality.body_error) entry._bodyError = quality.body_error;
   return entry;
 }
 
@@ -222,6 +230,12 @@ export function buildHar(requests: CapturedRequest[], meta: HarSessionMeta = {})
       creator: { name: "Anything Analyzer", version: meta.appVersion ?? "unknown" },
       ...(commentParts.length > 0 ? { comment: commentParts.join("; ") } : {}),
       entries: sorted.map(toHarEntry),
+      ...(meta.captureHealth ? { _captureHealth: {
+        state: meta.captureHealth.state,
+        workerCoverage: meta.captureHealth.workerCoverage,
+        gapCount: meta.captureHealth.gaps.length,
+        knownDroppedEvents: meta.captureHealth.gaps.reduce((total, gap) => total + (gap.droppedEvents ?? 0), 0),
+      } } : {}),
     },
   };
 }

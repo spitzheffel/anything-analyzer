@@ -34,6 +34,11 @@ import type {
   Session,
   SessionBrowserConfig,
 } from "../../src/shared/types";
+import type {
+  CaptureAcceptedRecord,
+  CaptureHealthSnapshot,
+} from "../../src/shared/capture-protocol";
+import type { CaptureReliabilityRepo } from "../../src/main/db/capture-reliability-repo";
 
 const electronMocks = vi.hoisted(() => ({
   on: vi.fn(),
@@ -46,6 +51,21 @@ const captureMocks = vi.hoisted(() => ({
   cdpOn: vi.fn(),
   storageStart: vi.fn(),
   storageStop: vi.fn(),
+  operationLog: [] as string[],
+}));
+
+interface DeepCaptureMockInstance {
+  instanceId: number;
+  runId: string;
+  start(userDataDir: string | null): Promise<void>;
+  stop(state?: "stopped" | "paused"): Promise<void>;
+  getHealth(): CaptureHealthSnapshot;
+  setNetworkState(state: CaptureHealthSnapshot["network"]): void;
+  emitRecord(record: CaptureAcceptedRecord): void;
+}
+
+const deepCaptureMocks = vi.hoisted(() => ({
+  instances: [] as DeepCaptureMockInstance[],
 }));
 
 vi.mock("electron", () => ({
@@ -59,6 +79,7 @@ vi.mock("../../src/main/cdp/cdp-manager", () => ({
   CdpManager: class {
     async start(target: BrowserTarget, mode: string): Promise<void> {
       await captureMocks.cdpStart(target, mode);
+      captureMocks.operationLog.push(`cdp:start:${target.tabId}`);
     }
 
     on(event: string, listener: (...args: unknown[]) => void): this {
@@ -68,6 +89,7 @@ vi.mock("../../src/main/cdp/cdp-manager", () => ({
 
     async stop(): Promise<void> {
       await captureMocks.cdpStop();
+      captureMocks.operationLog.push("cdp:stop");
     }
   },
 }));
@@ -76,6 +98,7 @@ vi.mock("../../src/main/capture/storage-collector", () => ({
   StorageCollector: class {
     async start(sessionId: string, target: BrowserTarget): Promise<void> {
       await captureMocks.storageStart(sessionId, target);
+      captureMocks.operationLog.push(`storage:start:${target.tabId}`);
     }
 
     on(): this {
@@ -86,6 +109,71 @@ vi.mock("../../src/main/capture/storage-collector", () => ({
 
     async stop(): Promise<void> {
       await captureMocks.storageStop();
+      captureMocks.operationLog.push("storage:stop");
+    }
+  },
+}));
+
+vi.mock("../../src/main/capture/deep-capture-controller", () => ({
+  DeepCaptureController: class {
+    readonly instanceId: number;
+    readonly runId: string;
+    private readonly onRecord: (record: CaptureAcceptedRecord) => void;
+    private readonly onHealth: (snapshot: CaptureHealthSnapshot) => void;
+    private health: CaptureHealthSnapshot;
+
+    constructor(
+      context: BrowserContext,
+      _repository: CaptureReliabilityRepo,
+      onRecord: (record: CaptureAcceptedRecord) => void,
+      onHealth: (snapshot: CaptureHealthSnapshot) => void,
+    ) {
+      this.instanceId = deepCaptureMocks.instances.length + 1;
+      this.runId = `reliable-run-${this.instanceId}`;
+      this.onRecord = onRecord;
+      this.onHealth = onHealth;
+      this.health = {
+        sessionId: context.sessionId,
+        runId: this.runId,
+        revision: 0,
+        state: "starting",
+        network: "unknown",
+        workerCoverage: "unknown",
+        realms: [],
+        gaps: [],
+        persistenceError: null,
+      };
+      deepCaptureMocks.instances.push(this as unknown as DeepCaptureMockInstance);
+    }
+
+    getHealth(): CaptureHealthSnapshot {
+      return structuredClone(this.health);
+    }
+
+    async start(userDataDir: string | null): Promise<void> {
+      captureMocks.operationLog.push(`reliable:start:${this.runId}:${userDataDir}`);
+      this.health.state = "degraded";
+      this.health.revision += 1;
+      this.onHealth(this.getHealth());
+    }
+
+    setNetworkState(state: CaptureHealthSnapshot["network"]): void {
+      captureMocks.operationLog.push(`reliable:network:${state}`);
+      this.health.network = state;
+      this.health.revision += 1;
+      this.onHealth(this.getHealth());
+    }
+
+    async stop(state: "stopped" | "paused" = "stopped"): Promise<void> {
+      captureMocks.operationLog.push(`reliable:stop:${this.runId}:${state}`);
+      this.health.state = state;
+      this.health.network = "stopped";
+      this.health.revision += 1;
+      this.onHealth(this.getHealth());
+    }
+
+    emitRecord(record: CaptureAcceptedRecord): void {
+      this.onRecord(record);
     }
   },
 }));
@@ -629,9 +717,14 @@ interface Fixture {
   captureEngine: {
     start: ReturnType<typeof vi.fn>;
     stop: ReturnType<typeof vi.fn>;
+    notifyCommitted: ReturnType<typeof vi.fn>;
     handleResponseCaptured: ReturnType<typeof vi.fn>;
     handleStorageCollected: ReturnType<typeof vi.fn>;
   };
+  captureReliabilityRepo: {
+    getHealth: ReturnType<typeof vi.fn>;
+    clearSession: ReturnType<typeof vi.fn>;
+  } | undefined;
   cloakCheck: ReturnType<typeof vi.fn>;
   log: string[];
 }
@@ -644,9 +737,11 @@ function createFixture(
     registerCloak?: boolean;
     provideCloakRuntime?: boolean;
     withInteractionRecorder?: boolean;
+    reliableCapture?: boolean;
   } = {},
 ): Fixture {
   const log: string[] = [];
+  captureMocks.operationLog = log;
   const configs = new MemoryBrowserConfigRepo();
   const profiles = new MemoryProfilesRepo();
   const tabs = new MemoryTabsRepo(log);
@@ -688,13 +783,36 @@ function createFixture(
           lastUsedAt: context.lastUsedAt,
           closed: false,
         })),
+    getContext: (sessionId: string) => {
+      const context = cloakBackend.getContext(sessionId);
+      return context ? { userDataDir: `profiles/${sessionId}` } : null;
+    },
   } as unknown as CloakRuntime;
   const captureEngine = {
     start: vi.fn(),
     stop: vi.fn(),
+    notifyCommitted: vi.fn(),
     handleResponseCaptured: vi.fn(),
     handleStorageCollected: vi.fn(),
   };
+  const captureReliabilityRepo = options.reliableCapture
+    ? {
+        getHealth: vi.fn((sessionId: string): CaptureHealthSnapshot => ({
+          sessionId,
+          runId: null,
+          revision: 0,
+          state: "unknown",
+          network: "unknown",
+          workerCoverage: "unknown",
+          realms: [],
+          gaps: [],
+          persistenceError: null,
+        })),
+        clearSession: vi.fn((sessionId: string) => {
+          log.push(`reliability:clear:${sessionId}`);
+        }),
+      }
+    : undefined;
   const interactionEventsRepo = options.withInteractionRecorder
     ? {
         getNextSequence: vi.fn(() => 1),
@@ -713,6 +831,7 @@ function createFixture(
     (options.provideCloakRuntime ?? options.registerCloak !== false)
       ? cloakRuntime
       : undefined,
+    captureReliabilityRepo as unknown as CaptureReliabilityRepo,
   );
   managers.push(manager);
   return {
@@ -726,6 +845,7 @@ function createFixture(
     cloakBackend,
     cloakRuntime,
     captureEngine,
+    captureReliabilityRepo,
     cloakCheck,
     log,
   };
@@ -733,6 +853,12 @@ function createFixture(
 
 async function settleBrowserEvents(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 10));
+}
+
+function responseCaptureListeners(): Array<(data: unknown) => void> {
+  return captureMocks.cdpOn.mock.calls
+    .filter((call) => call[0] === "response-captured")
+    .map((call) => call[1] as (data: unknown) => void);
 }
 
 function deferred(): { promise: Promise<void>; resolve(): void } {
@@ -781,6 +907,8 @@ beforeEach(() => {
   captureMocks.cdpOn.mockReset();
   captureMocks.storageStart.mockReset();
   captureMocks.storageStop.mockReset();
+  captureMocks.operationLog = [];
+  deepCaptureMocks.instances.length = 0;
 });
 
 afterEach(async () => {
@@ -1796,6 +1924,194 @@ describe("SessionManager browser lifecycle", () => {
 
     expect(interactionRecorderSessionId(fixture.manager)).toBe(foreground.id);
     expect(interactionRecorderIsRecording(fixture.manager)).toBe(true);
+  });
+});
+
+describe("SessionManager reliable Cloak capture", () => {
+  it("keeps reliable deep capture running when startup is degraded", async () => {
+    const fixture = createFixture(2, { reliableCapture: true });
+    fixture.cloakBackend.initialInitScriptError = new Error("legacy init failed");
+    const session = fixture.manager.createSession("Reliable", "reliable.test", {
+      backend: "cloak",
+      captureMode: "deep",
+    });
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+
+    await expect(
+      fixture.manager.startCapture(session.id, undefined, renderer as never),
+    ).resolves.toBeUndefined();
+
+    const context = fixture.cloakBackend.contexts.get(session.id)!;
+    const [target] = await context.targets() as FakeTarget[];
+    expect(deepCaptureMocks.instances).toHaveLength(1);
+    expect(deepCaptureMocks.instances[0].runId).toBe("reliable-run-1");
+    expect(fixture.log).toContain(
+      `reliable:start:reliable-run-1:profiles/${session.id}`,
+    );
+    expect(target.addInitScript).not.toHaveBeenCalled();
+    expect(target.exposeBinding).not.toHaveBeenCalled();
+    expect(attachedCaptureCount(fixture.manager)).toBe(1);
+    expect(fixture.manager.getCaptureHealth(session.id)).toMatchObject({
+      runId: "reliable-run-1",
+      state: "degraded",
+      network: "running",
+    });
+
+    const committedRecord: CaptureAcceptedRecord = {
+      stream: "hook",
+      record: { hookType: "fetch" },
+    };
+    deepCaptureMocks.instances[0].emitRecord(committedRecord);
+    expect(fixture.captureEngine.notifyCommitted).toHaveBeenCalledWith(committedRecord);
+  });
+
+  it("starts network capture before navigating a new reliable target and tolerates storage failure", async () => {
+    const fixture = createFixture(2, { reliableCapture: true });
+    captureMocks.storageStart.mockRejectedValueOnce(new Error("storage unavailable"));
+    const session = fixture.manager.createSession("Network", "https://network.test", {
+      backend: "cloak",
+      captureMode: "deep",
+    });
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+
+    await expect(
+      fixture.manager.startCapture(session.id, undefined, renderer as never),
+    ).resolves.toBeUndefined();
+
+    const context = fixture.cloakBackend.contexts.get(session.id)!;
+    const [target] = await context.targets() as FakeTarget[];
+    const networkStartIndex = fixture.log.indexOf(`cdp:start:${target.tabId}`);
+    const navigationIndex = fixture.log.indexOf(
+      `navigate:${session.id}:${target.tabId}:https://network.test`,
+    );
+    expect(networkStartIndex).toBeGreaterThanOrEqual(0);
+    expect(navigationIndex).toBeGreaterThanOrEqual(0);
+    expect(networkStartIndex).toBeLessThan(navigationIndex);
+    expect(captureMocks.cdpStart).toHaveBeenCalledOnce();
+    expect(captureMocks.cdpStop).not.toHaveBeenCalled();
+    expect(attachedCaptureCount(fixture.manager)).toBe(1);
+    expect(fixture.manager.getCaptureHealth(session.id)).toMatchObject({
+      network: "running",
+      state: "degraded",
+    });
+  });
+
+  it("drains reliable capture before CDP stop and rejects callbacks from an old epoch", async () => {
+    const fixture = createFixture(2, { reliableCapture: true });
+    const session = fixture.manager.createSession("Epoch", "epoch.test", {
+      backend: "cloak",
+      captureMode: "deep",
+    });
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+
+    await fixture.manager.startCapture(session.id, undefined, renderer as never);
+    const firstController = deepCaptureMocks.instances[0];
+    const [oldResponseListener] = responseCaptureListeners();
+    expect(oldResponseListener).toBeTypeOf("function");
+
+    await fixture.manager.pauseCapture(session.id);
+
+    const stopIndex = fixture.log.indexOf(`reliable:stop:${firstController.runId}:paused`);
+    const storageStopIndex = fixture.log.indexOf("storage:stop");
+    const cdpStopIndex = fixture.log.indexOf("cdp:stop");
+    expect(stopIndex).toBeGreaterThanOrEqual(0);
+    expect(stopIndex).toBeLessThan(storageStopIndex);
+    expect(storageStopIndex).toBeLessThan(cdpStopIndex);
+    expect(firstController.getHealth()).toMatchObject({
+      state: "paused",
+      network: "stopped",
+    });
+
+    await fixture.manager.resumeCapture(session.id);
+    const controllers = deepCaptureMocks.instances;
+    expect(controllers).toHaveLength(2);
+    expect(controllers[1].runId).not.toBe(firstController.runId);
+    const [newResponseListener] = responseCaptureListeners().slice(-1);
+    expect(newResponseListener).toBeTypeOf("function");
+
+    const oldResponse = { requestId: "old-epoch" };
+    oldResponseListener!(oldResponse);
+    expect(fixture.captureEngine.handleResponseCaptured).not.toHaveBeenCalled();
+
+    const newResponse = { requestId: "new-epoch" };
+    newResponseListener!(newResponse);
+    expect(fixture.captureEngine.handleResponseCaptured).toHaveBeenCalledWith(newResponse);
+  });
+
+  it("seals and replaces reliable runs when clearing capture data", async () => {
+    const fixture = createFixture(2, { reliableCapture: true });
+    const session = fixture.manager.createSession("Clear", "clear.test", {
+      backend: "cloak",
+      captureMode: "deep",
+    });
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+
+    await fixture.manager.startCapture(session.id, undefined, renderer as never);
+    const firstController = deepCaptureMocks.instances[0];
+    await fixture.manager.withCaptureDataClear(
+      session.id,
+      () => fixture.log.push("capture-data:clear"),
+    );
+
+    expect(deepCaptureMocks.instances).toHaveLength(2);
+    expect(firstController.getHealth().state).toBe("paused");
+    expect(fixture.captureReliabilityRepo!.clearSession).toHaveBeenCalledWith(session.id);
+    const oldRunStopIndex = fixture.log.indexOf(
+      `reliable:stop:${firstController.runId}:paused`,
+    );
+    const reliabilityClearIndex = fixture.log.indexOf(`reliability:clear:${session.id}`);
+    expect(oldRunStopIndex).toBeLessThan(reliabilityClearIndex);
+    expect(fixture.log.indexOf("capture-data:clear")).toBeLessThan(reliabilityClearIndex);
+    const replacementStartIndex = fixture.log.findIndex((entry) =>
+      entry.startsWith("reliable:start:reliable-run-2:"),
+    );
+    expect(fixture.log.indexOf("capture-data:clear"))
+      .toBeLessThan(replacementStartIndex);
+  });
+
+  it("keeps reliability history when clearing interaction data selectively", async () => {
+    const fixture = createFixture(2, { reliableCapture: true });
+    const session = fixture.manager.createSession("Interaction clear", "interaction.test", {
+      backend: "cloak",
+      captureMode: "deep",
+    });
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+
+    await fixture.manager.startCapture(session.id, undefined, renderer as never);
+    await fixture.manager.withCaptureDataClear(session.id, () => undefined, false);
+
+    expect(fixture.captureReliabilityRepo!.clearSession).not.toHaveBeenCalled();
+    expect(deepCaptureMocks.instances).toHaveLength(2);
+    expect(fixture.manager.getCaptureHealth(session.id)).toMatchObject({
+      state: "degraded",
+      network: "running",
+    });
+  });
+
+  it("attaches reliable capture to pages already present in a warm context", async () => {
+    const fixture = createFixture(2, { reliableCapture: true });
+    const session = fixture.manager.createSession("Warm", "warm.test", {
+      backend: "cloak",
+      captureMode: "deep",
+    });
+    const renderer = { isDestroyed: () => false, send: vi.fn() };
+    await fixture.manager.activateSession(session.id);
+    const context = fixture.cloakBackend.contexts.get(session.id)!;
+    const warmTarget = await context.createTarget("https://already-open.test");
+    await settleBrowserEvents();
+    fixture.log.length = 0;
+
+    await fixture.manager.startCapture(session.id, undefined, renderer as never);
+
+    expect(deepCaptureMocks.instances).toHaveLength(1);
+    expect(captureMocks.cdpStart).toHaveBeenCalledWith(warmTarget, "deep");
+    expect(fixture.log).not.toContain(
+      `navigate:${session.id}:${warmTarget.tabId}:warm.test`,
+    );
+    expect(fixture.log).not.toContain(
+      `init-script:${session.id}:${warmTarget.tabId}`,
+    );
+    expect(attachedCaptureCount(fixture.manager)).toBe(2);
   });
 });
 

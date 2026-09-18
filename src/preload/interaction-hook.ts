@@ -3,8 +3,22 @@
  * Records clicks, inputs, scrolls, and mouse movement for AI automation replay.
  */
 ;(function () {
+  if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return
+
+  interface CaptureBridge {
+    enqueue(stream: 'hook' | 'interaction' | 'control', payload: Record<string, unknown>): void
+    registerFlush(callback: () => void): void
+    readonly recording: boolean
+  }
+
+  const realm = globalThis as typeof globalThis & { __aaReliableCapture?: CaptureBridge }
+  const capture = realm.__aaReliableCapture
   const MSG_TYPE = 'ar-interaction'
-  let isRecording = false
+  let legacyRecording = false
+
+  function isRecording(): boolean {
+    try { return capture ? capture.recording : legacyRecording } catch { return false }
+  }
 
   // Mouse move sampling config
   const MOVE_SAMPLE_INTERVAL = 50    // ms between samples
@@ -19,21 +33,27 @@
   let moveFlushTimer: ReturnType<typeof setTimeout> | null = null
 
   // Input debounce
-  const inputTimers = new WeakMap<Element, ReturnType<typeof setTimeout>>()
+  const inputTimers = new Map<Element, ReturnType<typeof setTimeout>>()
 
   // Control: main process toggles recording via executeJavaScript
-  window.addEventListener('message', (e) => {
-    if (e.data?.type === 'ar-interaction-control') {
-      isRecording = e.data.recording
-      if (!isRecording) {
-        flushMoveBuffer()
+  if (typeof realm.addEventListener === 'function') {
+    realm.addEventListener('message', (event: MessageEvent) => {
+      if (!capture && event.data?.type === 'ar-interaction-control') {
+        if (!event.data.recording) flushPendingInteractions()
+        legacyRecording = Boolean(event.data.recording)
       }
-    }
-  })
+    })
+  }
+
+  // The controller invokes this while recording is still enabled.
+  try { capture?.registerFlush(flushPendingInteractions) } catch { /* legacy controls still work */ }
 
   function send(data: Record<string, unknown>): void {
+    if (!isRecording()) return
     try {
-      window.postMessage({ type: MSG_TYPE, ...data }, '*')
+      const payload = { type: MSG_TYPE, ...data }
+      if (capture) capture.enqueue('interaction', payload)
+      else if (typeof window !== 'undefined') window.postMessage(payload, '*')
     } catch { /* ignore serialization errors */ }
   }
 
@@ -119,7 +139,7 @@
       'data-testid', 'data-id', 'data-action', 'value', 'title', 'alt']
     for (const key of keys) {
       const val = el.getAttribute(key)
-      if (val) attrs[key] = val.slice(0, 200) // truncate long values
+      if (val) attrs[key] = key === 'value' && isSensitiveInput(el) ? '[MASKED]' : val.slice(0, 200)
     }
     return attrs
   }
@@ -143,7 +163,7 @@
 
   // Click
   document.addEventListener('click', (e: MouseEvent) => {
-    if (!isRecording) return
+    if (!isRecording()) return
     const el = getActionElement(e.target)
     if (!el) return
     send({
@@ -166,7 +186,7 @@
 
   // Double click
   document.addEventListener('dblclick', (e: MouseEvent) => {
-    if (!isRecording) return
+    if (!isRecording()) return
     const el = getActionElement(e.target)
     if (!el) return
     send({
@@ -189,46 +209,57 @@
 
   // Input (debounced — record final value after 500ms idle)
   document.addEventListener('input', (e: Event) => {
-    if (!isRecording) return
+    if (!isRecording()) return
     const el = e.target as HTMLInputElement | HTMLTextAreaElement
-    if (!el || !('value' in el)) return
+    if (!(el instanceof Element) || !('value' in el)) return
 
     // Clear previous timer for this element
     const prev = inputTimers.get(el)
-    if (prev) clearTimeout(prev)
+    if (prev !== undefined) clearTimeout(prev)
 
     const timer = setTimeout(() => {
-      const isSensitive = el.type === 'password' || el.getAttribute('autocomplete')?.includes('password')
-      send({
-        interactionType: 'input',
-        timestamp: Date.now(),
-        selector: getSelector(el),
-        xpath: getXPath(el),
-        tagName: el.tagName.toLowerCase(),
-        elementText: null,
-        attributes: getAttributes(el),
-        boundingRect: el.getBoundingClientRect().toJSON(),
-        inputValue: isSensitive ? '[MASKED]' : el.value,
-        url: location.href,
-        pageTitle: document.title,
-      })
+      if (inputTimers.get(el) !== timer) return
       inputTimers.delete(el)
+      if (isRecording()) emitInput(el)
     }, 500)
     inputTimers.set(el, timer)
   }, true)
+
+  function isSensitiveInput(element: Element): boolean {
+    return (element as HTMLInputElement).type === 'password'
+      || element.getAttribute('type') === 'password'
+      || Boolean(element.getAttribute('autocomplete')?.includes('password'))
+  }
+
+  function emitInput(element: HTMLInputElement | HTMLTextAreaElement): void {
+    if (!isRecording()) return
+    send({
+      interactionType: 'input',
+      timestamp: Date.now(),
+      selector: getSelector(element),
+      xpath: getXPath(element),
+      tagName: element.tagName.toLowerCase(),
+      elementText: null,
+      attributes: getAttributes(element),
+      boundingRect: element.getBoundingClientRect().toJSON(),
+      inputValue: isSensitiveInput(element) ? '[MASKED]' : element.value,
+      url: location.href,
+      pageTitle: document.title,
+    })
+  }
 
   // Scroll (throttled to max once per 200ms)
   let lastScrollTime = 0
   let scrollTimer: ReturnType<typeof setTimeout> | null = null
   document.addEventListener('scroll', () => {
-    if (!isRecording) return
+    if (!isRecording()) return
     const now = Date.now()
     if (now - lastScrollTime < 200) {
       // Queue final position
-      if (scrollTimer) clearTimeout(scrollTimer)
+      if (scrollTimer !== null) clearTimeout(scrollTimer)
       scrollTimer = setTimeout(() => {
-        emitScroll()
         scrollTimer = null
+        if (isRecording()) emitScroll()
       }, 250)
       return
     }
@@ -237,6 +268,7 @@
   }, true)
 
   function emitScroll(): void {
+    if (!isRecording()) return
     send({
       interactionType: 'scroll',
       timestamp: Date.now(),
@@ -251,7 +283,7 @@
 
   // Mouse move (sampled)
   document.addEventListener('mousemove', (e: MouseEvent) => {
-    if (!isRecording) return
+    if (!isRecording()) return
     const now = Date.now()
 
     // Check idle threshold — flush if mouse was idle
@@ -274,7 +306,7 @@
     moveBuffer.push({ x: e.clientX, y: e.clientY, t: now })
 
     // Start flush timer if not already running
-    if (!moveFlushTimer) {
+    if (moveFlushTimer === null) {
       moveFlushTimer = setTimeout(() => {
         flushMoveBuffer()
         moveFlushTimer = null
@@ -283,6 +315,14 @@
   }, true)
 
   function flushMoveBuffer(): void {
+    if (moveFlushTimer !== null) {
+      clearTimeout(moveFlushTimer)
+      moveFlushTimer = null
+    }
+    if (!isRecording()) {
+      moveBuffer = []
+      return
+    }
     if (moveBuffer.length < 3) {
       moveBuffer = []
       return // ignore very short movements
@@ -295,9 +335,26 @@
       pageTitle: document.title,
     })
     moveBuffer = []
-    if (moveFlushTimer) {
-      clearTimeout(moveFlushTimer)
-      moveFlushTimer = null
+  }
+
+  function flushPendingInteractions(): void {
+    const pendingInputs = Array.from(inputTimers.entries())
+    inputTimers.clear()
+    for (const [element, timer] of pendingInputs) {
+      clearTimeout(timer)
+      try {
+        if (isRecording()) emitInput(element as HTMLInputElement | HTMLTextAreaElement)
+      } catch { /* detached or unusual elements must not block the remaining flush */ }
     }
+    if (scrollTimer !== null) {
+      clearTimeout(scrollTimer)
+      scrollTimer = null
+      try { if (isRecording()) emitScroll() } catch { /* continue flushing mouse movement */ }
+    }
+    try { flushMoveBuffer() } catch { moveBuffer = [] }
+    lastScrollTime = 0
+    lastMoveTime = 0
+    lastMoveX = 0
+    lastMoveY = 0
   }
 })()

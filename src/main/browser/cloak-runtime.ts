@@ -531,6 +531,8 @@ export function buildCloakLaunchOptions(
       // bot-check flows (Stripe HumanSecurity, reCAPTCHA v3). Stock Chrome
       // allows them, so re-enable for fidelity.
       "--fingerprint-allow-3p-cookies",
+      // A separate, loopback-only flat CDP connection owns Deep realm discovery.
+      ...(options.captureMode === "deep" ? ["--remote-debugging-port=0", "--remote-debugging-address=127.0.0.1"] : []),
       // Chromium otherwise inherits the host's system proxy configuration.
       ...(proxy ? [] : ["--no-proxy-server"]),
     ],

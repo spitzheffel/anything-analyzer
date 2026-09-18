@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events'
 import type { CaptureMode } from '@shared/types'
+import { withCaptureDeadline } from '../capture/capture-deadline'
 import type {
   BrowserTarget,
   CdpLease,
@@ -8,6 +9,7 @@ import type {
 } from '../browser/contracts'
 
 const MAX_BODY_SIZE = 1024 * 1024 // 1MB
+const NETWORK_BODY_FALLBACK_WAIT_MS = 2000
 const STATIC_EXTENSIONS = /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|map)(\?|$)/i
 
 const BINARY_CONTENT_TYPES = [
@@ -84,7 +86,11 @@ function isWebSocketUpgrade(headers: Record<string, string>): boolean {
 function shouldCollectBody(
   requestHeaders: Record<string, string>,
   responseInfo: ResponseInfo,
+  requestMethod = 'GET',
 ): boolean {
+  if (requestMethod.toUpperCase() === 'HEAD') return false
+  if ([204, 205, 304].includes(responseInfo.statusCode)) return false
+  if ([301, 302, 303, 307, 308].includes(responseInfo.statusCode)) return false
   if (isBinaryContent(responseInfo.contentType)) return false
   if (isStreamingContent(responseInfo.contentType)) return false
   if (responseInfo.statusCode === 101 || isWebSocketUpgrade(requestHeaders)) return false
@@ -125,6 +131,8 @@ export class CdpManager extends EventEmitter {
   private unsubscribeMessage: Unsubscribe | null = null
   private unsubscribeDisconnect: Unsubscribe | null = null
   private readonly inFlightHandlers = new Set<Promise<void>>()
+  private readonly pendingBodyFallbacks = new Map<string, (error: Error | null) => void>()
+  private readonly bodyErrors = new Map<string, string>()
   private stopPromise: Promise<void> | null = null
 
   async start(target: BrowserTarget, captureMode: CaptureMode = 'deep'): Promise<void> {
@@ -147,6 +155,7 @@ export class CdpManager extends EventEmitter {
         this.running = false
         this.pendingRequests.clear()
         this.pendingResponses.clear()
+        this.cancelBodyFallbacks()
         void this.stop().catch(error => {
           console.warn('[CdpManager] Failed to release disconnected lease:', (error as Error).message)
         })
@@ -201,23 +210,27 @@ export class CdpManager extends EventEmitter {
   ): Promise<Record<string, unknown>> {
     const lease = this.lease
     if (!lease || lease.released) throw new Error('No active CDP lease')
-    return lease.send(method, params)
+    return withCaptureDeadline(lease.send(method, params), 10000, method)
   }
 
   private async stopLease(lease: CdpLease): Promise<void> {
     this.running = false
-    this.removeSubscriptions()
     try {
       // Finish already-observed Fetch responses before disabling interception,
       // otherwise their request IDs can become invalid before body collection.
-      await this.waitForHandlers()
+      try { await withCaptureDeadline(this.waitForHandlers(), 25000, 'Network response drain') }
+      catch (error) {
+        console.warn('[CdpManager] Response drain incomplete', error)
+        this.emit('capture-incomplete', { reason: 'network-drain-timeout' })
+      }
+      this.removeSubscriptions()
       // Emit whatever open streams have accumulated so far — they never reach a
       // natural end, so stopping capture is their only chance to be recorded.
       this.flushPendingStreams()
       await this.disableOwnedDomains(lease)
       this.pendingRequests.clear()
       this.pendingResponses.clear()
-      if (!lease.released) await lease.release()
+      if (!lease.released) await withCaptureDeadline(lease.release(), 2000, 'Network lease release')
     } finally {
       if (this.lease === lease) this.resetState()
     }
@@ -229,6 +242,8 @@ export class CdpManager extends EventEmitter {
     this.pendingRequests.clear()
     this.pendingResponses.clear()
     this.pendingStreams.clear()
+    this.bodyErrors.clear()
+    this.cancelBodyFallbacks()
     this.enabledDomains.clear()
     this.target = null
     this.lease = null
@@ -246,7 +261,7 @@ export class CdpManager extends EventEmitter {
     domain: ManagedDomain,
     params: Record<string, unknown> = {}
   ): Promise<void> {
-    await lease.send(`${domain}.enable`, params)
+    await withCaptureDeadline(lease.send(`${domain}.enable`, params), 10000, `${domain}.enable`)
     this.enabledDomains.add(domain)
   }
 
@@ -255,7 +270,7 @@ export class CdpManager extends EventEmitter {
     for (const domain of DOMAIN_DISABLE_ORDER) {
       if (!this.enabledDomains.has(domain)) continue
       try {
-        await lease.send(`${domain}.disable`, {})
+        await withCaptureDeadline(lease.send(`${domain}.disable`, {}), 2000, `${domain}.disable`)
         this.enabledDomains.delete(domain)
       } catch {
         // A conflicting lease still owns the domain, or the target closed.
@@ -270,7 +285,23 @@ export class CdpManager extends EventEmitter {
   }
 
   private queueMessage(message: CdpMessage): void {
-    if (!this.running) return
+    const networkId = message.params.requestId
+    if (typeof networkId === 'string') {
+      if (message.method === 'Network.loadingFinished') {
+        this.pendingBodyFallbacks.get(networkId)?.(null)
+      } else if (message.method === 'Network.loadingFailed') {
+        this.pendingBodyFallbacks.get(networkId)?.(new Error('Network loading failed during body recovery'))
+      }
+    }
+    // Keep completion events alive while draining bodies, but do not capture
+    // new requests. Release late Fetch pauses so they cannot stall the page.
+    if (!this.running && (this.captureMode !== 'deep' || message.method !== 'Fetch.requestPaused')) return
+    if (!this.running) {
+      void this.send(message.params.responseStatusCode !== undefined || message.params.responseErrorReason !== undefined
+        ? 'Fetch.continueResponse' : 'Fetch.continueRequest', { requestId: message.params.requestId })
+        .catch(() => undefined)
+      return
+    }
     const task = this.handleCdpMessage(message.method, message.params).catch(error => {
       console.warn(`[CdpManager] ${message.method} handling failed:`, (error as Error).message)
     })
@@ -395,20 +426,91 @@ export class CdpManager extends EventEmitter {
 
     let responseBody: string | null = null
     let truncated = false
-    if (shouldCollectBody(requestInfo?.headers ?? {}, responseInfo)) {
+    let responseContinued = false
+    if (requestInfo && shouldCollectBody(requestInfo.headers, responseInfo, requestInfo.method)) {
       try {
         const result = await this.send('Fetch.getResponseBody', { requestId })
         const decoded = decodeBody(result)
+        if (decoded.body === null) throw new Error('Fetch.getResponseBody returned no body')
         responseBody = decoded.body
         truncated = decoded.truncated
-      } catch { /* body unavailable */ }
+      } catch (fetchError) {
+        let recoveryError: unknown
+        if (networkId && this.lease?.connected && !this.target?.isClosed()) {
+          try {
+            // Network needs the unpaused request to finish before reading its
+            // body. Never replay the HTTP request: it may have side effects.
+            responseContinued = true
+            const result = await this.recoverResponseBody(requestId, networkId)
+            const decoded = decodeBody(result)
+            if (decoded.body === null) throw new Error('Network.getResponseBody returned no body')
+            responseBody = decoded.body
+            truncated = decoded.truncated
+          } catch (error) {
+            recoveryError = error
+          }
+        }
+        if (responseBody === null) {
+          this.reportBodyFailure(requestId, responseInfo, fetchError, recoveryError, networkId)
+        }
+      }
     }
 
     if (requestInfo) {
       this.emitResponse(requestId, requestInfo, responseInfo, responseBody, truncated)
     }
     this.clearNetworkRequest(requestId)
-    try { await this.send('Fetch.continueResponse', { requestId }) } catch { /* cancelled */ }
+    if (!responseContinued) {
+      try { await this.send('Fetch.continueResponse', { requestId }) } catch { /* cancelled */ }
+    }
+  }
+
+  private async recoverResponseBody(requestId: string, networkId: string): Promise<Record<string, unknown>> {
+    let complete!: (error: Error | null) => void
+    const completion = new Promise<Error | null>(resolve => { complete = resolve })
+    this.pendingBodyFallbacks.set(networkId, complete)
+    // A completion event may already have been delivered by Chromium. Bound
+    // the wait, then make one best-effort cache read instead of hanging stop().
+    const timer = setTimeout(() => complete(null), NETWORK_BODY_FALLBACK_WAIT_MS)
+    try {
+      await this.send('Fetch.continueResponse', { requestId })
+      const error = await completion
+      if (error) throw error
+      return await this.send('Network.getResponseBody', { requestId: networkId })
+    } finally {
+      clearTimeout(timer)
+      this.pendingBodyFallbacks.delete(networkId)
+    }
+  }
+
+  private cancelBodyFallbacks(): void {
+    for (const complete of this.pendingBodyFallbacks.values()) {
+      complete(new Error('CDP disconnected during body recovery'))
+    }
+    this.pendingBodyFallbacks.clear()
+  }
+
+  private reportBodyFailure(
+    requestId: string,
+    responseInfo: ResponseInfo,
+    error: unknown,
+    recoveryError?: unknown,
+    networkId?: string | null,
+  ): void {
+    this.bodyErrors.set(requestId, recoveryError ? 'fetch-and-network-read-failed' : 'body-read-failed')
+    // IDs correlate with the session without logging headers, cookies or URLs
+    // that can carry credentials or personal data.
+    console.warn('[CdpManager] Response body unavailable', {
+      sessionId: this.target?.sessionId,
+      targetId: this.target?.id,
+      requestId,
+      networkId,
+      statusCode: responseInfo.statusCode,
+      contentType: responseInfo.contentType,
+      stopping: !this.running,
+      error,
+      recoveryError,
+    })
   }
 
   private handleNetworkRequest(params: Record<string, unknown>): void {
@@ -467,13 +569,15 @@ export class CdpManager extends EventEmitter {
 
     let responseBody: string | null = null
     let truncated = false
-    if (shouldCollectBody(requestInfo.headers, responseInfo)) {
+    if (shouldCollectBody(requestInfo.headers, responseInfo, requestInfo.method)) {
       try {
         const result = await this.send('Network.getResponseBody', { requestId })
         const decoded = decodeBody(result)
         responseBody = decoded.body
         truncated = decoded.truncated
-      } catch { /* cached, streamed, or otherwise unavailable */ }
+      } catch (error) {
+        this.reportBodyFailure(requestId, responseInfo, error)
+      }
     }
 
     this.emitResponse(requestId, requestInfo, responseInfo, responseBody, truncated)
@@ -536,6 +640,9 @@ export class CdpManager extends EventEmitter {
       statusCode: responseInfo.statusCode,
       responseHeaders: JSON.stringify(responseInfo.headers),
       responseBody,
+      bodyStatus: truncated ? 'truncated' : responseBody === '' ? 'empty' : responseBody !== null ? 'saved'
+        : shouldCollectBody(requestInfo.headers, responseInfo, requestInfo.method) ? 'unavailable' : 'skipped',
+      bodyError: this.bodyErrors.get(requestId) ?? null,
       contentType,
       initiator: requestInfo.initiator ? JSON.stringify(requestInfo.initiator) : null,
       durationMs: Date.now() - requestInfo.timestamp,
@@ -546,6 +653,7 @@ export class CdpManager extends EventEmitter {
       truncated,
       timestamp: requestInfo.timestamp,
     })
+    this.bodyErrors.delete(requestId)
   }
 
   private beginStream(

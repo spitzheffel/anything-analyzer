@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3'
+import type { ResponseBodyStatus } from '@shared/capture-protocol'
 import type {
   Session,
   CapturedRequest,
@@ -158,7 +159,8 @@ export class RequestsRepo {
       updateResponse: db.prepare(
         `UPDATE requests SET status_code = @status_code, response_headers = @response_headers,
          response_body = @response_body, content_type = @content_type, duration_ms = @duration_ms,
-         is_streaming = @is_streaming, is_websocket = @is_websocket
+         is_streaming = @is_streaming, is_websocket = @is_websocket,
+         body_status = @body_status, body_error = @body_error
          WHERE id = @id`
       ),
       findBySession: db.prepare(
@@ -191,8 +193,10 @@ export class RequestsRepo {
     duration_ms: number
     is_streaming: number  // 0 or 1
     is_websocket: number  // 0 or 1
+    body_status?: ResponseBodyStatus
+    body_error?: string | null
   }): void {
-    this.stmts.updateResponse.run(data)
+    this.stmts.updateResponse.run({ ...data, body_status: data.body_status ?? 'unknown', body_error: data.body_error ?? null })
   }
 
   findBySession(sessionId: string): CapturedRequest[] {

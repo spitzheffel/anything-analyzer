@@ -18,7 +18,12 @@ function redactLogValue(value: unknown, seen = new WeakSet<object>()): unknown {
   if (seen.has(value)) return "[Circular]";
   seen.add(value);
   if (value instanceof Error) {
-    return { name: value.name, message: redactString(value.message), stack: value.stack ? redactString(value.stack) : undefined };
+    return {
+      name: value.name,
+      message: redactString(value.message),
+      stack: value.stack ? redactString(value.stack) : undefined,
+      cause: redactLogValue(value.cause, seen),
+    };
   }
   if (Array.isArray(value)) return value.map((entry) => redactLogValue(entry, seen));
   const result: Record<string, unknown> = {};
@@ -54,9 +59,9 @@ export function initLogger(): void {
     data: message.data.map((value) => redactLogValue(value)),
   }));
 
-  // Override console methods so existing console.log/warn/error
-  // statements throughout the codebase are automatically captured.
+  // initialize() wires renderer IPC; main-process console needs a separate bridge.
   log.initialize();
+  Object.assign(console, log.functions);
 
   log.info("=== Application started ===");
   log.info(`Version: ${app.getVersion()}, Platform: ${process.platform} ${process.arch}`);

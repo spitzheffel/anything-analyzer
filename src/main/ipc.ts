@@ -2,6 +2,7 @@ import { ipcMain, dialog, app, session, shell } from "electron";
 import { networkInterfaces } from "os";
 import type {
   AiProgressEvent,
+  CaptureDiagnosticsBundle,
   CloakRuntimePolicy,
   ChatMessage,
   CreateSessionOptions,
@@ -37,6 +38,7 @@ import {
   deleteMCPServer,
 } from "./mcp/mcp-config";
 import { buildHar } from "@shared/har-export";
+import { CAPTURE_PROTOCOL_VERSION } from "@shared/capture-protocol";
 import { buildOpenApiDocument } from "@shared/openapi-export";
 import type {
   RequestsRepo,
@@ -357,27 +359,97 @@ export function registerIpcHandlers(deps: {
     return reportsRepo.findBySession(sessionId);
   });
 
+  ipcMain.handle("capture:health:get", (_event, sessionId: string) => {
+    return sessionManager.getCaptureHealth(sessionId);
+  });
+
+  ipcMain.handle("data:diagnostics", (_event, sessionId: string): CaptureDiagnosticsBundle => {
+    const captureSession = sessionManager.listSessions().find((candidate) => candidate.id === sessionId);
+    if (!captureSession) throw new Error("Session not found");
+    const health = sessionManager.getCaptureHealth(sessionId);
+    const requests = requestsRepo.findBySession(sessionId);
+    const hooks = jsHooksRepo.findBySession(sessionId);
+    const interactionCount = interactionEventsRepo.count(sessionId);
+    const interactions = interactionEventsRepo.findBySession(sessionId, interactionCount);
+    // Error messages and realm reasons can embed page URLs or captured payloads.
+    const safeHealth = {
+      ...health,
+      persistenceError: health.persistenceError === null ? null : "[redacted]",
+      realms: health.realms.map((realm) => ({
+        ...realm,
+        reason: realm.reason === null ? null : "[redacted]",
+      })),
+      gaps: health.gaps.map((gap) => ({ ...gap, reason: "[redacted]" })),
+    };
+    return {
+      schemaVersion: 1,
+      protocolVersion: CAPTURE_PROTOCOL_VERSION,
+      exportedAt: Date.now(),
+      privacy: { payloadsIncluded: false, urlsIncluded: false, freeTextReasonsIncluded: false },
+      session: {
+        id: captureSession.id,
+        browserBackend: captureSession.browser_backend ?? "electron",
+        captureMode: captureSession.capture_mode ?? "deep",
+        status: captureSession.status,
+      },
+      health: safeHealth,
+      counts: {
+        requests: requests.length,
+        hooks: hooks.length,
+        storageSnapshots: storageSnapshotsRepo.findBySession(sessionId).length,
+        interactions: interactionCount,
+      },
+      requests: requests.map((request) => ({
+        id: request.id,
+        sequence: request.sequence,
+        timestamp: request.timestamp,
+        statusCode: request.status_code,
+        source: request.source ?? "unknown",
+        bodyStatus: request.body_status ?? "unknown",
+        bodyErrorPresent: Boolean(request.body_error),
+      })),
+      hooks: hooks.map((hook) => ({
+        id: hook.id,
+        timestamp: hook.timestamp,
+        hookType: hook.hook_type,
+        runId: hook.run_id ?? null,
+        realmId: hook.realm_id ?? null,
+        producerSequence: hook.producer_sequence ?? null,
+      })),
+      interactions: interactions.map((interaction) => ({
+        id: interaction.id,
+        sequence: interaction.sequence,
+        timestamp: interaction.timestamp,
+        runId: interaction.run_id ?? null,
+        realmId: interaction.realm_id ?? null,
+        producerSequence: interaction.producer_sequence ?? null,
+      })),
+    };
+  });
+
   ipcMain.handle("data:clear", async (_event, sessionId: string) => {
-    requestsRepo.deleteBySession(sessionId);
-    jsHooksRepo.deleteBySession(sessionId);
-    storageSnapshotsRepo.deleteBySession(sessionId);
+    await sessionManager.withCaptureDataClear(sessionId, () => {
+      requestsRepo.deleteBySession(sessionId);
+      jsHooksRepo.deleteBySession(sessionId);
+      storageSnapshotsRepo.deleteBySession(sessionId);
+      interactionEventsRepo.deleteBySession(sessionId);
 
-    // Protect reports with in-flight chat from cascade deletion
-    const allReports = reportsRepo.findBySession(sessionId);
-    const protectedIds = new Set(
-      allReports.filter(r => activeChatReports.has(r.id)).map(r => r.id)
-    );
+      // Protect reports with in-flight chat from cascade deletion.
+      const allReports = reportsRepo.findBySession(sessionId);
+      const protectedIds = new Set(
+        allReports.filter((report) => activeChatReports.has(report.id)).map((report) => report.id)
+      );
 
-    if (protectedIds.size === 0) {
-      reportsRepo.deleteBySession(sessionId);
-    } else {
-      // Delete only unprotected reports
-      for (const r of allReports) {
-        if (!protectedIds.has(r.id)) {
-          reportsRepo.deleteById(r.id);
+      if (protectedIds.size === 0) {
+        reportsRepo.deleteBySession(sessionId);
+      } else {
+        for (const report of allReports) {
+          if (!protectedIds.has(report.id)) {
+            reportsRepo.deleteById(report.id);
+          }
         }
       }
-    }
+    });
   });
 
   // ---- AI Analysis ----
@@ -642,6 +714,7 @@ export function registerIpcHandlers(deps: {
       name: sessionInfo?.name,
       targetUrl: sessionInfo?.target_url,
       appVersion: app.getVersion(),
+      captureHealth: sessionManager.getCaptureHealth(sessionId),
     });
     return saveTextFile(`${sessionName}-${timestamp}.har`, JSON.stringify(har, null, 2));
   });
@@ -969,7 +1042,9 @@ export function registerIpcHandlers(deps: {
   });
 
   ipcMain.handle("interaction:clear", async (_event, sessionId: string) => {
-    interactionEventsRepo.deleteBySession(sessionId);
+    await sessionManager.withCaptureDataClear(sessionId, () => {
+      interactionEventsRepo.deleteBySession(sessionId);
+    }, false);
   });
 
   // ---- Log Files ----

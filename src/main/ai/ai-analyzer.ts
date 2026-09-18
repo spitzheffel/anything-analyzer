@@ -79,6 +79,7 @@ export class AiAnalyzer {
     private reportsRepo: AnalysisReportsRepo,
     private aiRequestLogRepo: AiRequestLogRepo,
     private interactionEventsRepo: InteractionEventsRepo,
+    private readonly captureHealthReader?: (sessionId: string) => import('@shared/capture-protocol').CaptureHealthSnapshot,
   ) {}
 
   /**
@@ -431,6 +432,17 @@ export class AiAnalyzer {
     const user = subagentContext
       ? `${baseUser}\n\n## 并行子分析导航（仅作定位线索，正文仍需工具验证）\n${subagentContext}`
       : baseUser;
+    let analysisSystem = system;
+    if (this.captureHealthReader) {
+      try {
+        const health = this.captureHealthReader(sessionId);
+        const knownLoss = health.gaps.reduce((total, gap) => total + (gap.droppedEvents ?? 0), 0);
+        const uncertainIntervals = health.gaps.filter(gap => gap.certainty === 'unknown-coverage').length;
+        analysisSystem += `\n\nCapture coverage evidence: Deep=${health.state}; network=${health.network}; workers=${health.workerCoverage}; known dropped events=${knownLoss}; uncertain coverage intervals=${uncertainIntervals}. Healthy now does not prove historical completeness. An absent Hook or request is not evidence the operation never occurred. State capture limitations explicitly and do not invent missing operations.`;
+      } catch {
+        analysisSystem += '\n\nCapture coverage is unknown because health evidence could not be read. Do not assume complete capture.';
+      }
+    }
 
     const router = this.createRouter(sessionId, null, "analyze", config);
     let content = "";
@@ -445,7 +457,7 @@ export class AiAnalyzer {
       try {
         signal?.throwIfAborted();
         let messages: MessageLike[] = [
-          { role: "system", content: system },
+          { role: "system", content: analysisSystem },
           { role: "user", content: user },
         ];
         messages = await this.packMessages(messages, config, sessionId, null, onProgress, signal);

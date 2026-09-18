@@ -60,6 +60,8 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+const BINDING_REFRESH_RETRY_DELAYS_MS = [100, 300, 600] as const;
+
 function emitSafely<T>(listeners: ReadonlySet<(event: T) => void>, event: T): void {
   for (const listener of listeners) {
     try {
@@ -1514,7 +1516,7 @@ export class CloakBrowserContext implements BrowserContext {
       registrationInstalled = true;
       registration ??= this.bindingRegistrations.get(name);
       if (!registration) throw new Error(`Cloak binding ${name} was not registered`);
-      await target.playwrightPage.evaluate(registration.source);
+      // attachBindingToFrame installs the source too, inside the retry boundary.
       await this.refreshTargetBindings(target);
       await this.deliverPendingBindingCalls(target, name, callback);
     } catch (error) {
@@ -1534,13 +1536,30 @@ export class CloakBrowserContext implements BrowserContext {
     const previous = this.bindingRefreshes.get(page) ?? Promise.resolve();
     const refresh = previous
       .catch(() => undefined)
-      .then(() => this.refreshTargetBindingsNow(target));
+      .then(() => this.refreshTargetBindingsWithRetry(target));
     this.bindingRefreshes.set(page, refresh);
     try {
       await refresh;
     } finally {
       if (this.bindingRefreshes.get(page) === refresh) {
         this.bindingRefreshes.delete(page);
+      }
+    }
+  }
+
+  private async refreshTargetBindingsWithRetry(target: CloakBrowserTarget): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      if (this.isClosed() || target.isClosed()) return;
+      try {
+        await this.refreshTargetBindingsNow(target);
+        return;
+      } catch (error) {
+        if (this.isClosed() || target.isClosed()) return;
+        const delay = BINDING_REFRESH_RETRY_DELAYS_MS[attempt];
+        if (delay === undefined) throw error;
+        // A document commit can remove the raw binding between addBinding and
+        // evaluate. Retry the whole registration, not just the stale raw name.
+        await new Promise<void>((resolve) => setTimeout(resolve, delay));
       }
     }
   }
@@ -1610,7 +1629,7 @@ export class CloakBrowserContext implements BrowserContext {
             target,
             mainFrameResult.status === "rejected"
               ? mainFrameResult.reason
-              : undefined,
+              : new Error("The main frame could not connect to the raw CDP binding"),
           );
         }
 

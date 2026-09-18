@@ -40,6 +40,9 @@ import type {
 import { CaptureEngine } from "../capture/capture-engine";
 import { InteractionRecorder } from "../capture/interaction-recorder";
 import { JsInjector } from "../capture/js-injector";
+import { DeepCaptureController } from "../capture/deep-capture-controller";
+import type { CaptureReliabilityRepo } from "../db/capture-reliability-repo";
+import type { CaptureHealthSnapshot } from "@shared/capture-protocol";
 import { StorageCollector } from "../capture/storage-collector";
 import { CdpManager } from "../cdp/cdp-manager";
 import { buildStealthScript } from "../../preload/stealth-script";
@@ -86,6 +89,9 @@ const PUBLIC_CLOAK_STATUS: CloakRuntimeStatus = {
  */
 export class SessionManager {
   private currentSessionId: string | null = null;
+  private captureEpoch: string | null = null;
+  private reliableCapture: DeepCaptureController | null = null;
+  private pendingReliableStart: string | null = null;
   private activeBrowserSessionId: string | null = null;
   private rendererWebContents: WebContents | null = null;
   private lastProxyConfig: ProxyConfig | null = null;
@@ -128,6 +134,7 @@ export class SessionManager {
     private readonly browserProfilesRepo: BrowserProfilesRepo,
     private readonly browserTabsRepo: BrowserTabsRepo,
     private readonly cloakRuntime?: CloakRuntime,
+    private readonly captureReliabilityRepo?: CaptureReliabilityRepo,
   ) {
     ipcMain.on("capture:hook-data", this.hookIpcHandler);
     this.unsubscribeCoordinator = browserCoordinator.onEvent((event) => {
@@ -202,6 +209,50 @@ export class SessionManager {
     return this.sessionsRepo.findById(sessionId) ?? null;
   }
 
+  getCaptureHealth(sessionId: string): CaptureHealthSnapshot {
+    if (this.reliableCapture?.getHealth().sessionId === sessionId) return this.reliableCapture.getHealth();
+    if (this.captureReliabilityRepo) return this.captureReliabilityRepo.getHealth(sessionId);
+    return { sessionId, runId: null, revision: 0, state: "unknown", network: "unknown",
+      workerCoverage: "unknown", realms: [], gaps: [], persistenceError: null };
+  }
+
+  withCaptureDataClear(sessionId: string, operation: () => void, clearHealth = true): Promise<void> {
+    return this.enqueueBrowserLifecycle(async () => {
+      const session = this.requireSession(sessionId);
+      const wasRunning = this.currentSessionId === sessionId && session.status === "running";
+      if (wasRunning) await this.pauseCaptureNow(sessionId);
+      this.sessionsRepo.transaction(() => {
+        operation();
+        if (clearHealth) this.captureReliabilityRepo?.clearSession(sessionId);
+      });
+      if (wasRunning) await this.resumeCaptureNow(sessionId);
+    });
+  }
+
+  private useReliableCapture(session: Session): boolean {
+    return Boolean(this.captureReliabilityRepo && session.browser_backend === "cloak" && session.capture_mode === "deep");
+  }
+
+  private async startReliableCapture(context: BrowserContext): Promise<void> {
+    if (!this.captureReliabilityRepo || this.reliableCapture) return;
+    const controller = new DeepCaptureController(context, this.captureReliabilityRepo,
+      record => this.captureEngine.notifyCommitted(record),
+      snapshot => {
+        if (!this.rendererWebContents?.isDestroyed()) this.rendererWebContents?.send("capture:health", snapshot);
+      });
+    this.reliableCapture = controller;
+    this.captureEpoch = controller.runId;
+    await controller.start(this.cloakRuntime?.getContext(context.sessionId)?.userDataDir ?? null);
+  }
+
+  private async stopReliableCapture(state: "stopped" | "paused" = "stopped"): Promise<void> {
+    const controller = this.reliableCapture;
+    if (!controller) return;
+    try { await controller.stop(state); }
+    catch (error) { console.warn("[SessionManager] Deep drain failed", { sessionId: controller.getHealth().sessionId, error }); }
+    finally { if (this.reliableCapture === controller) this.reliableCapture = null; }
+  }
+
   async activateSession(
     sessionId: string,
     rendererWebContents?: WebContents,
@@ -265,6 +316,14 @@ export class SessionManager {
       this.activeBrowserSessionId = sessionId;
       this.sessionErrors.delete(sessionId);
       if (!wasOpen) this.sessionWarnings.delete(sessionId);
+      if (this.pendingReliableStart === sessionId && this.rendererWebContents) {
+        this.currentSessionId = sessionId;
+        this.captureEngine.start(sessionId, this.rendererWebContents);
+        this.sessionsRepo.updateStatus(sessionId, "running");
+        await this.startReliableCapture(context);
+        // Arm independent network collectors before restoring saved URLs.
+        await Promise.allSettled((await context.targets()).map(target => this.attachCaptureToTarget(session, target)));
+      }
       if (!wasOpen) {
         await this.initializeOpenedContext(session, context);
       } else {
@@ -358,12 +417,18 @@ export class SessionManager {
 
     // Opening and runtime preparation happen before the DB state transition.
     // A license, binary, or profile failure therefore leaves the Session stopped.
-    const context = await this.activateSessionNow(
-      sessionId,
-      rendererWebContents,
-      proxyConfig,
-    );
+    let context: BrowserContext;
+    if (this.useReliableCapture(session)) this.pendingReliableStart = sessionId;
+    try {
+      context = await this.activateSessionNow(sessionId, rendererWebContents, proxyConfig);
+    } catch (error) {
+      if (this.currentSessionId === sessionId) await this.rollbackFailedCaptureStart(sessionId);
+      throw error;
+    } finally {
+      this.pendingReliableStart = null;
+    }
     this.currentSessionId = sessionId;
+    this.captureEpoch ??= uuidv4();
     try {
       this.rendererWebContents = rendererWebContents;
       this.captureEngine.start(sessionId, rendererWebContents);
@@ -408,6 +473,7 @@ export class SessionManager {
     if (this.currentSessionId !== sessionId) return;
     this.suspendingCaptureSessions.add(sessionId);
     try {
+      await this.stopReliableCapture("paused");
       await this.detachSessionCaptures(sessionId);
       await this.interactionRecorder?.pause();
       this.sessionsRepo.updateStatus(sessionId, "paused");
@@ -427,6 +493,8 @@ export class SessionManager {
     this.suspendingCaptureSessions.delete(sessionId);
     try {
       const context = this.browserCoordinator.resolveContext(sessionId);
+      this.captureEpoch = uuidv4();
+      if (this.useReliableCapture(session)) await this.startReliableCapture(context);
       const targets = await context.targets();
       await this.prepareTargetsForMode(session, targets);
       for (const target of targets) {
@@ -449,6 +517,7 @@ export class SessionManager {
     this.suspendingCaptureSessions.add(sessionId);
     let detachError: unknown;
     try {
+      await this.stopReliableCapture();
       await this.detachSessionCaptures(sessionId);
     } catch (error) {
       detachError = error;
@@ -457,6 +526,7 @@ export class SessionManager {
       this.captureEngine.stop();
       this.sessionsRepo.updateStatus(sessionId, "stopped", Date.now());
       this.currentSessionId = null;
+      this.captureEpoch = null;
       this.suspendingCaptureSessions.delete(sessionId);
     }
     await this.persistTabsBestEffort(sessionId);
@@ -1206,6 +1276,9 @@ export class SessionManager {
   ): Promise<void> {
     this.registerElectronTarget(target);
     if ((session.capture_mode ?? "deep") !== "deep") return;
+    // The reliable context-wide bootstrap owns Cloak Hook and interaction
+    // installation. A failure there must never prevent network attachment.
+    if (this.useReliableCapture(session)) return;
 
     // A fresh Electron WebContentsView has no document at all. Prime it with an
     // internal blank page so CDP init-script registration and immediate script
@@ -1307,14 +1380,13 @@ export class SessionManager {
     if (!this.canAttachCapture(session.id, target)) return;
 
     const cdp = new CdpManager();
+    const captureEpoch = this.captureEpoch;
     const storage = new StorageCollector();
     let cdpStarted = false;
     let storageStarted = false;
     try {
-      await cdp.start(target, session.capture_mode ?? "deep");
-      cdpStarted = true;
       cdp.on("response-captured", (data) => {
-        if (this.currentSessionId === session.id) {
+        if (this.currentSessionId === session.id && this.captureEpoch === captureEpoch) {
           this.captureEngine.handleResponseCaptured(data);
         }
       });
@@ -1323,12 +1395,20 @@ export class SessionManager {
         void this.syncInteractionRecordingAfterNavigation(session.id, target);
       });
       storage.on("storage-collected", (data) => {
-        if (this.currentSessionId === session.id) {
+        if (this.currentSessionId === session.id && this.captureEpoch === captureEpoch) {
           this.captureEngine.handleStorageCollected(data);
         }
       });
-      await storage.start(session.id, target);
-      storageStarted = true;
+      await cdp.start(target, session.capture_mode ?? "deep");
+      cdpStarted = true;
+      this.reliableCapture?.setNetworkState("running");
+      try {
+        await storage.start(session.id, target);
+        storageStarted = true;
+      } catch (error) {
+        if (!this.useReliableCapture(session)) throw error;
+        console.warn("[SessionManager] Storage degraded; network capture remains active", { sessionId: session.id, error });
+      }
       if (!this.canAttachCapture(session.id, target)) {
         await storage.stop();
         storageStarted = false;
@@ -1342,6 +1422,7 @@ export class SessionManager {
         cdp,
         storage,
       });
+      this.reliableCapture?.setNetworkState("running");
     } catch (error) {
       if (storageStarted) await storage.stop().catch(() => undefined);
       if (cdpStarted) await cdp.stop().catch(() => undefined);
@@ -1379,6 +1460,7 @@ export class SessionManager {
   private async rollbackFailedCaptureStart(sessionId: string): Promise<void> {
     this.suspendingCaptureSessions.add(sessionId);
     try {
+      await this.stopReliableCapture();
       await this.detachSessionCaptures(sessionId).catch((error) => {
         console.warn(
           `[SessionManager] Failed to fully detach capture after Session ${sessionId} start failed:`,
@@ -1391,6 +1473,7 @@ export class SessionManager {
         this.sessionsRepo.updateStatus(sessionId, "stopped", Date.now());
       }
       this.currentSessionId = null;
+      this.captureEpoch = null;
     } finally {
       this.suspendingCaptureSessions.delete(sessionId);
     }

@@ -2,6 +2,10 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Button, Badge } from '../ui'
 import { IconGlobe, IconLoading, IconMaximize } from '../ui/Icons'
 import type { BrowserSessionRuntimeStatus, CaptureMode, Session } from '@shared/types'
+import type { CaptureHealthSnapshot } from '@shared/capture-protocol'
+import { useCaptureHealth } from '../hooks/useCapture'
+import { useLocale } from '../i18n'
+import CaptureHealthPanel, { getCaptureHealthPresentation } from './CaptureHealthPanel'
 import styles from './ExternalBrowserSurface.module.css'
 
 function errorMessage(error: unknown): string {
@@ -11,6 +15,7 @@ function errorMessage(error: unknown): string {
 interface ExternalBrowserSurfaceProps {
   session: Session
   onCaptureModeChange: (mode: CaptureMode) => Promise<void>
+  captureHealth?: CaptureHealthSnapshot | null
 }
 
 const statePresentation: Record<
@@ -26,9 +31,20 @@ const statePresentation: Record<
 export default function ExternalBrowserSurface({
   session,
   onCaptureModeChange,
+  captureHealth,
 }: ExternalBrowserSurfaceProps) {
   const sessionId = session.id
+  const { locale } = useLocale()
+  const localHealth = useCaptureHealth(captureHealth === undefined ? sessionId : null)
+  const health = captureHealth === undefined ? localHealth : captureHealth
+  const scopedHealth = health?.sessionId === sessionId ? health : null
+  const deepPresentation = getCaptureHealthPresentation(scopedHealth?.state ?? 'unknown', locale)
   const mountedRef = useRef(true)
+  const scopeRef = useRef({ sessionId, version: 0 })
+  const refreshVersionRef = useRef(0)
+  if (scopeRef.current.sessionId !== sessionId) {
+    scopeRef.current = { sessionId, version: scopeRef.current.version + 1 }
+  }
   const [status, setStatus] = useState<BrowserSessionRuntimeStatus | null>(null)
   const [focusing, setFocusing] = useState(false)
   const [focusError, setFocusError] = useState<string | null>(null)
@@ -36,15 +52,19 @@ export default function ExternalBrowserSurface({
   const [modeBusy, setModeBusy] = useState(false)
 
   const refresh = useCallback(async () => {
+    const scopeVersion = scopeRef.current.version
+    const refreshVersion = ++refreshVersionRef.current
+    const isCurrentRefresh = () => mountedRef.current && scopeRef.current.version === scopeVersion
+      && refreshVersionRef.current === refreshVersion
     try {
       const nextStatus = await window.electronAPI.getBrowserSessionStatus(sessionId)
-      if (mountedRef.current) {
+      if (isCurrentRefresh() && (nextStatus.sessionId === sessionId || nextStatus.sessionId === null)) {
         setStatus(nextStatus)
         setFocusError(nextStatus.error)
         setWarning(nextStatus.warning ?? null)
       }
     } catch (error) {
-      if (mountedRef.current) setFocusError(errorMessage(error))
+      if (isCurrentRefresh()) setFocusError(errorMessage(error))
     }
   }, [sessionId])
 
@@ -52,6 +72,9 @@ export default function ExternalBrowserSurface({
     mountedRef.current = true
     setStatus(null)
     setFocusError(null)
+    setWarning(null)
+    setFocusing(false)
+    setModeBusy(false)
     void refresh()
     const timer = window.setInterval(() => void refresh(), 2000)
     return () => {
@@ -61,28 +84,32 @@ export default function ExternalBrowserSurface({
   }, [refresh])
 
   const handleFocus = async () => {
+    const scopeVersion = scopeRef.current.version
+    const isCurrentScope = () => mountedRef.current && scopeRef.current.version === scopeVersion
     setFocusing(true)
     setFocusError(null)
     try {
       await window.electronAPI.focusBrowser(sessionId)
     } catch (error) {
-      if (mountedRef.current) setFocusError(errorMessage(error))
+      if (isCurrentScope()) setFocusError(errorMessage(error))
     } finally {
-      if (mountedRef.current) setFocusing(false)
+      if (isCurrentScope()) setFocusing(false)
     }
   }
 
   const handleModeChange = async (mode: CaptureMode) => {
     if (mode === session.capture_mode || session.status !== 'stopped' || modeBusy) return
+    const scopeVersion = scopeRef.current.version
+    const isCurrentScope = () => mountedRef.current && scopeRef.current.version === scopeVersion
     setModeBusy(true)
     setFocusError(null)
     try {
       await onCaptureModeChange(mode)
-      await refresh()
+      if (isCurrentScope()) await refresh()
     } catch (error) {
-      if (mountedRef.current) setFocusError(errorMessage(error))
+      if (isCurrentScope()) setFocusError(errorMessage(error))
     } finally {
-      if (mountedRef.current) setModeBusy(false)
+      if (isCurrentScope()) setModeBusy(false)
     }
   }
 
@@ -92,8 +119,8 @@ export default function ExternalBrowserSurface({
     : statePresentation.opening
 
   return (
-    <div className={styles.surface}>
-      <div className={styles.content}>
+    <div className={styles.surface} style={{ overflow: 'auto' }}>
+      <div className={styles.content} style={{ width: 'min(100%, 720px)' }}>
         <div className={styles.browserMark} aria-hidden="true">
           <IconGlobe size={24} />
         </div>
@@ -101,12 +128,16 @@ export default function ExternalBrowserSurface({
         <div className={styles.statusRow}>
           <Badge
             color={presentation.color}
-            label={presentation.label}
+            label={`Browser: ${presentation.label}`}
             pulse={pending}
             size="sm"
           />
           <span className={styles.divider} />
           <span className={styles.version}>{status?.version ? `Chromium ${status.version}` : '版本未知'}</span>
+        </div>
+        <div className={styles.statusRow}>
+          <Badge color={deepPresentation.color} label={`Deep: ${deepPresentation.label}`} size="sm" />
+          <span className={styles.version}>{locale === 'zh' ? '浏览器已连接不等于 Deep 健康' : 'Browser ready does not imply Deep health'}</span>
         </div>
         {focusError && <div className={styles.error} role="alert">{focusError}</div>}
         {!focusError && warning && (
@@ -144,6 +175,15 @@ export default function ExternalBrowserSurface({
         >
           {status?.state === 'ready' ? '聚焦浏览器' : '打开浏览器'}
         </Button>
+        <div style={{ width: '100%', marginTop: 16 }}>
+          <CaptureHealthPanel
+            key={sessionId}
+            sessionId={sessionId}
+            captureHealth={scopedHealth}
+            captureMode={session.capture_mode}
+            compact
+          />
+        </div>
       </div>
     </div>
   )

@@ -627,6 +627,83 @@ describe("CloakBrowser context-wide hooks", () => {
     expect(session.subscribedBindings.size).toBe(1);
   });
 
+  it.each(["context-destroyed", "binding-missing"])(
+    "retries %s after navigation and delivers queued hooks without a warning",
+    async (failureKind) => {
+      const { browserContext, nativeContext, firstPage } = createHarness();
+      const [target] = await browserContext.targets();
+      const callback = vi.fn();
+      const events: unknown[] = [];
+      browserContext.onEvent((event) => events.push(event));
+      await target.exposeBinding("__hook", callback);
+      firstPage.commitNavigation("https://example.com/redirected");
+      firstPage.invokeBinding("__hook", { event: "queued-during-navigation" });
+      const evaluate = firstPage.evaluate.bind(firstPage);
+      let failedAttachments = 0;
+      const evaluation = vi.spyOn(firstPage, "evaluate").mockImplementation(async (source) => {
+        if (source.endsWith("=== true") && failedAttachments < (failureKind === "binding-missing" ? 2 : 1)) {
+          failedAttachments += 1;
+          if (failureKind === "context-destroyed") throw new Error("Execution context was destroyed");
+          return false;
+        }
+        return evaluate(source);
+      });
+      try {
+        firstPage.domContentLoaded();
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(1));
+        expect(callback).toHaveBeenCalledWith(expect.objectContaining({
+          args: [{ event: "queued-during-navigation" }],
+        }));
+        expect(events).not.toContainEqual(expect.objectContaining({ type: "target-warning" }));
+        expect(nativeContext.latestSession(firstPage).subscribedBindings.size).toBe(1);
+      } finally {
+        evaluation.mockRestore();
+      }
+    },
+  );
+
+  it("reports persistent attachment failure after bounded retries", async () => {
+    const { browserContext, nativeContext, firstPage } = createHarness();
+    const [target] = await browserContext.targets();
+    await target.exposeBinding("__hook", vi.fn());
+    firstPage.commitNavigation("https://example.com/broken");
+    const events: unknown[] = [];
+    browserContext.onEvent((event) => events.push(event));
+    const cause = new Error("Execution context remains unavailable");
+    const evaluation = vi.spyOn(firstPage, "evaluate").mockRejectedValue(cause);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    try {
+      firstPage.domContentLoaded();
+      await vi.waitFor(() => expect(events).toContainEqual(expect.objectContaining({
+        type: "target-warning",
+        message: expect.stringContaining("Failed to attach Cloak binding __hook"),
+      })), { timeout: 2000 });
+      expect(warning).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ cause }));
+      expect(nativeContext.latestSession(firstPage).subscribedBindings.size).toBe(0);
+    } finally {
+      evaluation.mockRestore();
+      warning.mockRestore();
+    }
+  });
+
+  it("stops retrying bindings when the page closes", async () => {
+    const { browserContext, nativeContext, firstPage } = createHarness();
+    const [target] = await browserContext.targets();
+    await target.exposeBinding("__hook", vi.fn());
+    const session = nativeContext.latestSession(firstPage);
+    const evaluation = vi.spyOn(firstPage, "evaluate").mockRejectedValue(new Error("Context destroyed"));
+    try {
+      const refresh = browserContext.refreshTargetBindings(target);
+      await vi.waitFor(() => expect(evaluation).toHaveBeenCalled());
+      firstPage.closePage();
+      const callsAtClose = session.send.mock.calls.length;
+      await refresh;
+      expect(session.send.mock.calls).toHaveLength(callsAtClose);
+    } finally {
+      evaluation.mockRestore();
+    }
+  });
+
   it("keeps main-frame bindings live when a cross-origin iframe cannot attach", async () => {
     const { browserContext, nativeContext, firstPage } = createHarness();
     const [target] = await browserContext.targets();

@@ -25,13 +25,47 @@ export function getDatabase(): Database.Database {
 
   const dbPath = databasePathFor(userDataPath)
 
-  db = new Database(dbPath)
-
-  // Enable WAL mode for better concurrent read performance
-  db.pragma('journal_mode = WAL')
-  db.pragma('foreign_keys = ON')
+  const connection = new Database(dbPath)
+  try {
+    // FULL makes a committed delivery receipt durable before acknowledging it.
+    connection.pragma('journal_mode = WAL')
+    connection.pragma('synchronous = FULL')
+    connection.pragma('foreign_keys = ON')
+    backupBeforeCaptureReliabilityMigration(connection)
+    db = connection
+  } catch (error) {
+    connection.close()
+    throw error
+  }
 
   return db
+}
+
+/** Synchronously preserve an old database before the synchronous migrations run. */
+export function backupBeforeCaptureReliabilityMigration(database: Database.Database): string | null {
+  if (!database.name || database.name === ':memory:') return null
+  const hasSessions = Boolean(database.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+  ).get())
+  const hasCaptureRuns = Boolean(database.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'capture_runs'",
+  ).get())
+  if (!hasSessions || hasCaptureRuns) return null
+
+  const backupDirectory = join(dirname(database.name), 'backups')
+  mkdirSync(backupDirectory, { recursive: true })
+  const destination = join(backupDirectory, 'anything-register-pre-capture-reliability.db')
+  if (existsSync(destination)) return destination
+  const temporaryPath = `${destination}.backing-up-${process.pid}`
+  if (existsSync(temporaryPath)) unlinkSync(temporaryPath)
+  try {
+    // VACUUM INTO includes committed WAL contents; copying the .db alone does not.
+    database.exec(`VACUUM INTO '${temporaryPath.replace(/'/g, "''")}'`)
+    renameSync(temporaryPath, destination)
+    return destination
+  } finally {
+    if (existsSync(temporaryPath)) unlinkSync(temporaryPath)
+  }
 }
 
 /** Import a consistent SQLite snapshot without copying WAL/SHM sidecars. */

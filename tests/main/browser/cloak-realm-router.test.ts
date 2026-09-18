@@ -310,8 +310,17 @@ describe('CloakRealmRouter', () => {
     expect(targetCommands.map((command) => command.method)).toEqual([
       'Target.setAutoAttach', 'Runtime.runIfWaitingForDebugger', 'Runtime.enable', 'Runtime.evaluate'
     ])
-    expect(targetCommands.find(command => command.method === 'Runtime.evaluate')?.params.expression)
-      .toContain('sourceURL=aa-capture-bootstrap://')
+    const workerBootstrap = String(
+      targetCommands.find(command => command.method === 'Runtime.evaluate')?.params.expression
+    )
+    expect(workerBootstrap).toContain('sourceURL=aa-capture-bootstrap://')
+    // Install first, read the marker second, and keep looking for a bounded
+    // moment: a module worker's context exists before its first statement
+    // runs, so a single read at context creation reports a gap that is not
+    // there. Reading first would also delay the hooks behind that wait.
+    expect(workerBootstrap.indexOf(options.bootstrapSource))
+      .toBeLessThan(workerBootstrap.indexOf('__aaReliableCaptureEntryScript'))
+    expect(workerBootstrap).toMatch(/for \(let attempt = 0; attempt < \d+ && !covered/)
     expect(router.capabilities.workerStartupInjection).toBe('supported')
     const commandCount = socket.commands.length
     await vi.advanceTimersByTimeAsync(60_000)

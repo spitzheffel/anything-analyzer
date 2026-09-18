@@ -35,6 +35,18 @@ const SETUP_TIMEOUT_MS = 10_000
 const PAUSE_GUARD_TIMEOUT_MS = 5_000
 const WORKER_BOOTSTRAP_SOURCE_URL = 'aa-capture-bootstrap://realm-router/bootstrap.js'
 /**
+ * A module worker instantiates its module graph before it evaluates any top
+ * level code, so its execution context exists for a short while before the
+ * rewritten entry script's first statement runs. Reading the marker once, at
+ * context creation, lands inside that window often enough to matter: measured
+ * at 2 failures in 12 real-Cloak runs, each reporting a coverage gap for a
+ * worker whose bytes the router had demonstrably rewritten. Re-read for a
+ * bounded moment instead. Only the verdict waits — the re-entry bootstrap has
+ * already installed the hooks by then, so nothing runs uninstrumented.
+ */
+const ENTRY_MARKER_POLL_ATTEMPTS = 10
+const ENTRY_MARKER_POLL_INTERVAL_MS = 5
+/**
  * Worker entry scripts are fetched as `Other`, not `Script` — measured across
  * dedicated, shared and service workers, classic and module. Filtering on
  * `Script` would miss every one of them; filtering on `*` would route every
@@ -664,15 +676,23 @@ export class CloakRealmRouter {
     let entryScriptRewritten = false
     const startedWhilePaused = target.waitingForDebugger && !target.resumeStarted
     try {
-      // For a worker, read the entry-script marker and install in one round
-      // trip: the marker has to be read before this re-entry installs anything,
-      // and a second evaluation would be another way for the realm to stall.
-      // The re-entry itself is idempotent; it exists to bind the producer to
-      // this run, since the bytes the worker started from carry whatever runId
-      // was current when they were rewritten.
+      // For a worker, install first and read the entry-script marker second,
+      // still in one round trip. Installing first puts the hooks in place at
+      // the earliest moment the router can manage, whatever the marker turns
+      // out to say; only the coverage verdict waits. The re-entry is idempotent
+      // and never sets the marker itself — only the bytes the router rewrote
+      // do — so reading it afterwards still reports on the entry script alone.
+      // The re-entry exists to bind the producer to this run, since the bytes
+      // the worker started from carry whatever runId was current when they
+      // were rewritten.
+      const marker = `globalThis[${JSON.stringify(CAPTURE_ENTRY_SCRIPT_FLAG)}] === true`
       const bootstrapExpression = target.workerEntry
-        ? `(() => { const covered = globalThis[${JSON.stringify(CAPTURE_ENTRY_SCRIPT_FLAG)}] === true;\n` +
-          `${this.options.bootstrapSource}\nreturn covered })()\n` +
+        ? `(async () => {\n${this.options.bootstrapSource}\n;\n` +
+          `let covered = ${marker}\n` +
+          `for (let attempt = 0; attempt < ${ENTRY_MARKER_POLL_ATTEMPTS} && !covered; attempt += 1) {\n` +
+          `  await new Promise(resolve => setTimeout(resolve, ${ENTRY_MARKER_POLL_INTERVAL_MS}))\n` +
+          `  covered = ${marker}\n` +
+          `}\nreturn covered })()\n` +
           `//# sourceURL=${WORKER_BOOTSTRAP_SOURCE_URL}`
         : this.options.bootstrapSource
       const evaluated = await this.evaluateInRealm<unknown>(target, realm, bootstrapExpression)

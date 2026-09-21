@@ -6,6 +6,7 @@ import {
   buildSpecExtractionMessages,
   computeReportTokenBudget,
   extractProtocolSpec,
+  INDEX_TOTAL_LIMIT,
   MAX_REPORT_TOKENS,
   MIN_REPORT_TOKENS,
   truncateReportToTokenBudget,
@@ -86,13 +87,28 @@ describe("buildSpecExtractionMessages", () => {
     expect(messages[1].content).toContain("#1 POST");
     expect(messages[1].content).not.toContain("#200 POST");
   });
+
+  it("caps the index no matter how many seqs the report cites", () => {
+    const many: RequestSummary[] = Array.from({ length: 1_000 }, (_, i) => ({ ...summaries[0], seq: i + 1, url: `https://api.example.com/r/${i + 1}` }));
+    // 报告引用了 400 条：不设上限时索引会涨到 460 行，把 PROMPT_OVERHEAD_TOKENS 的预留撑爆
+    const cited = Array.from({ length: 400 }, (_, i) => (i + 1) * 2);
+    const reportContent = `# 报告\n${cited.map((seq) => `见 [#${seq}]`).join("\n")}`;
+
+    const messages = buildSpecExtractionMessages({ reportContent, summaries: many, enrichment: null });
+    const indexLines = messages[1].content.split("\n").filter((line) => /^#\d+ POST /.test(line));
+
+    expect(indexLines).toHaveLength(INDEX_TOTAL_LIMIT);
+    // 被引用的优先占位；挤不下时宁可丢头部，也不能丢报告真正引用到的行
+    expect(messages[1].content).toContain("#2 POST");
+    expect(messages[1].content).not.toContain("#1 POST ");
+  });
 });
 
 describe("computeReportTokenBudget", () => {
   it("shrinks the report allowance for small context windows and caps it for large ones", () => {
     const small = computeReportTokenBudget({ ...config, maxTokens: 8192, contextBudget: { maxContextTokens: 32_000, autoContextWindow: false } });
-    // 32000 - 8192 - 12000
-    expect(small).toBe(11_808);
+    // 32000 - 8192 - 16000
+    expect(small).toBe(7_808);
     const tiny = computeReportTokenBudget({ ...config, maxTokens: 8192, contextBudget: { maxContextTokens: 16_000, autoContextWindow: false } });
     expect(tiny).toBe(MIN_REPORT_TOKENS);
     const large = computeReportTokenBudget({ ...config, maxTokens: 8192, contextBudget: { maxContextTokens: 400_000, autoContextWindow: false } });

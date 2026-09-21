@@ -14,12 +14,17 @@ import type { MessageLike } from "./context-budget";
 
 /** 索引超过这个数时，只给报告引用过的 + 头部这么多条 */
 const INDEX_HEAD_LIMIT = 120;
+/** 索引行数硬上限：引用再多也不能把提示词撑爆（PROMPT_OVERHEAD_TOKENS 按这个数预留） */
+export const INDEX_TOTAL_LIMIT = 240;
 /** 报告正文喂给抽取器的上限（token）；再大也没必要 */
 export const MAX_REPORT_TOKENS = 20_000;
 /** 报告正文至少保留这么多 token，再少抽不出东西 */
 export const MIN_REPORT_TOKENS = 3_000;
-/** 索引（最多 120 行）+ 系统提示 + 线索 + schema 提示的预留，单位 token */
-const PROMPT_OVERHEAD_TOKENS = 12_000;
+/**
+ * 索引 + 系统提示 + 线索 + schema 提示的预留，单位 token。
+ * 实测：一条长 URL 的索引行约 46 token，240 行约 11k；ProtocolSpec 的 schema 提示约 1.3k。
+ */
+const PROMPT_OVERHEAD_TOKENS = 16_000;
 const REPORT_TRUNCATION_MARKER = "\n...[报告过长，已截断]";
 
 export interface SpecExtractionInput {
@@ -78,12 +83,16 @@ function selectIndexLines(summaries: RequestSummary[], reportContent: string, bu
   if (summaries.length <= INDEX_HEAD_LIMIT) return summaries.map((summary) => builder.formatIndexLine(summary));
   const cited = new Set(extractCitedSeqs(reportContent));
   const picked = new Map<number, RequestSummary>();
+  // 引用过的优先：Spec 的 exampleSeqs / evidenceSeqs 只能落在索引里真实出现过的行上
   for (const summary of summaries) {
-    if (picked.size >= INDEX_HEAD_LIMIT) break;
-    picked.set(summary.seq, summary);
-  }
-  for (const summary of summaries) {
+    if (picked.size >= INDEX_TOTAL_LIMIT) break;
     if (cited.has(summary.seq)) picked.set(summary.seq, summary);
+  }
+  // 再用头部补出会话起始的脉络，总量仍受硬上限约束
+  const headTarget = Math.min(INDEX_TOTAL_LIMIT, picked.size + INDEX_HEAD_LIMIT);
+  for (const summary of summaries) {
+    if (picked.size >= headTarget) break;
+    picked.set(summary.seq, summary);
   }
   return [...picked.values()]
     .sort((left, right) => left.seq - right.seq)

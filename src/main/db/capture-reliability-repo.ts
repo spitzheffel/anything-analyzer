@@ -219,6 +219,7 @@ function mergeGaps(previousGaps: CaptureGap[], incomingGaps: CaptureGap[]): Capt
       ...gap,
       endedAt: gap.endedAt ?? previous?.endedAt ?? null,
       droppedEvents: gap.droppedEvents ?? previous?.droppedEvents ?? null,
+      detail: gap.detail ?? previous?.detail ?? null,
     })
   }
   return [...merged.values()]

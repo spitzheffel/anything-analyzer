@@ -126,3 +126,64 @@ describe('Deep controller commit and fallback', () => {
     expect(vi.getTimerCount()).toBe(0)
   })
 })
+
+describe('gap diagnostics say what they know', () => {
+  function makeController(acceptBatch: unknown = vi.fn(() => { throw new Error('SQLITE_BUSY') })) {
+    const repository = {
+      beginRun: vi.fn(), endRun: vi.fn(), saveHealth: vi.fn(), getHealth: () => ({ gaps: [] }), acceptBatch,
+    } as unknown as CaptureReliabilityRepo
+    const context = { sessionId: 'session-1', isClosed: () => false, targets: async () => [], getNativeHandle: () => ({
+      addInitScript: async () => ({ dispose: vi.fn() }),
+    }) } as unknown as BrowserContext
+    return new DeepCaptureController(context, repository, vi.fn(), vi.fn(), { hook: '', interaction: '' })
+  }
+
+  it('classifies a router failure without storing its URLs or target ids', async () => {
+    const controller = makeController()
+    await controller.start('isolated-profile')
+
+    // router 的原文里有 targetId 和 URL——面板承诺不含这些
+    routing.options!.onFailure(
+      'Worker entry script was not rewritten for TARGET-ABC (https://secret.example.com/app/worker.js); '
+      + 'its first statements ran without instrumentation'
+    )
+
+    const gap = controller.getHealth().gaps.find(entry => entry.reason === 'worker-entry-script-unrewritten')!
+    expect(gap.detail).toBe('worker-entry-script-rewrite-failed')
+    const serialized = JSON.stringify(gap)
+    expect(serialized).not.toContain('secret.example.com')
+    expect(serialized).not.toContain('TARGET-ABC')
+    await controller.stop()
+  })
+
+  it('counts the events stuck in the queue instead of calling the loss unknown', async () => {
+    vi.useFakeTimers()
+    // 提交成功但一条都没确认：队列清不掉，pendingEvents 会被真实填上
+    const acceptBatch = vi.fn((_session: string, runId: string, _realm: unknown, batch: CaptureBatch): CaptureIngestionResult => ({
+      receipt: { runId, producerId: batch.producerId, acknowledged: [], disposition: 'committed' },
+      records: [],
+    }))
+    const controller = makeController(acceptBatch)
+    await controller.start('isolated-profile')
+    const producer = createProducer(controller.runId)
+    producer.bridge.enqueue('hook', { marker: 'stuck' })
+    const connection: CaptureRealmConnection = {
+      info: { realmId: 'realm-stuck', kind: 'document', targetId: 'target-1', frameId: 'frame-1', tabId: null, earlyInjection: true },
+      installBinding: async () => { throw new Error('binding-unavailable') },
+      evaluate: async <Value>(expression: string): Promise<Value> => producer.evaluate<Value>(expression),
+    }
+    routing.options!.onRealm(connection)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(controller.getHealth().realms[0].pendingEvents).toBeGreaterThan(0)
+    const stuck = controller.getHealth().realms[0].pendingEvents
+
+    // 和真实那次一样：realm 先没了，队列里还压着事件，然后才停止会话
+    routing.options!.onClosed('realm-stuck')
+    await controller.stop()
+
+    const gap = controller.getHealth().gaps.find(entry => entry.reason === 'drain-timeout' && entry.realmId === 'realm-stuck')!
+    // 队列长度当场就数得出来，不该记成"覆盖未知 / Dropped events: Unknown"
+    expect(gap.certainty).toBe('known-loss')
+    expect(gap.droppedEvents).toBe(stuck)
+  })
+})

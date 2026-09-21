@@ -159,6 +159,7 @@ export default function CaptureHealthPanel({
               <div>Realm: {gap.realmId ?? 'Session / unknown realm'} | Run: {gap.runId}</div>
               <div>{formatConfirmedAt(gap.startedAt)} - {gap.endedAt === null ? 'Open' : formatConfirmedAt(gap.endedAt)}</div>
               <div>Dropped events: {gap.droppedEvents ?? 'Unknown'}</div>
+              {gap.detail && <div>{localize('Detail', '\u7ec6\u5206\u539f\u56e0')}: {gap.detail}</div>}
             </div>
           ))}
         </details>

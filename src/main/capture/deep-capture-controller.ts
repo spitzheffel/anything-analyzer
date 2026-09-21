@@ -3,8 +3,8 @@ import type { BrowserContext as PlaywrightContext, Disposable, Frame } from 'pla
 import type { BrowserContext } from '../browser/contracts'
 import type { CaptureRealmConnection, CloakRealmRouter } from '../browser/cloak-realm-router'
 import type { CaptureReliabilityRepo } from '../db/capture-reliability-repo'
-import { CAPTURE_BRIDGE_NAME, CAPTURE_PUSH_BINDING } from '@shared/capture-protocol'
-import type { CaptureAcceptedRecord, CaptureBatch, CaptureGap, CaptureHealthSnapshot, CaptureRealmHealth } from '@shared/capture-protocol'
+import { CAPTURE_BRIDGE_NAME, CAPTURE_PUSH_BINDING, classifyCaptureFailure } from '@shared/capture-protocol'
+import type { CaptureAcceptedRecord, CaptureBatch, CaptureFailureCode, CaptureGap, CaptureHealthSnapshot, CaptureRealmHealth } from '@shared/capture-protocol'
 import { buildDeepBootstrap } from './deep-bootstrap'
 import { withCaptureDeadline } from './capture-deadline'
 
@@ -96,18 +96,20 @@ export class DeepCaptureController {
         onFailure: (reason) => {
           if (!this.accepting) return
           console.warn('[DeepCapture] Realm router reported a coverage limitation', { reason })
+          // 原文里有 URL / targetId / 任意错误文本，诊断面板承诺不含这些，所以只留分类后的码
+          const detail = classifyCaptureFailure(reason)
           if (reason.startsWith('Worker entry script was not rewritten')) {
             // One worker ran its first statements uninstrumented. Everything
             // else — network, documents, other workers — is still covered, so
             // this is a bounded gap, not an unavailable instrumentation layer.
             this.snapshot.workerCoverage = 'late-attachment'
-            this.addGap(null, 'worker-entry-script-unrewritten', 'unknown-coverage')
+            this.addGap(null, 'worker-entry-script-unrewritten', 'unknown-coverage', null, detail)
           } else if (reason.startsWith('Late attachment')) {
             if (!reason.includes('document target')) this.snapshot.workerCoverage = 'late-attachment'
-            this.addGap(null, 'target-startup-unverified', 'unknown-coverage')
+            this.addGap(null, 'target-startup-unverified', 'unknown-coverage', null, detail)
           } else {
             this.snapshot.workerCoverage = 'unavailable'
-            this.addGap(null, 'cdp-instrumentation-unavailable', 'unknown-coverage')
+            this.addGap(null, 'cdp-instrumentation-unavailable', 'unknown-coverage', null, detail)
           }
           this.publish()
           if (reason.includes('WebSocket')) this.scheduleReconnect()
@@ -377,13 +379,21 @@ export class DeepCaptureController {
     this.publish()
   }
 
-  private addGap(realmId: string | null, reason: string, certainty: CaptureGap['certainty'], droppedEvents: number | null = null): void {
+  private addGap(
+    realmId: string | null,
+    reason: string,
+    certainty: CaptureGap['certainty'],
+    droppedEvents: number | null = null,
+    detail: CaptureFailureCode | null = null,
+  ): void {
     const previous = this.snapshot.gaps.find(gap => gap.realmId === realmId && gap.reason === reason && gap.endedAt === null)
     if (previous) {
       if (droppedEvents !== null) previous.droppedEvents = (previous.droppedEvents ?? 0) + droppedEvents
+      // 同一个缺口里第一次说得出细分原因就留下，后面的重复上报不覆盖
+      if (detail && !previous.detail) previous.detail = detail
       return
     }
-    this.snapshot.gaps.push({ runId: this.runId, realmId, startedAt: Date.now(), endedAt: null, reason, certainty, droppedEvents })
+    this.snapshot.gaps.push({ runId: this.runId, realmId, startedAt: Date.now(), endedAt: null, reason, certainty, droppedEvents, detail })
   }
 
   private publish(): void {
@@ -419,7 +429,13 @@ export class DeepCaptureController {
     try { await withCaptureDeadline(drain(), DRAIN_TIMEOUT_MS, 'Deep capture drain') }
     catch { this.addGap(null, 'drain-timeout', 'unknown-coverage') }
     for (const realm of this.realms.values()) {
-      if (realm.health.pendingEvents || realm.processing) this.addGap(realm.health.realmId, 'drain-timeout', 'unknown-coverage')
+      // 队列里压了几条是当场数得出来的：这是确知的丢失，不是"覆盖未知"。
+      // 只有 processing 没有 pendingEvents 时才真的不知道在途多少。
+      if (realm.health.pendingEvents) {
+        this.addGap(realm.health.realmId, 'drain-timeout', 'known-loss', realm.health.pendingEvents)
+      } else if (realm.processing) {
+        this.addGap(realm.health.realmId, 'drain-timeout', 'unknown-coverage')
+      }
     }
     await Promise.allSettled([...this.realms.values()].filter(realm => !realm.closed)
       .map(realm => realm.connection.evaluate(`${bridgeExpression}?.configure('')`)))

@@ -18,6 +18,7 @@ const routerBehaviour = {
   lastToolSignal: undefined as AbortSignal | undefined,
   /** 非空时 complete() 返回它：analyze 流程里只有预过滤走 complete */
   completeText: null as string | null,
+  lastToolMessages: undefined as Array<{ role: string; content: string }> | undefined,
 };
 
 vi.mock("../../../src/main/ai/llm-router", async (importOriginal) => {
@@ -31,7 +32,7 @@ vi.mock("../../../src/main/ai/llm-router", async (importOriginal) => {
       };
     }
     async completeWithTools(
-      _messages: unknown,
+      messages: Array<{ role: string; content: string }>,
       _tools: unknown,
       _callTool: unknown,
       _onEvent: unknown,
@@ -39,6 +40,7 @@ vi.mock("../../../src/main/ai/llm-router", async (importOriginal) => {
       signal?: AbortSignal,
     ) {
       routerBehaviour.toolCalls += 1;
+      routerBehaviour.lastToolMessages = messages;
       routerBehaviour.lastToolSignal = signal;
       if (routerBehaviour.hangUntilAborted) {
         return new Promise<never>((_resolve, reject) => {
@@ -57,6 +59,7 @@ vi.mock("../../../src/main/ai/llm-router", async (importOriginal) => {
 });
 
 import { AiAnalyzer } from "../../../src/main/ai/ai-analyzer";
+import { clearToolSessionState, recordToolSessionActivity } from "../../../src/main/ai/tool-session-state";
 
 const config: LLMProviderConfig = {
   name: "openai",
@@ -131,6 +134,7 @@ beforeEach(() => {
   routerBehaviour.toolCalls = 0;
   routerBehaviour.lastToolSignal = undefined;
   routerBehaviour.completeText = null;
+  routerBehaviour.lastToolMessages = undefined;
   // 失败路径会打一条预期内的 warn，别让它污染测试输出
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -237,6 +241,22 @@ describe("AiAnalyzer artifacts", () => {
     expect(messages[0].content).toContain("引用规则");
     expect(messages[0].content).toContain("#1 POST /v1/login");
     expect(messages[1]).toEqual({ role: "assistant", content: "# 报告" });
+  });
+});
+
+describe("AiAnalyzer.chat tool state", () => {
+  it("does not tell the model it already fetched requests that no longer exist", async () => {
+    const { analyzer } = makeAnalyzer();
+    clearToolSessionState("s1", "r1");
+    // #1 #2 还在；#77 是抓包数据被清掉之前留下的
+    recordToolSessionActivity("s1", "r1", [1, 2, 77], "[get_request_detail](seqs=1,2,77)");
+
+    await analyzer.chat("s1", config, [], "问题", undefined, "r1");
+
+    const note = (routerBehaviour.lastToolMessages ?? []).map((m) => m.content).join("\n");
+    expect(note).toContain("#1");
+    expect(note).toContain("#2");
+    expect(note).not.toContain("#77");
   });
 });
 

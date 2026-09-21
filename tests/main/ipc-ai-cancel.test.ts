@@ -55,6 +55,10 @@ vi.mock("../../src/main/mcp/mcp-config", () => ({
 }));
 
 import { registerIpcHandlers } from "../../src/main/ipc";
+import {
+  getToolSessionState,
+  recordToolSessionActivity,
+} from "../../src/main/ai/tool-session-state";
 
 /** 一个只在 signal abort 时结束的调用，用来观察取消是否真的传到了底层 */
 function pendingCall(record: { signal?: AbortSignal }) {
@@ -93,9 +97,10 @@ function setup(options: { chatResolves?: () => Promise<string> } = {}) {
   registerIpcHandlers({
     sessionManager: {
       withCaptureDataClear: async (_id: string, clear: () => void) => clear(),
+      deleteSession: vi.fn(),
     },
     aiAnalyzer,
-    windowManager: { getMainWindow: vi.fn(() => null) },
+    windowManager: { getMainWindow: vi.fn(() => null), getTabManager: vi.fn(() => null) },
     mcpManager: { connectAll: vi.fn(), hasConnections: () => false },
     requestsRepo: noopRepo,
     jsHooksRepo: noopRepo,
@@ -245,5 +250,19 @@ describe("AI cancellation IPC", () => {
 
     await handler("data:clear")({}, "s1");
     expect(deleted).toEqual(["*"]);
+  });
+});
+
+describe("tool state lifecycle over IPC", () => {
+  it("drops a session's tool state when its capture data is cleared or the session is deleted", async () => {
+    const { handler } = setup();
+
+    recordToolSessionActivity("ipc-clear", "r1", [1, 2], "[get_request_detail](seqs=1,2)");
+    await handler("data:clear")({}, "ipc-clear");
+    expect(getToolSessionState("ipc-clear", "r1").fetchedSeqs).toEqual([]);
+
+    recordToolSessionActivity("ipc-delete", "r1", [3, 4], "[get_request_detail](seqs=3,4)");
+    await handler("session:delete")({}, "ipc-delete");
+    expect(getToolSessionState("ipc-delete", "r1").fetchedSeqs).toEqual([]);
   });
 });

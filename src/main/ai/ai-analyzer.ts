@@ -658,8 +658,18 @@ export class AiAnalyzer {
     signal?: AbortSignal,
   ): Promise<string> {
     signal?.throwIfAborted();
-    // 从历史恢复侧态，并注入紧凑说明（无正文）
-    const snapshot = hydrateToolSessionFromHistory(sessionId, reportId, history);
+
+    const assembler = new DataAssembler(
+      this.requestsRepo,
+      this.jsHooksRepo,
+      this.storageSnapshotsRepo,
+    );
+    const fullData = assembler.assemble(sessionId);
+    const summaries = assembler.extractSummaries(fullData);
+    const requestMap = new Map(fullData.requests.map((r) => [r.seq, r]));
+
+    // 从历史恢复侧态，并注入紧凑说明（无正文）；只认工具现在还取得到的序号
+    const snapshot = hydrateToolSessionFromHistory(sessionId, reportId, history, new Set(requestMap.keys()));
     const stateNote = buildToolStateNote(snapshot);
 
     const messages: MessageLike[] = [
@@ -681,14 +691,6 @@ export class AiAnalyzer {
 
     const router = this.createRouter(sessionId, reportId ?? null, "chat", config);
 
-    const assembler = new DataAssembler(
-      this.requestsRepo,
-      this.jsHooksRepo,
-      this.storageSnapshotsRepo,
-    );
-    const fullData = assembler.assemble(sessionId);
-    const summaries = assembler.extractSummaries(fullData);
-    const requestMap = new Map(fullData.requests.map((r) => [r.seq, r]));
     const allTools = this.collectTools(fullData.requests.length > 0);
     const callTool = this.createBuiltinToolRouter(sessionId, reportId, requestMap, summaries);
 

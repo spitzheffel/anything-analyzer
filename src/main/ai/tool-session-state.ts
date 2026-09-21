@@ -81,11 +81,16 @@ export function buildToolStateNote(snapshot: ToolSessionSnapshot): string | null
 
 /**
  * 从历史消息中恢复侧态（兼容旧 <tool_context> / 新 <tool_state>）。
+ *
+ * 传 knownSeqs 时只保留现在还取得到的序号。历史里的 <tool_state> 标记会把
+ * 清掉的侧态重新带回来，而那些序号指向的请求可能已经被 data:clear 删了；
+ * 侧态说的是"这些你已经拉过"，不该指向工具拿不到的东西。
  */
 export function hydrateToolSessionFromHistory(
   sessionId: string,
   reportId: string | null | undefined,
   history: Array<{ role: string; content: string }>,
+  knownSeqs?: ReadonlySet<number>,
 ): ToolSessionSnapshot {
   const seqs = new Set<number>(getToolSessionState(sessionId, reportId).fetchedSeqs);
   const refs: string[] = [...getToolSessionState(sessionId, reportId).recentRefs];
@@ -127,7 +132,9 @@ export function hydrateToolSessionFromHistory(
   }
 
   const next: ToolSessionSnapshot = {
-    fetchedSeqs: [...seqs].sort((a, b) => a - b),
+    fetchedSeqs: [...seqs]
+      .filter((seq) => knownSeqs === undefined || knownSeqs.has(seq))
+      .sort((a, b) => a - b),
     recentRefs: refs.slice(-MAX_RECENT_REFS),
     updatedAt: Date.now(),
   };

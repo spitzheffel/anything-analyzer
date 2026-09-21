@@ -60,6 +60,26 @@ describe("tool session state", () => {
     expect(stripToolContext(content)).toBe("分析完成");
   });
 
+  it("drops hydrated seqs the tools can no longer serve", () => {
+    clearToolSessionState("s4", "r4");
+    const history = [
+      {
+        role: "assistant",
+        content: 'x\n\n<tool_state>{"fetchedSeqs":[1,2,3],"recentRefs":[]}</tool_state>',
+      },
+    ];
+
+    // 抓包数据被清空后只剩 #2：历史里的标记不能把 #1 #3 带回来
+    const snap = hydrateToolSessionFromHistory("s4", "r4", history, new Set([2]));
+    expect(snap.fetchedSeqs).toEqual([2]);
+    // 写回 store 的也必须是过滤后的，否则下一轮又涨回来
+    expect(getToolSessionState("s4", "r4").fetchedSeqs).toEqual([2]);
+
+    // 不传 knownSeqs 时保持原行为
+    clearToolSessionState("s5", "r5");
+    expect(hydrateToolSessionFromHistory("s5", "r5", history).fetchedSeqs).toEqual([1, 2, 3]);
+  });
+
   it("hydrates from legacy tool_context and tool_state history", () => {
     clearToolSessionState("s3", "r3");
     const snap = hydrateToolSessionFromHistory("s3", "r3", [

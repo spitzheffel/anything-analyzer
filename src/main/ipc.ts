@@ -196,6 +196,8 @@ export function registerIpcHandlers(deps: {
       tabManager ?? undefined,
       options,
     );
+    // 和 data:clear 一样：会话没了，那串"已拉取过的序号"再留着也没有意义
+    clearToolSessionsForSession(sessionId);
   });
 
   // ---- Window Control (frameless window) ----

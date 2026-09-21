@@ -1,28 +1,20 @@
-# Anything Analyzer v3.6.67
+# Anything Analyzer v3.6.68
 
-本版本修的都是 Cloak 会话的打开行为：会话现在开在它自己的目标网址上，关掉的窗口不再自己回来，开发模式下也终于能跑真实的 Cloak 后端。
+本版本只有一处改动：修复部分第三方 OpenAI 兼容服务无法使用 AI 分析。
 
 ## 修复
 
-- **Cloak 会话每次都打开在 `about:blank`，而且原有标签页不会恢复** — 恢复已保存标签页的分支会在导航到目标网址之前返回，而浏览器自带的空白起始页也被当成了「值得恢复的标签页」，于是兜底导航永远没有机会执行。这是自我维持的：浏览器开在自己的空白页，该页被持久化，之后每次打开都「恢复」它并就此停下。又因为持久化是整组替换，一次空白打开还会覆盖掉用户原有的标签页记录。现在只恢复真正有去处的标签页；保存的标签页全为空白时，会话回落到它的目标网址。
-- **手动关闭浏览器窗口后，窗口会自动重新打开** — 任何不是应用自己发起的断开都被当作崩溃并自动恢复一次，而在这一层无法区分「用户关窗」和「浏览器进程异常退出」。自动恢复的意义是保护**正在进行的抓取**；没有抓取在跑时，窗口关了就是关了，重新拉起只会覆盖用户的意图，其空白标签页还会覆盖已保存的标签页。现在仅在该会话的抓取进行中才自动恢复一次，空闲会话保持关闭，由「打开浏览器」按钮显式打开。
-- **开发模式下 CloakBrowser 完全无法启动** — CLI 路径由 `app.getAppPath()` 推导，打包后指向应用根目录（CLI 就在其下），但开发模式的主进程包运行在 `out-internal/main`，比真正存放它的 `node_modules` 深好几层，于是每次启动都以 `cli.js` 的 ENOENT 失败。现在会逐级向上查找；打包后的行为不变，仍然第一次就命中。
+- **配置第三方 OpenAI 兼容端点后，AI 分析直接失败（`Type validation failed ... expected "function"`）** — 按 OpenAI 规范，工具调用的 `id`、`type`、`function.name` 只出现在第一个增量分片中，后续分片应当省略；部分兼容服务改为发送空字符串。`@ai-sdk/openai` 的流式 schema 声明 `type: z.literal('function').nullish()`，缺省合法而空串非法，因此一个续传分片就会让整次请求失败。
 
-## 关于「无法区分关窗与崩溃」
+  只有严格路径受影响：`@ai-sdk/openai-compatible` 的 schema 中没有 `type` 字段，Zod 会直接丢弃，所以选择 Custom 提供商不受影响；而把第三方端点配置在 OpenAI 提供商下是合理用法，不应因此中断。
 
-这一条是实测结论而非推断，记录在此以免日后重复排查：
-
-- Playwright 对「关闭窗口」和「杀掉进程」上报的事件序列完全相同，只有时间间隔不同，而间隔本身并不稳定。
-- Cloak 的 `launchPersistentContext` 返回普通的 `BrowserContext`，拿不到子进程，`browser.process()` 为 `null`，因此没有退出码。
-- Chromium 记录的 `profile.exit_type` 在进程被杀之后仍然是 `Normal`。同一个复用 profile 连跑三轮从未出现 `Crashed` —— 该标记在启动时设置但似乎并未落盘，磁盘上的值描述的是上一次退出而不是这一次。
-
-因此本版本没有去猜测意图，而是改用不需要区分的策略。
+  现在在所有 provider HTTP 共用的请求层统一规整流式响应，仅删除这几个为空的判别字段，使分片读起来与省略一致。其余内容逐字节透传：`function.arguments` 承载正文，空字符串在该处有意义；无法解析为分片的行不做改动；请求日志仍记录服务端实际发送的字节。
 
 ## 验证
 
-- 全量测试：538 passed，20 skipped。其中 `tests/main/db/capture-reliability.test.ts` 的 18 项需要 Electron 的原生模块 ABI，改用 `node scripts/run-electron-vitest.mjs` 运行后 18 项全部通过。
+- 全量测试：542 passed，20 skipped。其中 `tests/main/db/capture-reliability.test.ts` 的 18 项需要 Electron 的原生模块 ABI，改用 `node scripts/run-electron-vitest.mjs` 运行后全部通过。
+- 新增 4 项回归测试，覆盖：真实失败分片的修复、合规分片与非分片行的原样透传、空 `arguments` 不被误删，以及跨网络边界切分（在 JSON 中间切开，按行重写会损坏报文）。接线本身也在覆盖内——移除规整步骤会导致该测试失败。
 - 真实 CloakBrowser 验证（`AA_REAL_CLOAK=1`）9 个场景全部通过。
-- 新增回归测试覆盖：空白标签页不再顶替目标网址、空闲会话关闭后不再自动重开、以及选中会话不会启动浏览器。两条关于「不应发生」的测试都先对旧行为验证过会失败。
 - 内部包打包、产物校验、启动冒烟与 UI 冒烟通过。
 
 ## 已知问题
@@ -33,7 +25,7 @@
 
 | 平台 | 文件 |
 |------|------|
-| Windows | Anything-Analyzer-Setup-3.6.67.exe |
-| macOS (Apple Silicon) | Anything-Analyzer-3.6.67-arm64.dmg |
-| macOS (Intel) | Anything-Analyzer-3.6.67-x64.dmg |
-| Linux | Anything-Analyzer-3.6.67.AppImage |
+| Windows | Anything-Analyzer-Setup-3.6.68.exe |
+| macOS (Apple Silicon) | Anything-Analyzer-3.6.68-arm64.dmg |
+| macOS (Intel) | Anything-Analyzer-3.6.68-x64.dmg |
+| Linux | Anything-Analyzer-3.6.68.AppImage |

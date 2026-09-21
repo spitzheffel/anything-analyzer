@@ -70,6 +70,10 @@ export const BUILTIN_REQUEST_TOOLS: MCPToolInfo[] = [
           type: "boolean",
           description: "是否尽量返回完整字段（仍受安全上限约束）。默认 false，长字段会截断。",
         },
+        offset: {
+          type: "number",
+          description: "正文起始偏移（字符，从 0 开始）。正文超过上限时截断标记会给出续查调用；建议配合单个 seq 使用。",
+        },
       },
       required: [],
     },
@@ -88,6 +92,28 @@ function clip(value: string | null | undefined, label: string, limit: number): s
   if (!value) return null;
   if (value.length <= limit) return value;
   return `${value.slice(0, limit)}\n...[${label} truncated ${value.length - limit} chars]`;
+}
+
+/**
+ * 正文字段：从 offset 起取一段，并在标记里给出区间、总长和续查调用。
+ * 捕获层单条正文最大 1MB，只给第一段等于让模型永远看不到后面。
+ */
+function clipBody(
+  value: string | null | undefined,
+  label: string,
+  limit: number,
+  offset: number,
+  continuation: (nextOffset: number) => string,
+): string | null {
+  if (!value) return null;
+  if (offset >= value.length) {
+    return `[${label}共 ${value.length} 字符，offset=${offset} 已越过正文末尾]`;
+  }
+  const end = Math.min(value.length, offset + limit);
+  // 一次就取完且是从头取：保持和改动前完全一致的输出
+  if (offset === 0 && end === value.length) return value;
+  const more = end < value.length ? `，续看：${continuation(end)}` : "";
+  return `${value.slice(offset, end)}\n...[${label} ${offset}-${end}/${value.length} 字符${more}]`;
 }
 
 function formatBytes(n?: number): string {
@@ -116,8 +142,10 @@ export function formatRequestIndexLine(s: RequestSummary): string {
   return `#${s.seq} ${s.method} ${s.url} @ ${formatTimestamp(s.timestamp)} -> ${s.status ?? "pending"}${ct} body=${formatBytes(s.bodyBytes)} resp=${formatBytes(s.responseBytes)}${flagText}`;
 }
 
-export function formatRequestDetail(req: FilteredRequest, full = false): string {
+export function formatRequestDetail(req: FilteredRequest, full = false, offset = 0): string {
   const limit = full ? FULL_FIELD_CHARS : DEFAULT_FIELD_CHARS;
+  const continuation = (nextOffset: number): string =>
+    `get_request_detail({seq: ${req.seq}${full ? ", full: true" : ""}, offset: ${nextOffset}})`;
   const lines = [
     `# 请求 #${req.seq}`,
     `${req.method} ${req.url} → ${req.status ?? "pending"}`,
@@ -126,12 +154,12 @@ export function formatRequestDetail(req: FilteredRequest, full = false): string 
     "## 请求头",
     JSON.stringify(req.headers, null, 2),
   ];
-  const body = clip(req.body, "body", limit);
+  const body = clipBody(req.body, "请求体", limit, offset, continuation);
   if (body) lines.push("", "## 请求体", body);
   if (req.responseHeaders) {
     lines.push("", "## 响应头", JSON.stringify(req.responseHeaders, null, 2));
   }
-  const responseBody = clip(req.responseBody, "response", limit);
+  const responseBody = clipBody(req.responseBody, "响应体", limit, offset, continuation);
   if (responseBody) lines.push("", "## 响应体", responseBody);
   if (req.hooks.length > 0) {
     lines.push("", "## 关联 JS Hooks");
@@ -165,6 +193,8 @@ export function handleGetRequestDetail(
   requestMap: Map<number, FilteredRequest>,
 ): ToolCallOutcome {
   const full = args.full === true;
+  const rawOffset = typeof args.offset === "number" ? args.offset : Number(args.offset);
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
   const seqs = parseSeqList(args);
   if (seqs.length === 0) {
     return { result: "Error: 请提供 seq 或 seqs", fetchedSeqs: [], refLine: "[get_request_detail](error=missing_seq)" };
@@ -185,13 +215,13 @@ export function handleGetRequestDetail(
       parts.push(`Error: 未找到序号为 ${seq} 的请求`);
     } else {
       fetchedSeqs.push(seq);
-      parts.push(formatRequestDetail(req, full));
+      parts.push(formatRequestDetail(req, full, offset));
     }
   }
   return {
     result: parts.join("\n\n---\n\n"),
     fetchedSeqs,
-    refLine: `[get_request_detail](seqs=${fetchedSeqs.join(",") || seqs.join(",")})`,
+    refLine: `[get_request_detail](seqs=${fetchedSeqs.join(",") || seqs.join(",")}${offset > 0 ? `,offset=${offset}` : ""})`,
   };
 }
 

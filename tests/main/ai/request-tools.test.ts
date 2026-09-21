@@ -84,11 +84,46 @@ describe("request tools", () => {
     const longBody = "x".repeat(20_000);
     map.set(9, req({ seq: 9, method: "POST", url: "https://api.example.com/big", body: longBody }));
     const clipped = handleGetRequestDetail({ seq: 9 }, map);
-    expect(clipped.result).toContain("truncated");
+    expect(clipped.result).toContain("请求体 0-8000/20000 字符");
     const full = handleGetRequestDetail({ seqs: [1, 2], full: true }, map);
     expect(full.fetchedSeqs).toEqual([1, 2]);
     expect(full.result).toContain("access_token");
     expect(full.result).toContain("---");
+  });
+
+  it("pages through a body too long for one call, and says how to continue", () => {
+    // 捕获层单条正文最大 1MB；40000 的上限意味着要分 26 段
+    const body = `HEAD${"x".repeat(1_000_000)}`.slice(0, 1_000_000 - 11) + "TAIL-MARKER";
+    const big = new Map([[5, req({ seq: 5, method: "POST", url: "https://api.example.com/huge", responseBody: body })]]);
+
+    const first = handleGetRequestDetail({ seq: 5, full: true }, big);
+    expect(first.result).toContain("HEAD");
+    expect(first.result).not.toContain("TAIL-MARKER");
+    // 标记要给出区间、总长和可以照抄的续查调用
+    expect(first.result).toContain("响应体 0-40000/1000000 字符");
+    expect(first.result).toContain("get_request_detail({seq: 5, full: true, offset: 40000})");
+
+    const last = handleGetRequestDetail({ seq: 5, full: true, offset: 960_000 }, big);
+    expect(last.result).toContain("TAIL-MARKER");
+    expect(last.result).toContain("响应体 960000-1000000/1000000 字符");
+    // 已经到底了就不该再给续查调用
+    expect(last.result).not.toContain("续看");
+    expect(last.refLine).toContain("offset=960000");
+
+    const past = handleGetRequestDetail({ seq: 5, full: true, offset: 2_000_000 }, big);
+    expect(past.result).toContain("已越过正文末尾");
+  });
+
+  it("leaves a body that fits byte-identical, and ignores a nonsense offset", () => {
+    const small = new Map([[6, req({ seq: 6, method: "POST", url: "https://api.example.com/s", body: '{"a":1}' })]]);
+
+    const plain = handleGetRequestDetail({ seq: 6 }, small);
+    expect(plain.result).toContain('{"a":1}');
+    expect(plain.result).not.toContain("字符]");
+    expect(plain.refLine).not.toContain("offset");
+
+    expect(handleGetRequestDetail({ seq: 6, offset: -5 }, small).result).toBe(plain.result);
+    expect(handleGetRequestDetail({ seq: 6, offset: "abc" }, small).result).toBe(plain.result);
   });
 
   it("dispatches builtin tool names", () => {

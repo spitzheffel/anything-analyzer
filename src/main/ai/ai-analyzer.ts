@@ -32,7 +32,7 @@ import type {
 } from "../db/repositories";
 import { DataAssembler } from "./data-assembler";
 import { PromptBuilder } from "./prompt-builder";
-import { LLMRouter } from "./llm-router";
+import { LLMRouter, extractJsonArrayText } from "./llm-router";
 import { LLMRequestCancelledError } from "./llm-fetch";
 import { resolveRoleConfig } from "./llm-roles";
 import { computeReportTokenBudget, extractProtocolSpec } from "./spec-extractor";
@@ -368,6 +368,8 @@ export class AiAnalyzer {
           const phase1Router = this.createRouter(sessionId, null, "filter", phase1Config);
           const validSeqs = new Set(fullData.requests.map((r) => r.seq));
           const selected = new Set<number>();
+          const batchCount = Math.ceil(allSummaries.length / FILTER_BATCH_SIZE);
+          let unparsedBatches = 0;
 
           for (let batchStart = 0; batchStart < allSummaries.length; batchStart += FILTER_BATCH_SIZE) {
             const batchSummaries = allSummaries.slice(batchStart, batchStart + FILTER_BATCH_SIZE);
@@ -383,17 +385,28 @@ export class AiAnalyzer {
             ];
 
             const batchNumber = Math.floor(batchStart / FILTER_BATCH_SIZE) + 1;
-            const batchCount = Math.ceil(allSummaries.length / FILTER_BATCH_SIZE);
             onProgress?.(statusEvent(`正在过滤第 ${batchNumber}/${batchCount} 批请求（${batchSummaries.length} 条）...`));
             signal?.throwIfAborted();
             const phase1Result = await phase1Router.complete(phase1Messages, undefined, signal);
             filterPromptTokens = (filterPromptTokens ?? 0) + phase1Result.promptTokens;
             filterCompletionTokens = (filterCompletionTokens ?? 0) + phase1Result.completionTokens;
-            this.parseFilterResponse(phase1Result.content, validSeqs)?.forEach((seq) => selected.add(seq));
+            const batchSeqs = this.parseFilterResponse(phase1Result.content, validSeqs);
+            if (batchSeqs) batchSeqs.forEach((seq) => selected.add(seq));
+            else unparsedBatches += 1;
+          }
+
+          if (unparsedBatches > 0) {
+            onProgress?.(statusEvent(
+              `预过滤有 ${unparsedBatches}/${batchCount} 批的回复无法解析，这些批次的请求没有参与筛选。`,
+            ));
           }
 
           const filteredSeqs = [...selected];
-          if (filteredSeqs.length >= PRE_FILTER_MIN_SELECTED) {
+          // 过半批次解析失败时筛选结果不具代表性，和"选出来太少"一样不予采信
+          const trustworthy = unparsedBatches * 2 <= batchCount;
+          if (!trustworthy) {
+            onProgress?.(statusEvent(`过滤结果不可信，使用全部 ${fullData.requests.length} 条请求分析。`));
+          } else if (filteredSeqs.length >= PRE_FILTER_MIN_SELECTED) {
             analysisData = assembler.filterBySeqs(fullData, filteredSeqs);
             filteredApplied = true;
             onProgress?.(statusEvent(
@@ -615,12 +628,16 @@ export class AiAnalyzer {
     );
   }
 
+  /**
+   * 过滤模型应当只回一个 JSON 数组，但很多模型会在前后加一句话。
+   * 从正文里抠出数组而不是整段 JSON.parse：解析失败意味着整批请求不参与筛选。
+   */
   private parseFilterResponse(raw: string, validSeqs: Set<number>): number[] | null {
-    let cleaned = raw.trim();
-    cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, "").replace(/\n?```\s*$/, "");
+    const text = extractJsonArrayText(raw);
+    if (!text) return null;
 
     try {
-      const parsed = JSON.parse(cleaned);
+      const parsed = JSON.parse(text);
       if (!Array.isArray(parsed)) return null;
       const nums = parsed.filter((n): n is number => typeof n === "number" && validSeqs.has(n));
       return nums.length > 0 ? nums : null;

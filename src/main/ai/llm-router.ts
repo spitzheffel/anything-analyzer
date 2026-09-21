@@ -218,6 +218,17 @@ export function extractJsonObjectText(text: string): string | null {
   return unfenced.slice(start, end + 1);
 }
 
+/**
+ * 从模型的自由文本里抠出 JSON 数组：去掉 ``` 围栏，取第一个 [ 到最后一个 ] 之间的内容。
+ */
+export function extractJsonArrayText(text: string): string | null {
+  const unfenced = text.replace(/```(?:json)?\s*([\s\S]*?)```/gi, "$1");
+  const start = unfenced.indexOf("[");
+  const end = unfenced.lastIndexOf("]");
+  if (start < 0 || end <= start) return null;
+  return unfenced.slice(start, end + 1);
+}
+
 /** 结构化输出这一路关闭 OpenAI 的 strict schema：schema 里有 default / nullable，strict 模式会拒绝 */
 function withRelaxedSchemaOptions(providerOptions: ProviderOptions | undefined): ProviderOptions {
   const openai = { ...(providerOptions?.openai ?? {}), strictJsonSchema: false };

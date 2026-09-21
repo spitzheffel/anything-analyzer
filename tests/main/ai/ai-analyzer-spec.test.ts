@@ -16,12 +16,19 @@ const routerBehaviour = {
   hangUntilAborted: false,
   toolCalls: 0,
   lastToolSignal: undefined as AbortSignal | undefined,
+  /** 非空时 complete() 返回它：analyze 流程里只有预过滤走 complete */
+  completeText: null as string | null,
 };
 
-vi.mock("../../../src/main/ai/llm-router", () => {
+vi.mock("../../../src/main/ai/llm-router", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../../src/main/ai/llm-router")>();
   class FakeRouter {
     async complete() {
-      return { content: routerBehaviour.analysisText, promptTokens: 10, completionTokens: 5 };
+      return {
+        content: routerBehaviour.completeText ?? routerBehaviour.analysisText,
+        promptTokens: 10,
+        completionTokens: 5,
+      };
     }
     async completeWithTools(
       _messages: unknown,
@@ -46,7 +53,7 @@ vi.mock("../../../src/main/ai/llm-router", () => {
       return { output, promptTokens: 3, completionTokens: 2, degraded: false };
     }
   }
-  return { LLMRouter: FakeRouter, DEFAULT_MAX_TOOL_ROUNDS: 64 };
+  return { ...actual, LLMRouter: FakeRouter };
 });
 
 import { AiAnalyzer } from "../../../src/main/ai/ai-analyzer";
@@ -81,9 +88,11 @@ function request(sequence: number, url: string): CapturedRequest {
   };
 }
 
-function makeAnalyzer() {
+function makeAnalyzer(requestCount?: number) {
   const reports = new Map<string, AnalysisReport>();
-  const requests = [request(1, "https://api.example.com/v1/login"), request(2, "https://api.example.com/v1/me")];
+  const requests = requestCount
+    ? Array.from({ length: requestCount }, (_, i) => request(i + 1, `https://api.example.com/v1/r/${i + 1}`))
+    : [request(1, "https://api.example.com/v1/login"), request(2, "https://api.example.com/v1/me")];
   const repos = {
     sessionsRepo: { findById: () => ({ id: "s1", name: "demo", target_url: "https://example.com" }) },
     requestsRepo: {
@@ -121,6 +130,7 @@ beforeEach(() => {
   routerBehaviour.hangUntilAborted = false;
   routerBehaviour.toolCalls = 0;
   routerBehaviour.lastToolSignal = undefined;
+  routerBehaviour.completeText = null;
   // 失败路径会打一条预期内的 warn，别让它污染测试输出
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -257,5 +267,40 @@ describe("AiAnalyzer.chat cancellation", () => {
       analyzer.chat("s1", config, [], "问题", undefined, "r1", controller.signal),
     ).rejects.toThrow();
     expect(routerBehaviour.toolCalls).toBe(0);
+  });
+});
+
+describe("AiAnalyzer pre-filter", () => {
+  // legacy_inline 才走预过滤；250 条请求分成 3 批
+  const inlineConfig = {
+    ...config,
+    contextBudget: { subagentEnabled: false, contextMode: "legacy_inline" as const },
+  };
+
+  it("accepts a filter reply that wraps its JSON array in prose", async () => {
+    routerBehaviour.structured = async () => sampleSpec;
+    routerBehaviour.completeText = "好的，相关请求如下：\n[1, 2, 3, 4, 5]\n\n这些是登录链路。";
+    const { analyzer } = makeAnalyzer(250);
+    const events: AiProgressEvent[] = [];
+
+    await analyzer.analyze("s1", inlineConfig, (e) => events.push(e));
+    const statuses = events.flatMap((e) => (e.kind === "status" ? [e.text] : []));
+
+    expect(statuses.some((t) => t.includes("过滤完成") && t.includes("选出 5 条"))).toBe(true);
+    expect(statuses.some((t) => t.includes("无法解析"))).toBe(false);
+  });
+
+  it("says so and keeps every request when the filter replies cannot be parsed", async () => {
+    routerBehaviour.structured = async () => sampleSpec;
+    routerBehaviour.completeText = "相关序号：1、2、3";
+    const { analyzer } = makeAnalyzer(250);
+    const events: AiProgressEvent[] = [];
+
+    await analyzer.analyze("s1", inlineConfig, (e) => events.push(e));
+    const statuses = events.flatMap((e) => (e.kind === "status" ? [e.text] : []));
+
+    expect(statuses.some((t) => t.includes("3/3 批的回复无法解析"))).toBe(true);
+    expect(statuses.some((t) => t.includes("过滤结果不可信"))).toBe(true);
+    expect(statuses.some((t) => t.includes("过滤完成"))).toBe(false);
   });
 });

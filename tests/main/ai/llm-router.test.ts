@@ -5,6 +5,7 @@ import { APICallError, NoObjectGeneratedError, NoOutputGeneratedError } from "ai
 import type { AiProgressEvent, AiRequestLogData, LLMProviderConfig } from "../../../src/shared/types";
 import {
   LLMRouter,
+  extractJsonArrayText,
   extractJsonObjectText,
   isStructuredOutputShapeError,
   truncateTrailingToolResults,
@@ -535,6 +536,18 @@ describe("isStructuredOutputShapeError", () => {
     expect(isStructuredOutputShapeError(new NoObjectGeneratedError({ message: "no object", text: "x", response: { id: "r", timestamp: new Date(), modelId: "m" }, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, inputTokenDetails: { noCacheTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, outputTokenDetails: { textTokens: 0, reasoningTokens: 0 } } as never, finishReason: "stop" as never }))).toBe(true);
     // generateText + Output.object 抛的是 NoOutputGeneratedError，不是 generateObject 的 NoObjectGeneratedError
     expect(isStructuredOutputShapeError(new NoOutputGeneratedError({}))).toBe(true);
+  });
+});
+
+describe("extractJsonArrayText", () => {
+  it("recovers the array from fences and surrounding prose", () => {
+    expect(extractJsonArrayText("[1, 3, 5]")).toBe("[1, 3, 5]");
+    expect(extractJsonArrayText("```json\n[1, 3]\n```")).toBe("[1, 3]");
+    expect(extractJsonArrayText("好的，相关请求如下：\n[1, 3, 5]")).toBe("[1, 3, 5]");
+    expect(extractJsonArrayText("[1, 3, 5]\n\n这些是登录相关的请求。")).toBe("[1, 3, 5]");
+    expect(extractJsonArrayText("```json\n[1, 3]\n```\n说明：...")).toBe("[1, 3]");
+    expect(extractJsonArrayText("相关序号：1, 3, 5")).toBeNull();
+    expect(extractJsonArrayText("]乱序[")).toBeNull();
   });
 });
 

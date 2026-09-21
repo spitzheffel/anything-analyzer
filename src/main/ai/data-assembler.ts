@@ -40,7 +40,8 @@ export class DataAssembler {
       sessionStorage: this.calcDiff(allSnapshots, 'sessionStorage')
     }
 
-    this.applyTokenBudget(assembledRequests)
+    // 这里不削正文：assemble 的产物同时喂给工具、搜索和规则派生，
+    // 只有"正文要内联进提示词"那一路需要预算，见 budgetInlineBodies。
 
     // Extract crypto-related JS snippets from stored JS response bodies
     const cryptoExtractor = new CryptoScriptExtractor(this.requestsRepo, this.jsHooksRepo)
@@ -89,6 +90,30 @@ export class DataAssembler {
     }
     for (const key of Object.keys(first)) { if (!(key in last)) removed.push(key) }
     return { added, changed, removed }
+  }
+
+  /**
+   * 正文真要内联进提示词时（legacy_inline）才用：返回一份把最大响应体削进预算的副本。
+   *
+   * 不能在 assemble 里就地削：
+   * - get_request_detail / search_requests 读的是同一批对象，削掉就再也拿不回来，
+   *   full=true 也没用，搜索还会在被丢掉的那 3/4 里漏掉命中；
+   * - extractAuthChain 对响应体做 JSON.parse，截断过的 JSON 一定解析失败，
+   *   整条鉴权链会被 catch 静默吞掉。
+   * 工具那一路本来就有自己的两层预算（clip 的 8k/40k 每字段，
+   * 以及 createToolResultLimiter 按实时上下文预算收口），不依赖这里。
+   */
+  budgetInlineBodies(data: AssembledData): AssembledData {
+    const requests = data.requests.map(request => ({ ...request }))
+    this.applyTokenBudget(requests)
+    const bySeq = new Map(requests.map(request => [request.seq, request]))
+    return {
+      ...data,
+      requests,
+      // streamingRequests 原本和 requests 指向同一批对象，副本也要跟着换，否则这一段仍会内联全文
+      streamingRequests: data.streamingRequests.map(request => bySeq.get(request.seq) ?? request),
+      estimatedTokens: this.estimateTokens(requests, data.storageDiff),
+    }
   }
 
   private applyTokenBudget(requests: FilteredRequest[]): void {

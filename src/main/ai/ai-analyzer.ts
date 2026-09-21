@@ -435,8 +435,10 @@ export class AiAnalyzer {
 
     const promptBuilder = new PromptBuilder();
     const summariesForPrompt = indexFirst || filteredApplied ? allSummaries : undefined;
+    // 只有 legacy_inline 会把正文写进提示词，也只有它需要正文预算
+    const promptData = indexFirst ? analysisData : assembler.budgetInlineBodies(analysisData);
     const { system, user: baseUser } = promptBuilder.build(
-      analysisData,
+      promptData,
       platformName,
       purpose,
       template,

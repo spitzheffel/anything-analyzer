@@ -2,6 +2,7 @@ import {
   APICallError,
   JSONParseError,
   NoObjectGeneratedError,
+  NoOutputGeneratedError,
   Output,
   RetryError,
   TypeValidationError,
@@ -252,6 +253,12 @@ function appendToLastUserMessage(messages: MessageLike[], suffix: string): Messa
 export function isStructuredOutputShapeError(error: unknown): boolean {
   if (RetryError.isInstance(error)) return isStructuredOutputShapeError(error.lastError);
   if (NoObjectGeneratedError.isInstance(error)) return true;
+  // generateText + Output.object raises NoOutputGeneratedError, not the
+  // NoObjectGeneratedError that generateObject raises. Missing it left the
+  // fallback below unreachable for the very case it exists to handle: the
+  // model returned nothing usable, which is a shape problem and worth one
+  // plain-text retry.
+  if (NoOutputGeneratedError.isInstance(error)) return true;
   if (TypeValidationError.isInstance(error) || JSONParseError.isInstance(error)) return true;
   if (APICallError.isInstance(error)) {
     return error.statusCode === 400 || error.statusCode === 422;

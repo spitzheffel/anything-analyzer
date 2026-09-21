@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MockLanguageModelV4, simulateReadableStream } from "ai/test";
 import { z } from "zod";
-import { APICallError, NoObjectGeneratedError } from "ai";
+import { APICallError, NoObjectGeneratedError, NoOutputGeneratedError } from "ai";
 import type { AiProgressEvent, AiRequestLogData, LLMProviderConfig } from "../../../src/shared/types";
 import {
   LLMRouter,
@@ -498,6 +498,29 @@ describe("LLMRouter.completeStructured (behaviour via mock model)", () => {
     expect(result.output).toEqual({ name: "y", tags: [] });
     expect(result.degraded).toBe(true);
   });
+
+  it("does fall back when the model produces no output at all", async () => {
+    // generateText 只在 finishReason 为 stop、或非 tool-calls 且有正文时才解析 output；
+    // 否则 result.output 这个 getter 抛 NoOutputGeneratedError（"No output generated."）。
+    // 真实情况：第三方端点在没写出正文就耗尽 token，或直接回一个 tool-calls 结束原因。
+    const model = new MockLanguageModelV4({
+      doGenerate: {
+        content: [],
+        finishReason: { unified: "length", raw: "length" },
+        usage: usage(9, 4),
+        warnings: [],
+      } as never,
+      doStream: { stream: simulateReadableStream({ chunks: textStream('{"name":"z"}', { input: 5, output: 2 }) }) },
+    });
+    const router = new LLMRouter(baseConfig, undefined, undefined, undefined, { model });
+
+    const result = await router.completeStructured([{ role: "user", content: "extract" }], schema);
+
+    expect(result.output).toEqual({ name: "z", tags: [] });
+    expect(result.degraded).toBe(true);
+    expect(result.promptTokens).toBe(9 + 5);
+    expect(result.completionTokens).toBe(4 + 2);
+  });
 });
 
 describe("isStructuredOutputShapeError", () => {
@@ -510,6 +533,8 @@ describe("isStructuredOutputShapeError", () => {
     expect(isStructuredOutputShapeError(api(500))).toBe(false);
     expect(isStructuredOutputShapeError(new Error("网络请求失败"))).toBe(false);
     expect(isStructuredOutputShapeError(new NoObjectGeneratedError({ message: "no object", text: "x", response: { id: "r", timestamp: new Date(), modelId: "m" }, usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, inputTokenDetails: { noCacheTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 }, outputTokenDetails: { textTokens: 0, reasoningTokens: 0 } } as never, finishReason: "stop" as never }))).toBe(true);
+    // generateText + Output.object 抛的是 NoOutputGeneratedError，不是 generateObject 的 NoObjectGeneratedError
+    expect(isStructuredOutputShapeError(new NoOutputGeneratedError({}))).toBe(true);
   });
 });
 

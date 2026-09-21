@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { LLMProviderConfig } from "../../../src/shared/types";
 import {
-  EXTRACT_MAX_OUTPUT_TOKENS,
+  EXTRACT_SPEC_OUTPUT_TOKENS,
+  EXTRACT_UNKNOWN_MODEL_OUTPUT_TOKENS,
   isLightweightRole,
   LIGHTWEIGHT_MAX_TOKENS,
   resolveExtractMaxTokens,
@@ -38,23 +39,37 @@ describe("extract role output cap", () => {
     expect(resolveRoleConfig(small, "extract").maxTokens).toBe(10_000);
   });
 
-  it("scales with the window instead of sitting at a hard-coded 8192", () => {
-    expect(resolveExtractMaxTokens({ ...base, maxTokens: 1024 }, "gpt-5-mini")).toBe(EXTRACT_MAX_OUTPUT_TOKENS);
+  it("follows the model's own output limit, up to what a Spec needs", () => {
+    // 改之前所有模型都被压在写死的 8192
+    const big = { ...base, maxTokens: 1024, contextBudget: { maxContextTokens: 1_000_000, autoContextWindow: false } };
+    // 声明得比一份 Spec 需要的还多时，多出来的那部分只会从报告预算里扣，所以不要
+    expect(resolveExtractMaxTokens(big, "gpt-5")).toBe(EXTRACT_SPEC_OUTPUT_TOKENS);
+    expect(resolveExtractMaxTokens(big, "o3")).toBe(EXTRACT_SPEC_OUTPUT_TOKENS);
+    // 声明得少的就按它自己的来，不会被顶上去
+    expect(resolveExtractMaxTokens(big, "claude-sonnet-4-5")).toBe(64_000);
+    expect(resolveExtractMaxTokens(big, "gpt-4o")).toBe(16_384);
+    expect(resolveExtractMaxTokens(big, "claude-3-5-sonnet-20241022")).toBe(8_192);
+  });
 
-    // 用户实际配置：1M 窗口 + 主配置 4096 输出 + 模型表里没有的中转模型。
+  it("still lets the window share bound a model that claims a lot", () => {
+    // gpt-5 声明 128k 输出，但 200k 窗口里 25% 的份额只有 50k——再多提示词就没地方放了
+    const tight = { ...base, maxTokens: 1024, contextBudget: { maxContextTokens: 200_000, autoContextWindow: false } };
+    expect(resolveExtractMaxTokens(tight, "gpt-5")).toBe(50_000);
+  });
+
+  it("stays conservative for a model the table does not know", () => {
+    // 用户实际配置：1M 窗口 + 主配置 4096 输出 + 中转的自定义模型名。
     // 改之前这里是 8192，抽取每次正好吐满 8192、JSON 断在半截。
     const reported = {
       ...base,
       maxTokens: 4_096,
       contextBudget: { maxContextTokens: 1_000_000, autoContextWindow: true },
     };
-    expect(resolveExtractMaxTokens(reported, "step-3.7-flash")).toBe(EXTRACT_MAX_OUTPUT_TOKENS);
-  });
+    expect(resolveExtractMaxTokens(reported, "step-3.7-flash")).toBe(EXTRACT_UNKNOWN_MODEL_OUTPUT_TOKENS);
 
-  it("does not scale past the cap however big the window is", () => {
+    // 窗口再大也不替一个不认识的模型开更高的口
     const huge = { ...base, maxTokens: 1024, contextBudget: { maxContextTokens: 4_000_000, autoContextWindow: false } };
-    // 份额算出来是 100 万，但没有服务端会接受这个输出上限
-    expect(resolveExtractMaxTokens(huge, "mystery-1")).toBe(EXTRACT_MAX_OUTPUT_TOKENS);
+    expect(resolveExtractMaxTokens(huge, "mystery-1")).toBe(EXTRACT_UNKNOWN_MODEL_OUTPUT_TOKENS);
   });
 
   it("respects a model whose own output limit is lower than 8192", () => {
@@ -63,8 +78,10 @@ describe("extract role output cap", () => {
   });
 
   it("keeps a larger user-configured limit", () => {
-    // 比封顶还大的用户配置照样保留（gpt-5 自身上限 128k，窗口份额 100k）
-    expect(resolveExtractMaxTokens({ ...base, maxTokens: 64_000 }, "gpt-5")).toBe(64_000);
+    // 用户配置比我们自己算出来的目标还大时照样保留（gpt-5 自身上限 128k，400k 窗口份额 100k）
+    expect(resolveExtractMaxTokens({ ...base, maxTokens: 80_000 }, "gpt-5")).toBe(80_000);
+    // 但仍然不能突破窗口份额
+    expect(resolveExtractMaxTokens({ ...base, maxTokens: 200_000 }, "gpt-5")).toBe(100_000);
   });
 
   it("will not let the output limit eat a small window", () => {
@@ -75,9 +92,9 @@ describe("extract role output cap", () => {
     const unknownSmall = { ...base, maxTokens: 8_192, contextBudget: { maxContextTokens: 16_000, autoContextWindow: false } };
     expect(resolveExtractMaxTokens(unknownSmall, "mystery-1")).toBe(4_000);
 
-    // 大窗口给到封顶
+    // 大窗口给到未知模型的保守值
     const unknownLarge = { ...base, maxTokens: 8_192, contextBudget: { maxContextTokens: 200_000, autoContextWindow: false } };
-    expect(resolveExtractMaxTokens(unknownLarge, "mystery-1")).toBe(EXTRACT_MAX_OUTPUT_TOKENS);
+    expect(resolveExtractMaxTokens(unknownLarge, "mystery-1")).toBe(EXTRACT_UNKNOWN_MODEL_OUTPUT_TOKENS);
   });
 
   it("uses the lightweight model when deciding the cap", () => {

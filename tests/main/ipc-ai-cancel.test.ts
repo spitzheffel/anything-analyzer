@@ -84,12 +84,27 @@ function setup() {
     buildInitialChatMessages: () => [],
   };
 
+  // "*" = 整会话删除，其余是被单独删掉的报告 id
+  const deleted: string[] = [];
+  const noopRepo = { deleteBySession: vi.fn() };
+
   registerIpcHandlers({
-    sessionManager: {},
+    sessionManager: {
+      withCaptureDataClear: async (_id: string, clear: () => void) => clear(),
+    },
     aiAnalyzer,
     windowManager: { getMainWindow: vi.fn(() => null) },
     mcpManager: { connectAll: vi.fn(), hasConnections: () => false },
-    reportsRepo: { findById: () => undefined },
+    requestsRepo: noopRepo,
+    jsHooksRepo: noopRepo,
+    storageSnapshotsRepo: noopRepo,
+    interactionEventsRepo: noopRepo,
+    reportsRepo: {
+      findById: () => undefined,
+      findBySession: () => [{ id: "r1" }],
+      deleteBySession: () => void deleted.push("*"),
+      deleteById: (id: string) => void deleted.push(id),
+    },
     chatMessagesRepo: { insertMany: vi.fn(), append: vi.fn(), findByReport: () => [] },
     browserCoordinator: {},
   } as unknown as Parameters<typeof registerIpcHandlers>[0]);
@@ -99,7 +114,7 @@ function setup() {
     if (!found) throw new Error(`${channel} was not registered`);
     return found;
   };
-  return { analyzeCalls, chatCalls, handler };
+  return { analyzeCalls, chatCalls, deleted, handler };
 }
 
 beforeEach(() => {
@@ -177,5 +192,28 @@ describe("AI cancellation IPC", () => {
     expect(chatCalls).toHaveLength(2);
     expect(chatCalls[1].signal?.aborted).toBe(true);
     await expect(second).rejects.toThrow("aborted");
+  });
+
+  it("keeps a report protected while a replaced follow-up is still unwinding", async () => {
+    const { deleted, handler } = setup();
+
+    const first = handler("ai:chat")({}, "s1", "r1", [], "第一问");
+    first.catch(() => {});
+    await Promise.resolve();
+
+    const second = handler("ai:chat")({}, "s1", "r1", [], "第二问");
+    second.catch(() => {});
+    await expect(first).rejects.toThrow("aborted");
+    await Promise.resolve();
+
+    // 第一次追问已经结束，但第二次还在跑：报告不能被级联删掉
+    await handler("data:clear")({}, "s1");
+    expect(deleted).toEqual([]);
+
+    await handler("ai:cancelChat")({}, "s1");
+    await expect(second).rejects.toThrow("aborted");
+
+    await handler("data:clear")({}, "s1");
+    expect(deleted).toEqual(["*"]);
   });
 });

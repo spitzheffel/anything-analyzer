@@ -76,7 +76,17 @@ const analysisControllers = new Map<string, AbortController>();
 const chatControllers = new Map<string, AbortController>();
 
 /** Report IDs with in-flight chat calls — protected from cascade deletion */
-const activeChatReports = new Set<string>();
+const activeChatReports = new Map<string, number>();
+
+function retainChatReport(reportId: string): void {
+  activeChatReports.set(reportId, (activeChatReports.get(reportId) ?? 0) + 1);
+}
+
+function releaseChatReport(reportId: string): void {
+  const remaining = (activeChatReports.get(reportId) ?? 0) - 1;
+  if (remaining > 0) activeChatReports.set(reportId, remaining);
+  else activeChatReports.delete(reportId);
+}
 
 export function registerIpcHandlers(deps: {
   sessionManager: SessionManager;
@@ -492,7 +502,8 @@ export function registerIpcHandlers(deps: {
       }
       return report;
     } finally {
-      analysisControllers.delete(sessionId);
+      // 只清自己那一个：后来的分析可能已经把表里换成了它的 controller
+      if (analysisControllers.get(sessionId) === controller) analysisControllers.delete(sessionId);
     }
   });
 
@@ -537,7 +548,7 @@ export function registerIpcHandlers(deps: {
         : undefined;
 
       if (reportId) {
-        activeChatReports.add(reportId);
+        retainChatReport(reportId);
       }
 
       chatControllers.get(sessionId)?.abort();
@@ -558,7 +569,7 @@ export function registerIpcHandlers(deps: {
         // 只清自己那一个：后来的追问可能已经把表里换成了它的 controller
         if (chatControllers.get(sessionId) === controller) chatControllers.delete(sessionId);
         if (reportId) {
-          activeChatReports.delete(reportId);
+          releaseChatReport(reportId);
         }
       }
     },

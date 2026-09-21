@@ -1,57 +1,44 @@
-# Anything Analyzer v3.6.73
+# Anything Analyzer v3.6.74
 
-3.6.72 的健康面板在一次真实会话上给出「已确认丢失 34 条 / 已知丢失事件 434」。数是对的——问题在于它数出来的东西：**434 里有 426 是页面里的 bridge 自己扔掉的加密操作记录**，而且这条路一直存在，只是以前没被标出来。
+3.6.73 装上后在同一个站再抓了一次。好消息：`producer-queue-loss` 归零，2,120 条 crypto 记录里 166 条是以前必丢的 >16 KB buffer，最大 91 KB 整条落库。坏消息：健康面板上多了 2 条「传送延迟 / `ingestion-invalid` / Dropped: 0」——那是 3.6.73 自己引入的回归，而且比原来的问题更糟：它连丢失都不算。
 
 ## 修复
 
-- **`crypto.subtle` 在 ≥16 KB 数据上的操作两条记录全丢** — 30 条 `producer-queue-loss` 里 26 条是 OpenPGP worker，几乎每条正好 16 个事件，全部在同一秒（邮箱加载、worker 池拉起），而这些 realm 的队列是空的。不是队列满（上限 4096 条 / 2 MB），不是背压（要全局压到 32 MB），是**单个事件超过 bridge 64 KB 的上限被静默丢掉**：`crypto.subtle.sign/digest/encrypt/decrypt` 的钩子把 buffer 整个转 hex 且没有上限，B 字节 → 2B 字符，进 `enqueue` 一量超过 64 KB 就 `droppedEvents += 1`。每次调用发两个事件（调用 + `.result`，后者还带着同一份参数），所以一次操作丢两条；16 条 = 8 次大 buffer 操作，一个固定的初始化序列。用真实 bootstrap 实测阈值：
+- **第五道尺寸限制** — 3.6.73 的说明写了"一个事件要过四道限制"，是错的，有五道：仓储的 `validateBatch` 还按 256 KB / 2 MB 校验。bridge 放过的批次到仓储被整批判 `invalid`，没有回执，producer 原样重发、永远进不了库，还拖着同批的所有其它事件一起。receipts 表只记提交，所以那两批到底多少条已经无从知道。
 
-  ```
-  buffer=  8192 bytes  → dropped 0 of 2
-  buffer= 16000 bytes  → dropped 1 of 2
-  buffer= 16384 bytes  → dropped 2 of 2
-  ```
+  现在五道限制**只在 `capture-protocol.ts` 定义一次**：bootstrap 由构建时注入，controller 和仓储直接引用，不可能再各开各的。bootstrap 按 UTF-16 记（`chars*2+128`），utf8 字节数在任何文本上都不超过它，所以仓储按同一个数校验一定放得过 bridge 放过的东西。加了一条跨层测试：用真实 bootstrap 生成的批次直接过 `validateBatch`。
 
-  对「详解加密/签名流程」这个用途，这是正中要害的盲区：大 buffer 上的加密操作恰恰是最该看到的，而它们一条都不在库里。同一份文件里第三方库钩子走 `truncateArg`（500 字符），原生 `crypto.subtle` 却没截——两条路不一致。
+- **被仓储拒掉的批次记成「传送延迟」** — `invalid` 不是延迟：同一批内容会被原样重发、永远不会被接受。现在按**已知丢失**记数据事件的条数，realm 的 `pending` 如实显示卡住的队列（以前停在上次成功后的 0）。只数 hook / interaction，不数 control：realm 5 秒没确认时 controller 每次轮询会再入一条 `health-probe`，批次一直被拒它们就一直堆，按它们计数会让"丢失"每 750 ms 涨一条。同一批内容每次轮询都会再来，按序号只计一次。
 
-  **改法：整条保存到 1 MB，超过留头尾。** 边界和网络正文的 `MAX_BODY_SIZE = 1 MB` 对齐，不发明新数；超过 1 MB 的留头尾各 32 KB + `...[truncated: N bytes total, first and last 32768 shown]...`——头部有算法特征和魔数，尾部有 MAC / padding，长度本身也是线索。一个事件要过四道限制，只删第一道会在第二道死，所以一起开：
+- **会话中途销毁的 realm 在停止时被记成 `drain-timeout`** — 3.6.72 引入的标签错误。上次会话的 5 条 `drain-timeout` 全部对应停止前一到两分钟就销毁的 realm——它们没有超时，是早就没了。现在 `closeRealm` 当场按 `realm-destroyed-with-pending` 记已知丢失，排空只看还活着的 realm。
 
-  | 位置 | 之前 | 现在 |
-  |---|---|---|
-  | 单事件 | 64 KB | 9 MB（1 MB 的 decrypt 连结果约 8.4 MB） |
-  | 单批次 | 128 KB | 9 MB；且队头那条无论多大都进批次（批次循环从 0 起算，比批次还大的事件会永远卡在队头堵住后面所有事件） |
-  | 推送接收 | 512 K 字符 | 5 M 字符 |
-  | 队列总量 | 2 MB | 32 MB |
+## 关于「不会丢东西了吧」
 
-  代价：每个 realm 页内最多多占 32 MB，内存换完整性。推送是即时的，队列通常瞬间清空，实际远达不到上限。
-
-- **bridge 的丢弃只有一个总数** — 「太大」「队列满」「背压」「序列化抛错」四种情况合在一个 `droppedEvents` 里，健康面板上根本分不出来，上面那 426 条只能靠反推。现在按原因拆成四个计数器随 status 上报，controller 按原因各出一条 `producer-queue-loss` 缺口并带 `detail`，面板的 realm 行显示 `Dropped: 16 (event-oversize: 16)`。旧版 bootstrap 不上报时退回原来的单条缺口。
+不能这么说，这套抓包从设计上做不到那个承诺。这几天做的是**让每一条丢失被看见、贴对标签、能数就数出来**。上次会话的水位：35 个执行域、2,120 条加密记录，已知丢失 9 条（5 个随导航销毁的 realm 队列里的最后几条——那个 1/27 的固有竞争），覆盖未知 28 条。该警惕的是两种情况：某类丢失数量大（像 426 那次），或某条缺口说不出原因。
 
 ## 验证
 
-- 全量测试：638 passed，23 skipped。其中 `tests/main/db/capture-reliability.test.ts` 的 18 项需要 Electron 的原生模块 ABI（本机 `postinstall` 按 Electron 构建，Node 侧加载不了），改用 `node scripts/run-electron-vitest.mjs` 与迁移测试一起运行，32 项通过；CI 里由 `rebuild:native:node` 处理。
-- 新增 7 项回归测试，五次摘除验证（每次先断言锚点唯一命中）：单事件上限退回 64 KB 时 `expected 1 to be +0`；不按原因计数时 `expected { 'event-oversize': +0 } to match { 'event-oversize': 1 }`；controller 不分原因时 `expected [ [ null, 2 ] ] to deeply equal [ [ 'event-oversize', 1 ], … ]`；推送接收退回 512 K 时 `expected "spy" to be called 1 times, but got 0 times`；hook-script 不截时 `expected 'aa1111…' to contain '...[truncated: 1572864 bytes total…'`。
-- hook-script 的两条测试用真实编译出的注入脚本在 vm 里跑：200 KB 的 buffer 拿到 409,600 字符的完整 hex；1.5 MB 的拿到 `aa11…` 开头、`…11ff` 结尾、中间带标记。
+- 全量测试：641 passed，23 skipped。其中 `tests/main/db/capture-reliability.test.ts` 的 18 项需要 Electron 的原生模块 ABI，改用 `node scripts/run-electron-vitest.mjs` 与迁移测试一起运行，32 项通过；CI 里由 `rebuild:native:node` 处理。该文件里两条钉着旧上限（256 KB 载荷、12×200 KB 批次）的 fixture 改为引用共享常量。
+- 新增 3 项测试，五次摘除验证（每次先断言锚点唯一命中）：仓储限制退回 256 KB / 2 MB 时 `'Error: Invalid capture batch' was thrown`；被拒批次不记丢失时 `expected 'delivery-delay' to be 'known-loss'`；把 control 事件也算上时 `expected 5 to be 2`；销毁时不记 pending 时 1 failed；排空仍看已销毁 realm 时 `expected true to be false`。
 - 类型检查（主进程 + 渲染进程）、`npm run build` 通过；内部包打包、产物校验、启动冒烟与 UI 冒烟通过。
 
 ## 已知问题
 
-- **决定性的验证只能在真实页面上做**：在同一个站再抓一次，看 `producer-queue-loss` 是否归零。单测证明的是链路上四道闸都过得去，不是真实页面上不再丢。这是抓包路径的行为变化，装上后请跑一次看健康面板。
-- `.result` 事件仍把参数再带一遍（所以一次 1 MB 操作是 8.4 MB 而不是 4.2）。去掉会让 `.result` 行的 `args=` 变空，影响分析提示词的格式，本次未改。
-- `data:hooks` 仍把整个会话的 hook 全部发给渲染进程；1 MB 的参数会让这一步变重。列表的 tooltip 截到 2000 字符，传输没截——「整条保存」意味着界面要拿得到整条。
-- 批次里「队头必进」的守卫没有独立测试：它只在批次上限小于单事件上限时才起作用，两个常量现在相等，构造不出那个场景。它是防御性的。
-- 排空循环没有节流（`stopOnce` 里 `do { await this.poll() } while (Date.now() < deadline)`），生产环境靠真实 CDP I/O 拖慢，假时钟下会活锁。抓包路径既有行为，未改。
+- **`ingestion-invalid` 的修复还没在真实页面上验证过。** 装上后在同一个站再抓一次，那两条应该消失。
+- 跨层测试里 vm 沙箱的活对象直接过 `validateBatch` 会被拒（realm 相关的检查），生产路径总是经过 JSON 字符串，测试按生产路径做了 round-trip；具体是哪一处检查对 realm 敏感没有追到底。
+- `realm-destroyed-with-pending`（随导航销毁的 realm 队列里的最后几条）是抓包层与浏览器的固有竞争，约 1/27，此前专门查过、没能消掉。它还会发生，现在如实计数。
+- `.result` 事件仍把参数再带一遍；`data:hooks` 仍把整个会话的 hook 全部发给渲染进程。
+- 排空循环没有节流；批次「队头必进」的守卫没有独立测试。均为抓包路径既有行为。
 - 3.6.71 的两条修复（输出上限截断的识别与提示）仍未在真实会话上验证过。
-- 一轮分析里工具结果有**累计**总预算（128k 窗口约 27k token ≈ 108KB），耗尽后整条替换为省略标记。
-- AI 请求日志只保留原始 SSE 的**前** 100,000 字符，`finish_reason` 在末尾看不到；靠 `completion_tokens` 是否正好等于配置上限判断。
-- 快速连续导航时，偶发（约 1/27）有文档执行域未能建立推送通道，被下一次导航销毁时带走尚未送出的数据。该情况会如实记为缺口，不会静默丢失。
+- 一轮分析里工具结果有累计总预算（128k 窗口约 27k token ≈ 108KB）；AI 请求日志只保留原始 SSE 的前 100,000 字符。
+- 快速连续导航时，偶发有文档执行域未能建立推送通道，被下一次导航销毁时带走尚未送出的数据。该情况会如实记为缺口。
 - 混合压缩阶段若取消，摘要调用抛出的取消会被压缩层的 catch 吞掉，退回规则压缩；取消仍会在下一步生效。
 
 ## 下载
 
 | 平台 | 文件 |
 |------|------|
-| Windows | Anything-Analyzer-Setup-3.6.73.exe |
-| macOS (Apple Silicon) | Anything-Analyzer-3.6.73-arm64.dmg |
-| macOS (Intel) | Anything-Analyzer-3.6.73-x64.dmg |
-| Linux | Anything-Analyzer-3.6.73.AppImage |
+| Windows | Anything-Analyzer-Setup-3.6.74.exe |
+| macOS (Apple Silicon) | Anything-Analyzer-3.6.74-arm64.dmg |
+| macOS (Intel) | Anything-Analyzer-3.6.74-x64.dmg |
+| Linux | Anything-Analyzer-3.6.74.AppImage |

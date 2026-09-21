@@ -590,7 +590,8 @@ export class AiAnalyzer {
     const extractConfig = resolveRoleConfig(config, "extract");
     const router = this.createRouter(report.session_id, report.id, "extract", extractConfig);
     // 索引是过滤后的，捕获到的才是全部。提示词里的索引不变，但「这个序号是不是真的」得按全部来判。
-    const capturedRefs = this.requestsRepo.findRefsBySession(report.session_id);
+    // 这个函数承诺不抛（见上），所以这次读库也不能例外——读不到就退回旧口径，别让已经生成的报告丢了。
+    const capturedRefs = this.readCapturedRefs(report.session_id);
     try {
       const result = await extractProtocolSpec(router, {
         reportContent: report.report_content,
@@ -598,7 +599,7 @@ export class AiAnalyzer {
         enrichment,
         purpose: report.purpose,
         extractConfig,
-        capturedSeqs: capturedRefs.map((ref) => ref.seq),
+        capturedSeqs: capturedRefs?.map((ref) => ref.seq),
       }, signal);
       const specJson = JSON.stringify(result.spec);
       const evidenceJson = this.checkEvidence(report, result.spec, capturedRefs);
@@ -623,11 +624,22 @@ export class AiAnalyzer {
    * 机械校验「说得出依据吗」：引用的序号是否存在、Spec 条目有没有证据、端点能不能对上抓到的请求。
    * 只落库不阻断——它是提示，不是判决。
    */
+  /** 读不到就返回 null：核对不了就不下结论，总比把真实引用全判成编造的强 */
+  private readCapturedRefs(sessionId: string): EvidenceCheckRequest[] | null {
+    try {
+      return this.requestsRepo.findRefsBySession(sessionId);
+    } catch (error) {
+      console.warn(`[AiAnalyzer] failed to read captured refs for ${sessionId}:`, error);
+      return null;
+    }
+  }
+
   private checkEvidence(
     report: AnalysisReport,
     spec: ProtocolSpec | null,
-    capturedRefs: EvidenceCheckRequest[],
+    capturedRefs: EvidenceCheckRequest[] | null,
   ): string | null {
+    if (!capturedRefs) return null;
     try {
       const evidence = checkReportEvidence({
         reportContent: report.report_content,

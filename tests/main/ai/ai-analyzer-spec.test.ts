@@ -436,3 +436,25 @@ describe("requests the index excludes still count as evidence", () => {
     expect(JSON.parse(report.evidence_json!).unknownCitations).toEqual([404]);
   });
 });
+
+describe("the spec step keeps its promise not to throw", () => {
+  it("still extracts the spec when the capture table cannot be read", async () => {
+    routerBehaviour.structured = async () => { throw new Error("first attempt fails"); };
+    const { analyzer, repos, reports } = makeAnalyzer();
+    const failed = await analyzer.analyze("s1", config);
+
+    // 报告此刻已经落库；补读捕获序号失败不该把补抽连人带船一起带走
+    routerBehaviour.structured = async () => sampleSpec;
+    repos.requestsRepo.findRefsBySession = () => {
+      throw new Error("database is locked");
+    };
+
+    const fixed = await analyzer.ensureSpec(failed.id, config);
+
+    expect(fixed.spec_json).not.toBeNull();
+    expect(fixed.spec_error).toBeNull();
+    // 核对不了就不下结论，而不是把所有引用都判成编造的
+    expect(fixed.evidence_json).toBeNull();
+    expect(reports.get(failed.id)!.spec_json).toBe(fixed.spec_json);
+  });
+});

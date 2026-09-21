@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { LLMProviderConfig } from "../../../src/shared/types";
 import {
-  EXTRACT_MAX_TOKENS,
+  EXTRACT_MAX_OUTPUT_TOKENS,
   isLightweightRole,
   LIGHTWEIGHT_MAX_TOKENS,
   resolveExtractMaxTokens,
@@ -31,9 +31,30 @@ describe("isLightweightRole", () => {
 });
 
 describe("extract role output cap", () => {
-  it("never shrinks below 8192 just because the main config is small", () => {
-    expect(resolveExtractMaxTokens({ ...base, maxTokens: 1024 }, "gpt-5-mini")).toBe(EXTRACT_MAX_TOKENS);
-    expect(resolveRoleConfig({ ...base, maxTokens: 1024 }, "extract").maxTokens).toBe(EXTRACT_MAX_TOKENS);
+  it("does not follow a small main config down", () => {
+    // 主配置是为聊天设的；抽取被截断等于全失败，不能跟着它往下走
+    const small = { ...base, maxTokens: 1024, contextBudget: { maxContextTokens: 40_000, autoContextWindow: false } };
+    expect(resolveExtractMaxTokens(small, "mystery-1")).toBe(10_000);
+    expect(resolveRoleConfig(small, "extract").maxTokens).toBe(10_000);
+  });
+
+  it("scales with the window instead of sitting at a hard-coded 8192", () => {
+    expect(resolveExtractMaxTokens({ ...base, maxTokens: 1024 }, "gpt-5-mini")).toBe(EXTRACT_MAX_OUTPUT_TOKENS);
+
+    // 用户实际配置：1M 窗口 + 主配置 4096 输出 + 模型表里没有的中转模型。
+    // 改之前这里是 8192，抽取每次正好吐满 8192、JSON 断在半截。
+    const reported = {
+      ...base,
+      maxTokens: 4_096,
+      contextBudget: { maxContextTokens: 1_000_000, autoContextWindow: true },
+    };
+    expect(resolveExtractMaxTokens(reported, "step-3.7-flash")).toBe(EXTRACT_MAX_OUTPUT_TOKENS);
+  });
+
+  it("does not scale past the cap however big the window is", () => {
+    const huge = { ...base, maxTokens: 1024, contextBudget: { maxContextTokens: 4_000_000, autoContextWindow: false } };
+    // 份额算出来是 100 万，但没有服务端会接受这个输出上限
+    expect(resolveExtractMaxTokens(huge, "mystery-1")).toBe(EXTRACT_MAX_OUTPUT_TOKENS);
   });
 
   it("respects a model whose own output limit is lower than 8192", () => {
@@ -42,7 +63,8 @@ describe("extract role output cap", () => {
   });
 
   it("keeps a larger user-configured limit", () => {
-    expect(resolveExtractMaxTokens({ ...base, maxTokens: 32_000 }, "gpt-5")).toBe(32_000);
+    // 比封顶还大的用户配置照样保留（gpt-5 自身上限 128k，窗口份额 100k）
+    expect(resolveExtractMaxTokens({ ...base, maxTokens: 64_000 }, "gpt-5")).toBe(64_000);
   });
 
   it("will not let the output limit eat a small window", () => {
@@ -53,9 +75,9 @@ describe("extract role output cap", () => {
     const unknownSmall = { ...base, maxTokens: 8_192, contextBudget: { maxContextTokens: 16_000, autoContextWindow: false } };
     expect(resolveExtractMaxTokens(unknownSmall, "mystery-1")).toBe(4_000);
 
-    // 大窗口不受影响
+    // 大窗口给到封顶
     const unknownLarge = { ...base, maxTokens: 8_192, contextBudget: { maxContextTokens: 200_000, autoContextWindow: false } };
-    expect(resolveExtractMaxTokens(unknownLarge, "mystery-1")).toBe(8_192);
+    expect(resolveExtractMaxTokens(unknownLarge, "mystery-1")).toBe(EXTRACT_MAX_OUTPUT_TOKENS);
   });
 
   it("uses the lightweight model when deciding the cap", () => {

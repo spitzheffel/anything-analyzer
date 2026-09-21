@@ -114,6 +114,7 @@ describe("AiAnalyzer wires the lookup", () => {
       {
         findBySession: () => rows,
         countBySession: () => rows.length,
+        findRefsBySession: () => rows.map((r) => ({ seq: r.sequence, method: r.method, url: r.url })),
         // id 由 capture-engine 生成为 `${sessionId}-${sequence}`
         findById: (id: string) => rows.find((candidate) => candidate.id === id),
       } as never,

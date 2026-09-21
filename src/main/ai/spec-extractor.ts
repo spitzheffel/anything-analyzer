@@ -34,6 +34,11 @@ export interface SpecExtractionInput {
   maxReportTokens?: number;
   /** 抽取角色的配置：用真实窗口和输出上限把报告预算算准，而不是靠一个常量预留 */
   extractConfig?: LLMProviderConfig;
+  /**
+   * 会话里真实抓到的序号。索引只含通过相关性筛选的请求，而模型可以按序号点取索引外的请求，
+   * 所以净化引用时不能拿索引当全集——那会把真实证据当编造的抹掉。缺省时退回索引的序号。
+   */
+  capturedSeqs?: number[];
 }
 
 /**
@@ -192,7 +197,8 @@ export async function extractProtocolSpec(
 ): Promise<SpecExtractionResult> {
   const messages = buildSpecExtractionMessages(input);
   const result = await router.completeStructured(messages, ProtocolSpecSchema, signal);
-  const knownSeqs = new Set(input.summaries.map((summary) => summary.seq));
+  // 净化的基准是「抓到了哪些序号」，不是「索引里有哪些」——两者不同时，后者会抹掉真实证据
+  const knownSeqs = new Set(input.capturedSeqs ?? input.summaries.map((summary) => summary.seq));
   return {
     spec: sanitizeSpecReferences(result.output, knownSeqs),
     promptTokens: result.promptTokens,

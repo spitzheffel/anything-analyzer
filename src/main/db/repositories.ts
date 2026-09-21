@@ -145,6 +145,7 @@ export class RequestsRepo {
     updateResponse: Database.Statement
     findBySession: Database.Statement
     findById: Database.Statement
+    findRefsBySession: Database.Statement
     getNextSequence: Database.Statement
     deleteBySession: Database.Statement
     countBySession: Database.Statement
@@ -167,6 +168,9 @@ export class RequestsRepo {
         'SELECT * FROM requests WHERE session_id = ? ORDER BY sequence ASC'
       ),
       findById: db.prepare('SELECT * FROM requests WHERE id = ?'),
+      findRefsBySession: db.prepare(
+        'SELECT sequence, method, url FROM requests WHERE session_id = ? ORDER BY sequence ASC'
+      ),
       getNextSequence: db.prepare(
         'SELECT COALESCE(MAX(sequence), 0) + 1 AS next_seq FROM requests WHERE session_id = ?'
       ),
@@ -205,6 +209,19 @@ export class RequestsRepo {
 
   findById(id: string): CapturedRequest | undefined {
     return this.stmts.findById.get(id) as CapturedRequest | undefined
+  }
+
+  /**
+   * 只取序号 / 方法 / URL。核对报告引用和端点能不能对上抓到的请求要的就是这三样，
+   * 不该为此把每条最大 1MB 的正文一起读出来。
+   */
+  findRefsBySession(sessionId: string): Array<{ seq: number; method: string; url: string }> {
+    const rows = this.stmts.findRefsBySession.all(sessionId) as Array<{
+      sequence: number
+      method: string
+      url: string
+    }>
+    return rows.map(row => ({ seq: row.sequence, method: row.method, url: row.url }))
   }
 
   getNextSequence(sessionId: string): number {

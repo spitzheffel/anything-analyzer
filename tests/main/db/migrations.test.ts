@@ -10,6 +10,7 @@ import {
   AnalysisReportsRepo,
   BrowserProfilesRepo,
   BrowserTabsRepo,
+  RequestsRepo,
   SessionBrowserConfigRepo,
   SessionsRepo,
 } from "../../../src/main/db/repositories";
@@ -509,6 +510,37 @@ describeDatabaseMigrations("Database Migrations", () => {
     profiles.delete(profile.id);
     expect(profiles.findById(profile.id)).toBeNull();
     expect(tabs.findByProfileId(profile.id)).toEqual([]);
+  });
+
+  it("应该只取序号/方法/URL，不把正文一起读出来", () => {
+    db!.prepare("INSERT INTO sessions (id, name, created_at) VALUES (?, ?, ?)").run("s-refs", "Refs", Date.now());
+    db!.prepare("INSERT INTO sessions (id, name, created_at) VALUES (?, ?, ?)").run("s-other", "Other", Date.now());
+    const repo = new RequestsRepo(db!);
+
+    // 乱序插入。回来的顺序由 ORDER BY 保证，但这张表上不排序也会是升序，所以这里钉的是范围和投影
+    for (const seq of [3, 1, 2]) {
+      repo.insert({
+        id: `s-refs-${seq}`, session_id: "s-refs", sequence: seq, timestamp: 1_000 + seq,
+        method: seq === 2 ? "GET" : "POST", url: `https://api.example.com/v1/r/${seq}`,
+        request_headers: "{}", request_body: null, content_type: "application/json", initiator: null,
+      });
+    }
+    repo.insert({
+      id: "s-other-1", session_id: "s-other", sequence: 1, timestamp: 1,
+      method: "POST", url: "https://other.example.com/", request_headers: "{}",
+      request_body: null, content_type: "application/json", initiator: null,
+    });
+
+    const refs = repo.findRefsBySession("s-refs");
+
+    expect(refs).toEqual([
+      { seq: 1, method: "POST", url: "https://api.example.com/v1/r/1" },
+      { seq: 2, method: "GET", url: "https://api.example.com/v1/r/2" },
+      { seq: 3, method: "POST", url: "https://api.example.com/v1/r/3" },
+    ]);
+    // 正文不在结果里：核对引用要的就这三样，每条正文最大 1MB
+    expect(Object.keys(refs[0])).toEqual(["seq", "method", "url"]);
+    expect(repo.findRefsBySession("s-none")).toEqual([]);
   });
 
 });

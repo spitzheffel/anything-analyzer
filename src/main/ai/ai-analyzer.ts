@@ -14,6 +14,7 @@ import type {
 import { resetEvent, statusEvent } from "@shared/ai-progress";
 import { validateCitations } from "@shared/citations";
 import { checkReportEvidence, countEvidenceGaps } from "@shared/spec-evidence";
+import type { EvidenceCheckRequest } from "@shared/spec-evidence";
 import {
   isEnrichmentFresh,
   parseProtocolSpecJson,
@@ -368,7 +369,10 @@ export class AiAnalyzer {
     );
     const fullData = assembler.assemble(sessionId);
     const allSummaries: RequestSummary[] = assembler.extractSummaries(fullData);
-    const capturedTotal = this.requestsRepo.countBySession(sessionId);
+    // 引用和端点要对着「抓到的全部」核，不是「进了索引的」：索引外的请求模型也能按序号点取，
+    // 拿过滤后的集合去核，等于专挑认真补取的时候误报。只读序号/方法/URL，不碰正文。
+    const capturedRefs = this.requestsRepo.findRefsBySession(sessionId);
+    const capturedTotal = capturedRefs.length;
 
     let analysisData: AssembledData = fullData;
     let filterPromptTokens: number | null = null;
@@ -540,7 +544,7 @@ export class AiAnalyzer {
     }
 
     // 引用校验只提示不阻断：报告已经生成，未知序号更可能是模型手滑
-    const citation = validateCitations(content, allSummaries.map((summary) => summary.seq));
+    const citation = validateCitations(content, capturedRefs.map((ref) => ref.seq));
     if (citation.unknown.length > 0) {
       onProgress?.(statusEvent(
         `报告引用了不存在的请求序号：${citation.unknown.slice(0, 10).map((seq) => `#${seq}`).join(" ")}${citation.unknown.length > 10 ? " ..." : ""}`,
@@ -585,6 +589,8 @@ export class AiAnalyzer {
   ): Promise<AnalysisReport> {
     const extractConfig = resolveRoleConfig(config, "extract");
     const router = this.createRouter(report.session_id, report.id, "extract", extractConfig);
+    // 索引是过滤后的，捕获到的才是全部。提示词里的索引不变，但「这个序号是不是真的」得按全部来判。
+    const capturedRefs = this.requestsRepo.findRefsBySession(report.session_id);
     try {
       const result = await extractProtocolSpec(router, {
         reportContent: report.report_content,
@@ -592,9 +598,10 @@ export class AiAnalyzer {
         enrichment,
         purpose: report.purpose,
         extractConfig,
+        capturedSeqs: capturedRefs.map((ref) => ref.seq),
       }, signal);
       const specJson = JSON.stringify(result.spec);
-      const evidenceJson = this.checkEvidence(report, summaries, result.spec);
+      const evidenceJson = this.checkEvidence(report, result.spec, capturedRefs);
       this.reportsRepo.updateSpec(report.id, specJson, null, evidenceJson);
       return { ...report, spec_json: specJson, spec_error: null, evidence_json: evidenceJson };
     } catch (error) {
@@ -606,7 +613,7 @@ export class AiAnalyzer {
         console.warn(`[AiAnalyzer] ProtocolSpec extraction failed for report ${report.id}: ${message}`);
       }
       // 抽取失败也还能校验报告正文的引用，别把这份结论一起丢掉
-      const evidenceJson = this.checkEvidence(report, summaries, null);
+      const evidenceJson = this.checkEvidence(report, null, capturedRefs);
       this.reportsRepo.updateSpec(report.id, null, message, evidenceJson);
       return { ...report, spec_json: null, spec_error: message, evidence_json: evidenceJson };
     }
@@ -618,14 +625,14 @@ export class AiAnalyzer {
    */
   private checkEvidence(
     report: AnalysisReport,
-    summaries: RequestSummary[],
     spec: ProtocolSpec | null,
+    capturedRefs: EvidenceCheckRequest[],
   ): string | null {
     try {
       const evidence = checkReportEvidence({
         reportContent: report.report_content,
         spec,
-        requests: summaries,
+        requests: capturedRefs,
       });
       return countEvidenceGaps(evidence) > 0 ? JSON.stringify(evidence) : null;
     } catch (error) {

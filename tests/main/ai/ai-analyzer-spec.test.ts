@@ -91,16 +91,20 @@ function request(sequence: number, url: string): CapturedRequest {
   };
 }
 
-function makeAnalyzer(requestCount?: number) {
+function makeAnalyzer(requestCount?: number, extra: CapturedRequest[] = []) {
   const reports = new Map<string, AnalysisReport>();
-  const requests = requestCount
-    ? Array.from({ length: requestCount }, (_, i) => request(i + 1, `https://api.example.com/v1/r/${i + 1}`))
-    : [request(1, "https://api.example.com/v1/login"), request(2, "https://api.example.com/v1/me")];
+  const requests = [
+    ...(requestCount
+      ? Array.from({ length: requestCount }, (_, i) => request(i + 1, `https://api.example.com/v1/r/${i + 1}`))
+      : [request(1, "https://api.example.com/v1/login"), request(2, "https://api.example.com/v1/me")]),
+    ...extra,
+  ];
   const repos = {
     sessionsRepo: { findById: () => ({ id: "s1", name: "demo", target_url: "https://example.com" }) },
     requestsRepo: {
       findBySession: vi.fn(() => requests),
       countBySession: () => requests.length,
+      findRefsBySession: () => requests.map((r) => ({ seq: r.sequence, method: r.method, url: r.url })),
     },
     jsHooksRepo: { findBySession: () => [] },
     storageSnapshotsRepo: { findBySession: () => [] },
@@ -367,5 +371,68 @@ describe("AiAnalyzer evidence check", () => {
     const report = await analyzer.analyze("s1", config);
 
     expect(report.evidence_json).toBeNull();
+  });
+});
+
+describe("requests the index excludes still count as evidence", () => {
+  // #3 是 .js：相关性筛选把它挡在索引外，但它确实抓到了，模型也能用 get_request_detail 按序号点取。
+  // 拿索引当全集去核对，就会在模型做了该做的事时误报，还会把真实的证据序号当编造的抹掉。
+  const asset = (): CapturedRequest => ({
+    ...request(3, "https://cdn.example.com/app.js"),
+    method: "GET",
+    request_body: null,
+    content_type: "application/javascript",
+    request_headers: "{}",
+    response_headers: JSON.stringify({ "content-type": "application/javascript" }),
+    response_body: "function sign(){}",
+  });
+
+  const assetEndpoint = {
+    ...sampleSpec.endpoints[0],
+    id: "sign-script",
+    method: "GET",
+    urlTemplate: "https://cdn.example.com/app.js",
+    exampleSeqs: [3],
+  };
+
+  beforeEach(() => {
+    routerBehaviour.analysisText = "# 报告\n签名逻辑见 [#3]。";
+    routerBehaviour.structured = async () => ({
+      ...sampleSpec,
+      endpoints: [assetEndpoint],
+      authChain: [],
+      storage: [],
+      crypto: [],
+    });
+  });
+
+  it("keeps an unindexed seq as the endpoint's evidence instead of stripping it", async () => {
+    const { analyzer } = makeAnalyzer(undefined, [asset()]);
+
+    const report = await analyzer.analyze("s1", config);
+
+    const spec = JSON.parse(report.spec_json!);
+    expect(spec.endpoints[0].exampleSeqs).toEqual([3]);
+  });
+
+  it("does not accuse the report of citing a request that was captured", async () => {
+    const { analyzer } = makeAnalyzer(undefined, [asset()]);
+    const events: AiProgressEvent[] = [];
+
+    const report = await analyzer.analyze("s1", config, (e) => events.push(e));
+
+    expect(report.evidence_json).toBeNull();
+    // 生成过程里那条瞬时提示同样不该冤枉 #3
+    const statusTexts = events.flatMap((e) => (e.kind === "status" ? [e.text] : []));
+    expect(statusTexts.some((t) => t.includes("不存在的请求序号"))).toBe(false);
+  });
+
+  it("still flags a seq that really was never captured", async () => {
+    routerBehaviour.analysisText = "# 报告\n签名逻辑见 [#3]，另见 [#404]。";
+    const { analyzer } = makeAnalyzer(undefined, [asset()]);
+
+    const report = await analyzer.analyze("s1", config);
+
+    expect(JSON.parse(report.evidence_json!).unknownCitations).toEqual([404]);
   });
 });

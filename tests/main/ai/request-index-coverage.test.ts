@@ -104,9 +104,11 @@ describe("get_request_detail reaches requests the index excludes", () => {
 });
 
 describe("AiAnalyzer wires the lookup", () => {
-  it("resolves an unindexed seq through the deterministic row id", async () => {
+  const rows = [row(1), row(2, { url: "https://cdn.example.com/app.js", content_type: "application/javascript", response_body: "var sign=1" })];
+
+  async function makeRouter() {
     const { AiAnalyzer } = await import("../../../src/main/ai/ai-analyzer");
-    const rows = [row(1), row(2, { url: "https://cdn.example.com/app.js", content_type: "application/javascript", response_body: "var sign=1" })];
+    let hookReads = 0;
     const analyzer = new AiAnalyzer(
       { findById: () => ({ id: "s1", name: "d", target_url: "https://example.com" }) } as never,
       {
@@ -115,19 +117,47 @@ describe("AiAnalyzer wires the lookup", () => {
         // id 由 capture-engine 生成为 `${sessionId}-${sequence}`
         findById: (id: string) => rows.find((candidate) => candidate.id === id),
       } as never,
-      { findBySession: () => [] } as never,
+      {
+        findBySession: () => {
+          hookReads += 1;
+          return [];
+        },
+      } as never,
       { findBySession: () => [] } as never,
       { insert: () => {}, findById: () => undefined, findBySession: () => [], updateSpec: () => {} } as never,
       { insert: () => 1, updateTokensById: () => {}, updateResponseBodyById: () => {} } as never,
       { findBySession: () => [] } as never,
     );
+    const callTool = (analyzer as unknown as {
+      createBuiltinToolRouter: (
+        sessionId: string,
+        reportId: string | null,
+        requestMap: Map<number, unknown>,
+        summaries: unknown[],
+      ) => (name: string, args: Record<string, unknown>) => Promise<string>;
+    }).createBuiltinToolRouter("s1", null, new Map(), []);
+    return { callTool, reads: () => hookReads };
+  }
 
-    const lookup = (analyzer as unknown as {
-      lookupUnindexedRequest: (sessionId: string, seq: number) => unknown;
-    }).lookupUnindexedRequest.bind(analyzer);
+  it("resolves an unindexed seq through the deterministic row id", async () => {
+    const { callTool } = await makeRouter();
 
-    expect(lookup("s1", 2)).toMatchObject({ seq: 2, responseBody: "var sign=1" });
-    expect(lookup("s1", 99)).toBeNull();
+    const found = await callTool("get_request_detail", { seq: 2 });
+    expect(found).toContain("var sign=1");
+    expect(found).toContain("未纳入分析索引");
+
+    expect(await callTool("get_request_detail", { seq: 99 })).toContain("未找到序号为 99 的请求");
+  });
+
+  it("reads the hook table once per analysis, however many tools run", async () => {
+    // js_hooks 的查询没有 LIMIT，一次调用最多补取 5 条请求，每条都重读整张表是不行的
+    const { callTool, reads } = await makeRouter();
+
+    await callTool("get_request_detail", { seqs: [1, 2] });
+    await callTool("get_request_detail", { seq: 2 });
+    await callTool("read_session_hooks", {});
+
+    expect(reads()).toBe(1);
   });
 });
 

@@ -38,6 +38,7 @@ import { LLMRequestCancelledError } from "./llm-fetch";
 import { resolveRoleConfig } from "./llm-roles";
 import { extractProtocolSpec } from "./spec-extractor";
 import { buildInitialChatMessages } from "./chat-prompt";
+import type { JsHookRecord } from "@shared/types";
 import type { MCPClientManager, MCPToolInfo } from "../mcp/mcp-manager";
 import {
   applyUsageCalibration,
@@ -163,12 +164,14 @@ export class AiAnalyzer {
    * id 由唯一的写入路径生成为 `${sessionId}-${sequence}`（capture-engine），所以主键查询就是按序号查；
    * 不把这些请求塞进 requestMap，是因为 JS/CSS 正文单条可达 1MB 且占了绝大多数字节。
    */
-  private lookupUnindexedRequest(sessionId: string, seq: number): FilteredRequest | null {
+  private lookupUnindexedRequest(
+    sessionId: string,
+    seq: number,
+    sessionHooks: () => JsHookRecord[],
+  ): FilteredRequest | null {
     const row = this.requestsRepo.findById(`${sessionId}-${seq}`);
     if (!row || row.session_id !== sessionId) return null;
-    const hooks = this.jsHooksRepo
-      .findBySession(sessionId)
-      .filter((hook) => Math.abs(hook.timestamp - row.timestamp) <= 2000);
+    const hooks = sessionHooks().filter((hook) => Math.abs(hook.timestamp - row.timestamp) <= 2000);
     return toFilteredRequest(row, hooks);
   }
 
@@ -178,7 +181,13 @@ export class AiAnalyzer {
     requestMap: Map<number, FilteredRequest>,
     summaries: RequestSummary[],
   ) {
-    const lookup = (seq: number): FilteredRequest | null => this.lookupUnindexedRequest(sessionId, seq);
+    // js_hooks 的读取没有 LIMIT，一次工具调用最多补取 5 条请求，每条都重读整张表是不行的。
+    // 一轮分析/追问内缓存一次：工具看到的数据本来也该是同一个快照。
+    let hooksCache: JsHookRecord[] | null = null;
+    const sessionHooks = (): JsHookRecord[] => (hooksCache ??= this.jsHooksRepo.findBySession(sessionId));
+    const lookup = (seq: number): FilteredRequest | null =>
+      this.lookupUnindexedRequest(sessionId, seq, sessionHooks);
+
     return async (name: string, args: Record<string, unknown>): Promise<string> => {
       const builtin = dispatchBuiltinRequestTool(name, args, requestMap, summaries, lookup);
       if (builtin) {
@@ -188,7 +197,7 @@ export class AiAnalyzer {
       const captureBuiltin = dispatchBuiltinCaptureTool(
         name,
         args,
-        this.jsHooksRepo.findBySession(sessionId),
+        sessionHooks(),
         this.interactionEventsRepo.findBySession(sessionId, 10_000),
       );
       if (captureBuiltin) {

@@ -428,6 +428,15 @@ const ReportView: React.FC<ReportViewProps> = ({
         </div>
       )}
 
+      {/* 正文在输出上限处被切断：这是最该先看到的一条，排在证据校验之前 */}
+      {report?.output_truncated === 1 && (
+        <div className={styles.contextSection}>
+          <div className={styles.contextLabel}>{t('report.truncated')}</div>
+          <div className={styles.evidenceWarning}>{t('report.truncatedWarning')}</div>
+          <div className={styles.evidenceHint}>{t('report.truncatedHint')}</div>
+        </div>
+      )}
+
       {/* Mechanical evidence check: shown whenever anything could not be backed up */}
       {evidence && countEvidenceGaps(evidence) > 0 && (
         <div className={styles.contextSection}>

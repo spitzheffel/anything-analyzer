@@ -40,6 +40,20 @@ export interface LLMResponse {
   reasoning?: string;
   promptTokens: number;
   completionTokens: number;
+  /**
+   * 模型为什么停下来。`length` 表示撞上了输出上限——正文是残的，
+   * 不读这个字段就会把半截回复当成写完了。
+   */
+  finishReason?: LLMFinishReason;
+}
+
+/** 与 AI SDK 的 FinishReason 同构，避免调用方依赖 SDK 类型 */
+export type LLMFinishReason = "stop" | "length" | "content-filter" | "tool-calls" | "error" | "other";
+
+/** 撞输出上限时给用户的话：这是配置问题，说得出该去改哪儿 */
+export function outputTruncatedMessage(maxOutputTokens: number | undefined, what: string): string {
+  const cap = maxOutputTokens ? `${maxOutputTokens} tokens 的` : "";
+  return `${what}在${cap}输出上限处被截断，内容不完整。请在设置里调大「最大输出 tokens」。`;
 }
 
 export interface LLMStructuredResponse<T> {
@@ -417,6 +431,10 @@ export class LLMRouter {
       if (parsed.success) {
         return { output: parsed.data, ...call.totals, degraded: false };
       }
+      // 被输出上限截断时，降级路径受同一个上限约束，再试一次只是重复烧钱
+      if (result.finishReason === "length") {
+        throw new Error(outputTruncatedMessage(call.settings.maxOutputTokens, "结构化输出"));
+      }
       // 对象生成了但不符合 schema：走降级路径再试一次
     } catch (error) {
       if (signal?.aborted) throw new LLMRequestCancelledError();
@@ -430,11 +448,20 @@ export class LLMRouter {
     };
     const fallback = await this.complete([...messages, instruction], undefined, signal);
     const jsonText = extractJsonObjectText(fallback.content);
-    if (!jsonText) throw new Error("结构化输出解析失败: 回复中没有 JSON 对象");
+    if (!jsonText) {
+      if (fallback.finishReason === "length") {
+        throw new Error(outputTruncatedMessage(call.settings.maxOutputTokens, "结构化输出"));
+      }
+      throw new Error("结构化输出解析失败: 回复中没有 JSON 对象");
+    }
     let candidate: unknown;
     try {
       candidate = JSON.parse(jsonText);
     } catch {
+      // 「JSON 语法错误」对用户没用；截断是最常见的原因，能判断就说清楚
+      if (fallback.finishReason === "length") {
+        throw new Error(outputTruncatedMessage(call.settings.maxOutputTokens, "结构化输出"));
+      }
       throw new Error("结构化输出解析失败: JSON 语法错误");
     }
     const parsed = schema.safeParse(candidate);
@@ -502,6 +529,8 @@ export class LLMRouter {
     // 每一步的正文单独累计，最后用空行拼接：用户在流式过程中看到的所有正文都会进入结果
     const stepTexts: string[] = [];
     let reasoning = "";
+    // 多步时以最后一步为准：中间几步都是 tool-calls
+    let finishReason: LLMFinishReason | undefined;
 
     try {
       for await (const part of result.fullStream) {
@@ -529,6 +558,7 @@ export class LLMRouter {
           }
           case "finish-step":
             recordStepUsage(part.usage);
+            finishReason = part.finishReason;
             break;
           case "abort":
             throw new LLMRequestCancelledError();
@@ -554,6 +584,7 @@ export class LLMRouter {
       reasoning: reasoning.length > 0 ? reasoning : undefined,
       promptTokens: totals.promptTokens,
       completionTokens: totals.completionTokens,
+      finishReason,
     };
   }
 }

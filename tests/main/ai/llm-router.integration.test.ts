@@ -52,7 +52,27 @@ function chatChunk(delta: Record<string, unknown>, finish: string | null = null,
 }
 
 function handleChatCompletions(body: Record<string, unknown>, res: ServerResponse): void {
-  const messages = body.messages as Array<{ role: string }>;
+  const messages = body.messages as Array<{ role: string; content?: string }>;
+  // 提示词里带 TRUNCATE 的一律模拟"撞上输出上限"：正文半截 + finish_reason=length
+  const wantsTruncation = messages.some((m) => typeof m.content === "string" && m.content.includes("TRUNCATE"));
+  if (wantsTruncation) {
+    if (body.stream !== true) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        id: "chatcmpl-cut", object: "chat.completion", created: 1, model: "relay-model",
+        choices: [{ index: 0, message: { role: "assistant", content: '{"name":"log' }, finish_reason: "length" }],
+        usage: { prompt_tokens: 10, completion_tokens: 1024, total_tokens: 1034 },
+      }));
+      return;
+    }
+    sse(res, [
+      { data: chatChunk({ role: "assistant", content: "| POST | `/api/auth" }) },
+      { data: chatChunk({}, "length") },
+      { data: chatChunk({}, null, { prompt_tokens: 10, completion_tokens: 1024, total_tokens: 1034 }) },
+      { data: "[DONE]" },
+    ]);
+    return;
+  }
   // 结构化输出：非流式 JSON 响应，正文就是 schema 要求的对象
   if (body.response_format && body.stream !== true) {
     res.writeHead(200, { "content-type": "application/json" });
@@ -220,6 +240,29 @@ describe("LLMRouter.completeStructured against a local OpenAI-compatible relay",
     const messages = captured[0].body.messages as Array<{ role: string; content: string }>;
     expect(messages.some((m) => /schema/i.test(m.content))).toBe(true);
     expect(captured[0].body.stream).not.toBe(true);
+  });
+
+  it("reports that the model stopped at its output limit instead of calling it done", async () => {
+    const router = new LLMRouter({ name: "custom", baseUrl, apiKey: "k", model: "relay-model", maxTokens: 1024 });
+
+    const cut = await router.complete([{ role: "user", content: "写报告 TRUNCATE" }]);
+    // 正文停在表格单元格中间——不读 finishReason 就会把这半截当成写完了
+    expect(cut.content).toBe("| POST | `/api/auth");
+    expect(cut.finishReason).toBe("length");
+
+    const whole = await router.complete([{ role: "user", content: "写报告" }]);
+    expect(whole.finishReason).toBe("stop");
+  });
+
+  it("blames the output limit, not the JSON, when structured output is cut short", async () => {
+    const router = new LLMRouter({ name: "custom", baseUrl, apiKey: "k", model: "relay-model", maxTokens: 1024 });
+    const schema = z.object({ name: z.string() });
+
+    await expect(router.completeStructured([{ role: "user", content: "抽取 TRUNCATE" }], schema))
+      .rejects.toThrow(/输出上限/);
+    // 「JSON 语法错误」对用户没有任何可操作性，不能是这条
+    await expect(router.completeStructured([{ role: "user", content: "抽取 TRUNCATE" }], schema))
+      .rejects.not.toThrow(/JSON 语法错误/);
   });
 });
 

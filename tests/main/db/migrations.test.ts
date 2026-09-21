@@ -5,6 +5,7 @@ import {
   migrateAddBrowserPersistenceTables,
   migrateAddReportArtifactColumns,
   migrateAddReportEvidenceColumn,
+  migrateAddReportTruncatedColumn,
 } from "../../../src/main/db/migrations";
 import {
   AnalysisReportsRepo,
@@ -510,6 +511,30 @@ describeDatabaseMigrations("Database Migrations", () => {
     profiles.delete(profile.id);
     expect(profiles.findById(profile.id)).toBeNull();
     expect(tabs.findByProfileId(profile.id)).toEqual([]);
+  });
+
+  it("应该以幂等方式添加 output_truncated 列，老报告读出来是 0", () => {
+    expect(() => migrateAddReportTruncatedColumn(db!)).not.toThrow();
+    expect(() => migrateAddReportTruncatedColumn(db!)).not.toThrow();
+
+    const columns = (db!.prepare("PRAGMA table_info(analysis_reports)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(columns).toContain("output_truncated");
+
+    db!.prepare("INSERT INTO sessions (id, name, created_at) VALUES (?, ?, ?)").run("s-tr", "Tr", Date.now());
+    const repo = new AnalysisReportsRepo(db!);
+    const base: AnalysisReport = {
+      id: "r-whole", session_id: "s-tr", created_at: Date.now(),
+      llm_provider: "openai", llm_model: "gpt-4o",
+      prompt_tokens: 1, completion_tokens: 1, report_content: "# r",
+      filter_prompt_tokens: null, filter_completion_tokens: null,
+      purpose: null, spec_json: null, spec_error: null, enrichment_json: null,
+    };
+    repo.insert(base);
+    // 老代码路径不带这个字段：落成 0，不是 NULL，界面上就不用再判一次 undefined
+    expect(repo.findById("r-whole")).toMatchObject({ output_truncated: 0 });
+
+    repo.insert({ ...base, id: "r-cut", output_truncated: 1 });
+    expect(repo.findById("r-cut")).toMatchObject({ output_truncated: 1 });
   });
 
   it("应该只取序号/方法/URL，不把正文一起读出来", () => {

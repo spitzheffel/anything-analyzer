@@ -117,6 +117,7 @@ export function runMigrations(db: Database.Database): void {
     migrateAddBrowserPersistenceTables(db)
     migrateAddReportArtifactColumns(db)
     migrateAddReportEvidenceColumn(db)
+    migrateAddReportTruncatedColumn(db)
     migrateAddCaptureReliability(db)
   })()
 }
@@ -180,6 +181,20 @@ export function migrateAddCaptureReliability(db: Database.Database): void {
 export function migrateAddReportEvidenceColumn(db: Database.Database): void {
   try {
     db.exec(`ALTER TABLE analysis_reports ADD COLUMN evidence_json TEXT`)
+  } catch (err) {
+    if (!String(err).includes('duplicate column name')) {
+      throw err
+    }
+  }
+}
+
+/**
+ * Migration 014: remember that a report was cut off at the model's output limit.
+ * Safe to call multiple times (handles duplicate column errors).
+ */
+export function migrateAddReportTruncatedColumn(db: Database.Database): void {
+  try {
+    db.exec(`ALTER TABLE analysis_reports ADD COLUMN output_truncated INTEGER`)
   } catch (err) {
     if (!String(err).includes('duplicate column name')) {
       throw err

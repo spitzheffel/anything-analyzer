@@ -495,6 +495,8 @@ export class AiAnalyzer {
     let content = "";
     let promptTokens = 0;
     let completionTokens = 0;
+    // 模型撞上输出上限时正文是残的——不记下来就会把半截报告当成写完了
+    let outputTruncated = false;
 
     const requestMap = new Map(fullData.requests.map((r) => [r.seq, r]));
     const allTools = this.collectTools(fullData.requests.length > 0);
@@ -526,6 +528,7 @@ export class AiAnalyzer {
         content = result.content;
         promptTokens = result.promptTokens;
         completionTokens = result.completionTokens;
+        outputTruncated = result.finishReason === "length";
         if (allTools.length === 0) {
           applyUsageCalibration(messages, result.promptTokens);
           saveTokenCalibration(config);
@@ -541,6 +544,12 @@ export class AiAnalyzer {
         onProgress?.(resetEvent());
         onProgress?.(statusEvent(`分析请求失败（${message}），正在重试...`));
       }
+    }
+
+    if (outputTruncated) {
+      onProgress?.(statusEvent(
+        `报告在模型输出上限（${config.maxTokens} tokens）处被截断，内容不完整。请在设置里调大「最大输出 tokens」后重新分析。`,
+      ));
     }
 
     // 引用校验只提示不阻断：报告已经生成，未知序号更可能是模型手滑
@@ -567,11 +576,20 @@ export class AiAnalyzer {
       spec_json: null,
       spec_error: null,
       enrichment_json: JSON.stringify(enrichment),
+      output_truncated: outputTruncated ? 1 : 0,
     };
 
     // 先落库再抽取：抽取失败或被取消时报告本身已经安全
     this.reportsRepo.insert(report);
     if (signal?.aborted) return report;
+
+    if (outputTruncated) {
+      // 残报告抽出来的 Spec 一定也是残的，白烧一次调用；把原因写进 spec_error 让界面显示
+      const message = "报告正文被输出上限截断，未做结构化抽取。调大「最大输出 tokens」后重新分析。";
+      const evidenceJson = this.checkEvidence(report, null, this.readCapturedRefs(sessionId));
+      this.reportsRepo.updateSpec(report.id, null, message, evidenceJson);
+      return { ...report, spec_error: message, evidence_json: evidenceJson };
+    }
 
     onProgress?.(statusEvent("正在抽取结构化数据（ProtocolSpec）..."));
     return this.extractAndStoreSpec(report, config, allSummaries, enrichment, signal);

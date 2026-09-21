@@ -396,8 +396,8 @@ export class AnalysisReportsRepo {
   constructor(private db: Database.Database) {
     this.stmts = {
       insert: db.prepare(
-        `INSERT INTO analysis_reports (id, session_id, created_at, llm_provider, llm_model, prompt_tokens, completion_tokens, report_content, filter_prompt_tokens, filter_completion_tokens, purpose, spec_json, spec_error, enrichment_json, evidence_json)
-         VALUES (@id, @session_id, @created_at, @llm_provider, @llm_model, @prompt_tokens, @completion_tokens, @report_content, @filter_prompt_tokens, @filter_completion_tokens, @purpose, @spec_json, @spec_error, @enrichment_json, @evidence_json)`
+        `INSERT INTO analysis_reports (id, session_id, created_at, llm_provider, llm_model, prompt_tokens, completion_tokens, report_content, filter_prompt_tokens, filter_completion_tokens, purpose, spec_json, spec_error, enrichment_json, evidence_json, output_truncated)
+         VALUES (@id, @session_id, @created_at, @llm_provider, @llm_model, @prompt_tokens, @completion_tokens, @report_content, @filter_prompt_tokens, @filter_completion_tokens, @purpose, @spec_json, @spec_error, @enrichment_json, @evidence_json, @output_truncated)`
       ),
       findBySession: db.prepare(
         'SELECT * FROM analysis_reports WHERE session_id = ? ORDER BY created_at DESC'
@@ -425,6 +425,7 @@ export class AnalysisReportsRepo {
       spec_error: report.spec_error ?? null,
       enrichment_json: report.enrichment_json ?? null,
       evidence_json: report.evidence_json ?? null,
+      output_truncated: report.output_truncated ? 1 : 0,
     })
   }
 

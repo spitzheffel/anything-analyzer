@@ -11,6 +11,8 @@ vi.mock("electron", () => ({ app: { getPath: () => tmpdir() } }));
 
 const routerBehaviour = {
   analysisText: "# 报告\n登录接口 [#1]，资料接口 [#2]，还有一个不存在的 [#99]。",
+  /** 非空时作为 analyze/chat 回复的 finishReason */
+  finishReason: undefined as string | undefined,
   structured: null as null | (() => Promise<unknown>),
   /** true 时工具循环一直挂着，只有 abort 能结束它 */
   hangUntilAborted: false,
@@ -47,7 +49,12 @@ vi.mock("../../../src/main/ai/llm-router", async (importOriginal) => {
           signal?.addEventListener("abort", () => reject(new Error("LLM 请求已取消")), { once: true });
         });
       }
-      return { content: routerBehaviour.analysisText, promptTokens: 10, completionTokens: 5 };
+      return {
+        content: routerBehaviour.analysisText,
+        promptTokens: 10,
+        completionTokens: 5,
+        finishReason: routerBehaviour.finishReason,
+      };
     }
     async completeStructured() {
       if (!routerBehaviour.structured) throw new Error("structured not configured");
@@ -137,6 +144,7 @@ const DEFAULT_ANALYSIS_TEXT = routerBehaviour.analysisText;
 beforeEach(() => {
   routerBehaviour.structured = null;
   routerBehaviour.analysisText = DEFAULT_ANALYSIS_TEXT;
+  routerBehaviour.finishReason = undefined;
   routerBehaviour.hangUntilAborted = false;
   routerBehaviour.toolCalls = 0;
   routerBehaviour.lastToolSignal = undefined;
@@ -456,5 +464,42 @@ describe("the spec step keeps its promise not to throw", () => {
     // 核对不了就不下结论，而不是把所有引用都判成编造的
     expect(fixed.evidence_json).toBeNull();
     expect(reports.get(failed.id)!.spec_json).toBe(fixed.spec_json);
+  });
+});
+
+describe("a report cut off at the output limit is not passed off as finished", () => {
+  beforeEach(() => {
+    routerBehaviour.finishReason = "length";
+    routerBehaviour.analysisText = "# 报告\n三、API 端点清单\n| POST | \`/api/auth/v4";
+  });
+
+  it("marks the report, warns, and does not spend a call extracting a half spec", async () => {
+    routerBehaviour.structured = async () => { throw new Error("should not be called"); };
+    const { analyzer, reports } = makeAnalyzer();
+    const events: AiProgressEvent[] = [];
+
+    const report = await analyzer.analyze("s1", config, (e) => events.push(e));
+
+    expect(report.output_truncated).toBe(1);
+    expect(reports.get(report.id)!.output_truncated).toBe(1);
+    // 残报告抽出来的 Spec 一定也是残的
+    expect(report.spec_json).toBeNull();
+    expect(report.spec_error).toContain("输出上限");
+
+    const statusTexts = events.flatMap((e) => (e.kind === "status" ? [e.text] : []));
+    expect(statusTexts.some((t) => t.includes("输出上限") && t.includes("最大输出 tokens"))).toBe(true);
+    expect(statusTexts.some((t) => t.includes("正在抽取结构化数据"))).toBe(false);
+  });
+
+  it("leaves a normally finished report alone", async () => {
+    routerBehaviour.finishReason = "stop";
+    routerBehaviour.analysisText = DEFAULT_ANALYSIS_TEXT;
+    routerBehaviour.structured = async () => sampleSpec;
+    const { analyzer } = makeAnalyzer();
+
+    const report = await analyzer.analyze("s1", config);
+
+    expect(report.output_truncated).toBe(0);
+    expect(report.spec_json).not.toBeNull();
   });
 });

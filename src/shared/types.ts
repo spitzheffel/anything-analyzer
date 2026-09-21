@@ -286,6 +286,8 @@ export interface AnalysisReport {
   enrichment_json: string | null;
   /** ReportEvidence 的 JSON：机械校验出的「说不出依据」的条目；旧报告为 undefined */
   evidence_json?: string | null;
+  /** 1 表示正文在模型输出上限处被截断，这份报告是残的 */
+  output_truncated?: number | null;
 }
 
 // ---- AI Request Log ----

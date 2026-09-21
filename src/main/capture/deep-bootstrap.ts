@@ -1,10 +1,11 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { CAPTURE_BRIDGE_NAME, CAPTURE_PUSH_BINDING, CAPTURE_WORKER_PATCH_FLAG } from '@shared/capture-protocol'
+import { CAPTURE_BRIDGE_NAME, CAPTURE_PUSH_BINDING, CAPTURE_WORKER_PATCH_FLAG , CAPTURE_PRODUCER_LIMITS} from '@shared/capture-protocol'
+import type { CaptureProducerLimits } from '@shared/capture-protocol'
 import type { CaptureBatch, CaptureBatchReceipt, CaptureEnvelope, CaptureProducerStatus, CaptureStream } from '@shared/capture-protocol'
 
 /** This function is serialized into the page. Keep every runtime dependency inside it. */
-function installCaptureProducer(runId: string, bridgeName: string, pushBinding: string): void {
+function installCaptureProducer(runId: string, bridgeName: string, pushBinding: string, limits: CaptureProducerLimits): void {
   type ProducerBridge = {
     readonly recording: boolean
     readonly runId: string
@@ -33,14 +34,13 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
   const randomIdentifier = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
   const producerId = randomIdentifier?.() ?? `${now()}-${Math.random().toString(36).slice(2)}`
   const maximumEvents = 4096
-  // 这几个数按"一次 1 MB 的 crypto.subtle 操作要整条保存"来定：网络正文的保留上限就是 1 MB
-  // （cdp-manager 的 MAX_BODY_SIZE），加密参数按同一条线。1 MB 的 buffer 转 hex 是 2 M 字符，
-  // 按下面 UTF-16 的口径记 4 MB；.result 事件把参数再带一遍加上结果，约 8.4 MB。
+  // 尺寸限制由构建时注入（capture-protocol 的 CAPTURE_PRODUCER_LIMITS），和仓储校验用的是
+  // 同一组数。这几个数按"一次 1 MB 的 crypto.subtle 操作要整条保存"来定：网络正文的保留
+  // 上限就是 1 MB，加密参数按同一条线。1 MB 的 buffer 转 hex 是 2 M 字符，按下面 UTF-16 的
+  // 口径记 4 MB；.result 事件把参数再带一遍加上结果，约 8.4 MB。
   // 原来单事件 64 KB，任何 ≥16 KB 的 buffer 两条记录全丢，一个邮箱页面一次丢了 426 条。
-  const maximumBytes = 32 * 1024 * 1024
-  const maximumEventBytes = 9 * 1024 * 1024
-  // 批次上限必须 ≥ 单事件上限：批次循环从 0 起算，比批次还大的事件会永远卡在队头
-  const maximumBatchBytes = 9 * 1024 * 1024
+  // 批次上限必须 ≥ 单事件上限：批次循环从 0 起算，比批次还大的事件会永远卡在队头。
+  const { maximumBytes, maximumEventBytes, maximumBatchBytes } = limits
   const queued: Array<{ event: CaptureEnvelope; bytes: number }> = []
   const verifiers = new Map<string, (() => boolean) | null>()
   const repairs = new Map<string, () => void>()
@@ -262,7 +262,7 @@ function buildBootstrapVariant(
 ): string {
   return `(() => {
     const installed = Boolean(globalThis[${BRIDGE}]);
-    (${installCaptureProducer.toString()})(${JSON.stringify(runId)}, ${BRIDGE}, ${JSON.stringify(CAPTURE_PUSH_BINDING)});
+    (${installCaptureProducer.toString()})(${JSON.stringify(runId)}, ${BRIDGE}, ${JSON.stringify(CAPTURE_PUSH_BINDING)}, ${JSON.stringify(CAPTURE_PRODUCER_LIMITS)});
     if (installed) { globalThis[${BRIDGE}].repairHooks(); return; }
     try { ${hookSource} } catch { globalThis[${BRIDGE}].registerHook('hook-bootstrap', () => false); }
     if (typeof document !== 'undefined') {${interactionSource === null ? '' : `

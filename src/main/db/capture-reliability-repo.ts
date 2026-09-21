@@ -9,11 +9,16 @@ import {
   type CaptureHealthSnapshot,
   type CaptureIngestionResult,
   type CaptureRealmInfo,
+  CAPTURE_MAX_BATCH_BYTES,
+  CAPTURE_MAX_EVENT_BYTES,
 } from '../../shared/capture-protocol'
 
 const MAX_BATCH_EVENTS = 256
-const MAX_BATCH_BYTES = 2 * 1024 * 1024
-const MAX_PAYLOAD_BYTES = 256 * 1024
+// 和 bridge 用同一组数（capture-protocol）：bridge 放过的，这里一定要放过，否则整批判 invalid、
+// producer 原样重发、永远进不了库。bootstrap 按 UTF-16 记，utf8 字节数不会超过它；
+// 批次外壳（status 等）另给 64 KB。
+const MAX_BATCH_BYTES = CAPTURE_MAX_BATCH_BYTES + 64 * 1024
+const MAX_PAYLOAD_BYTES = CAPTURE_MAX_EVENT_BYTES
 const HOOK_TYPES = new Set(['fetch', 'xhr', 'crypto', 'crypto_lib', 'cookie_set'])
 const INTERACTION_TYPES = new Set(['click', 'dblclick', 'input', 'scroll', 'navigate', 'hover'])
 const INSTALLATION_STATES = new Set(['installed', 'failed', 'not-applicable', 'overwritten'])
@@ -154,7 +159,7 @@ function validatePayload(event: CaptureEnvelope, realm: CaptureRealmInfo): void 
   }
 }
 
-function validateBatch(batch: CaptureBatch, runId: string, realm: CaptureRealmInfo): void {
+export function validateBatch(batch: CaptureBatch, runId: string, realm: CaptureRealmInfo): void {
   requireValid(isObject(batch) && batch.protocolVersion === CAPTURE_PROTOCOL_VERSION)
   requireValid(batch.runId === runId && isIdentifier(batch.producerId))
   requireValid(Array.isArray(batch.events) && batch.events.length <= MAX_BATCH_EVENTS)

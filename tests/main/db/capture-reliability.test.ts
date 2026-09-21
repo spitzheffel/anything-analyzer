@@ -11,6 +11,7 @@ import type {
   CaptureHealthSnapshot,
   CaptureRealmInfo,
 } from '../../../src/shared/capture-protocol'
+import { CAPTURE_MAX_BATCH_BYTES, CAPTURE_MAX_EVENT_BYTES } from '../../../src/shared/capture-protocol'
 
 vi.mock('electron', () => ({ app: { getPath: () => process.cwd() } }))
 import { backupBeforeCaptureReliabilityMigration } from '../../../src/main/db/database'
@@ -245,10 +246,11 @@ describe('Durable capture reliability persistence', () => {
       createBatch([{ ...createHook(), sequence: 0 }]),
       createBatch([{ ...createHook(), payload: { ...createHook().payload, hookType: 'unknown-hook' } }]),
       createBatch([{ ...createHook(), stream: 'network' } as unknown as CaptureEnvelope]),
-      createBatch([{ ...createHook(), payload: { ...createHook().payload, arguments: 'x'.repeat(256 * 1024) } }]),
+      // 尺寸上限和 bridge 共用同一组数（capture-protocol），这里按它来，别再各写各的
+      createBatch([{ ...createHook(), payload: { ...createHook().payload, arguments: 'x'.repeat(CAPTURE_MAX_EVENT_BYTES + 1) } }]),
       createBatch(Array.from({ length: 257 }, (_, index) => createHook(index + 1))),
       createBatch(Array.from({ length: 12 }, (_, index) => ({
-        ...createHook(index + 1), payload: { ...createHook(index + 1).payload, arguments: 'x'.repeat(200 * 1024) },
+        ...createHook(index + 1), payload: { ...createHook(index + 1).payload, arguments: 'x'.repeat(Math.ceil(CAPTURE_MAX_BATCH_BYTES / 12) + 8 * 1024) },
       }))),
       createBatch([{ ...createInteraction(1), payload: { ...createInteraction(1).payload, viewportX: '20' } }]),
       createBatch([{ ...createInteraction(1), payload: { ...createInteraction(1).payload, path: [{ x: 1, y: 2, t: 'bad' }] } }]),

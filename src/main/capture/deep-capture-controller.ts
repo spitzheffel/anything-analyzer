@@ -3,7 +3,7 @@ import type { BrowserContext as PlaywrightContext, Disposable, Frame } from 'pla
 import type { BrowserContext } from '../browser/contracts'
 import type { CaptureRealmConnection, CloakRealmRouter } from '../browser/cloak-realm-router'
 import type { CaptureReliabilityRepo } from '../db/capture-reliability-repo'
-import { CAPTURE_BRIDGE_NAME, CAPTURE_DROP_REASONS, CAPTURE_PUSH_BINDING, classifyCaptureFailure } from '@shared/capture-protocol'
+import { CAPTURE_BRIDGE_NAME, CAPTURE_DROP_REASONS, CAPTURE_MAX_PUSH_CHARS, CAPTURE_PUSH_BINDING, classifyCaptureFailure } from '@shared/capture-protocol'
 import type { CaptureAcceptedRecord, CaptureBatch, CaptureGap, CaptureHealthSnapshot, CaptureRealmHealth } from '@shared/capture-protocol'
 import { buildDeepBootstrap } from './deep-bootstrap'
 import { withCaptureDeadline } from './capture-deadline'
@@ -11,8 +11,7 @@ import { withCaptureDeadline } from './capture-deadline'
 const POLL_INTERVAL_MS = 750
 const MAXIMUM_REALMS = 128
 const MAXIMUM_CONTEXT_PENDING_BYTES = 32 * 1024 * 1024
-/** 一批最多 9 MB（bootstrap 按 UTF-16 记，≈4.5 M 字符）；再留些余量，别在最后一道把整批扔掉 */
-const MAXIMUM_PUSH_PAYLOAD_CHARS = 5 * 1024 * 1024
+const MAXIMUM_PUSH_PAYLOAD_CHARS = CAPTURE_MAX_PUSH_CHARS
 const DRAIN_TIMEOUT_MS = 5000
 const bridgeExpression = `globalThis[${JSON.stringify(CAPTURE_BRIDGE_NAME)}]`
 
@@ -24,6 +23,8 @@ interface RealmState {
   producerStopped: boolean
   recoveryUntil: number
   pendingPush: CaptureBatch | null
+  /** 已按 invalid 计过丢失的最大序号：同一批内容每次轮询都会再来，只计一次 */
+  invalidThroughSequence: number
 }
 
 /** Owns one immutable capture epoch. Neither callbacks nor receipts outlive it. */
@@ -148,6 +149,7 @@ export class DeepCaptureController {
         ...connection,
         evaluate: <Value>(expression: string) => withCaptureDeadline(connection.evaluate<Value>(expression), 2000, 'Realm evaluation'),
       }, processing: null, closed: false, producerStopped: false, recoveryUntil: Date.now() + 10000, pendingPush: null,
+      invalidThroughSequence: 0,
       health: { ...connection.info, runId: this.runId, producerId: previous?.health.producerId ?? null, state: 'starting',
         transport: 'unavailable', installed: {}, installedAtBootstrap: {}, pendingEvents: 0, pendingBytes: 0,
         droppedEvents: previous?.health.droppedEvents ?? 0, droppedByReason: previous?.health.droppedByReason ?? null,
@@ -195,6 +197,7 @@ export class DeepCaptureController {
       try {
         const result = this.repository.acceptBatch(this.context.sessionId, this.runId, state.connection.info, batch)
         if (result.receipt.disposition !== 'committed') {
+          if (result.receipt.disposition === 'invalid') this.recordInvalidBatch(state, batch)
           this.markFailure(state, `ingestion-${result.receipt.disposition}`)
           return
         }
@@ -377,12 +380,31 @@ export class DeepCaptureController {
     state.closed = true
     // A vanished JS realm cannot prove its final queue was empty, even if the last poll was.
     if (!state.producerStopped || state.health.pendingEvents) this.addGap(realmId, 'realm-destroyed-unverified-tail', 'unknown-coverage')
+    // 上次轮询看到还压着的那几条，随 realm 一起没了：这部分是确知的，单独记数
+    if (state.health.pendingEvents) this.addGap(realmId, 'realm-destroyed-with-pending', 'known-loss', state.health.pendingEvents)
     state.health.state = 'stopped'
     if (this.realms.size > 256) {
       const oldestClosed = [...this.realms.values()].find(realm => realm.closed && realm !== state)
       if (oldestClosed) this.realms.delete(oldestClosed.health.realmId)
     }
     this.publish()
+  }
+
+  /**
+   * 仓储判定 invalid 的批次，producer 会原样重发，永远不会被接受：这不是延迟，是确知的丢失。
+   * 一次真实会话里两个 realm 各被拒了一批，面板上却是「传送延迟 / Dropped: 0」，
+   * pendingEvents 还停在上次成功后的 0——队列明明卡着一整批。
+   */
+  private recordInvalidBatch(state: RealmState, batch: CaptureBatch): void {
+    state.health.pendingEvents = batch.status.pendingEvents
+    state.health.pendingBytes = batch.status.pendingBytes
+    const unseen = batch.events.filter(event => event.sequence > state.invalidThroughSequence)
+    if (unseen.length === 0) return
+    state.invalidThroughSequence = unseen[unseen.length - 1].sequence
+    // 只数数据流：bridge 每次轮询都会再入一条 control 事件，批次一直被拒它们就一直堆，
+    // 按它们计数会让"丢失"每 750 ms 涨一条，而那只是协议心跳
+    const lost = unseen.filter(event => event.stream !== 'control').length
+    if (lost > 0) this.addGap(state.health.realmId, 'ingestion-invalid', 'known-loss', lost)
   }
 
   private markFailure(state: RealmState, reason: string): void {
@@ -444,6 +466,8 @@ export class DeepCaptureController {
     try { await withCaptureDeadline(drain(), DRAIN_TIMEOUT_MS, 'Deep capture drain') }
     catch { this.addGap(null, 'drain-timeout', 'unknown-coverage') }
     for (const realm of this.realms.values()) {
+      // 早已销毁的 realm 在 closeRealm 里记过了；这里只看排空时还活着的
+      if (realm.closed) continue
       // 队列里压了几条是当场数得出来的：这是确知的丢失，不是"覆盖未知"。
       // 只有 processing 没有 pendingEvents 时才真的不知道在途多少。
       if (realm.health.pendingEvents) {

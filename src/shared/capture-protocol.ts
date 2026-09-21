@@ -12,6 +12,32 @@ export const CAPTURE_WORKER_PATCH_FLAG = '__aaReliableCaptureWorkerPatch'
  */
 export const CAPTURE_ENTRY_SCRIPT_FLAG = '__aaReliableCaptureEntryScript'
 
+/**
+ * 一个事件从页面到落库要过五道尺寸限制：bridge 单事件、bridge 单批次、推送接收、
+ * 仓储单事件、仓储单批次。3.6.73 只开了前三道，仓储那两道还是 256 KB / 2 MB，
+ * 于是 128 KB 以上 buffer 的批次被整批判 invalid、原样重发、永远进不了库——比原来
+ * 在 bridge 里静默丢还糟，因为它连丢失都不算。所以只在这里定义一次：bootstrap 由
+ * 构建时注入，controller 和仓储直接引用，不可能再各开各的。
+ *
+ * 口径：bootstrap 按 UTF-16 记（chars*2+128）；utf8 字节数在任何文本上都不超过它，
+ * 所以仓储按同一个数校验一定放得过 bridge 放过的东西。
+ */
+export const CAPTURE_MAX_EVENT_BYTES = 9 * 1024 * 1024
+export const CAPTURE_MAX_BATCH_BYTES = 9 * 1024 * 1024
+export const CAPTURE_MAX_QUEUE_BYTES = 32 * 1024 * 1024
+/** 推送接收按字符数设限：批次上限的一半（UTF-16 口径）再留余量 */
+export const CAPTURE_MAX_PUSH_CHARS = 5 * 1024 * 1024
+export interface CaptureProducerLimits {
+  maximumEventBytes: number
+  maximumBatchBytes: number
+  maximumBytes: number
+}
+export const CAPTURE_PRODUCER_LIMITS: CaptureProducerLimits = {
+  maximumEventBytes: CAPTURE_MAX_EVENT_BYTES,
+  maximumBatchBytes: CAPTURE_MAX_BATCH_BYTES,
+  maximumBytes: CAPTURE_MAX_QUEUE_BYTES,
+}
+
 export type CaptureRealmKind = 'document' | 'worker' | 'shared_worker' | 'service_worker'
 export type CaptureStream = 'hook' | 'interaction' | 'control'
 export type CaptureHealthState = 'starting' | 'healthy' | 'degraded' | 'stopped' | 'unknown'

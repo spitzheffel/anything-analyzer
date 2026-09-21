@@ -30,7 +30,7 @@ import type {
   AiRequestLogRepo,
   InteractionEventsRepo,
 } from "../db/repositories";
-import { DataAssembler } from "./data-assembler";
+import { DataAssembler, toFilteredRequest } from "./data-assembler";
 import { PromptBuilder } from "./prompt-builder";
 import { LLMRouter, extractJsonArrayText } from "./llm-router";
 import { LLMRequestCancelledError } from "./llm-fetch";
@@ -157,14 +157,29 @@ export class AiAnalyzer {
     );
   }
 
+  /**
+   * 索引之外的请求按序号回库补取。
+   * id 由唯一的写入路径生成为 `${sessionId}-${sequence}`（capture-engine），所以主键查询就是按序号查；
+   * 不把这些请求塞进 requestMap，是因为 JS/CSS 正文单条可达 1MB 且占了绝大多数字节。
+   */
+  private lookupUnindexedRequest(sessionId: string, seq: number): FilteredRequest | null {
+    const row = this.requestsRepo.findById(`${sessionId}-${seq}`);
+    if (!row || row.session_id !== sessionId) return null;
+    const hooks = this.jsHooksRepo
+      .findBySession(sessionId)
+      .filter((hook) => Math.abs(hook.timestamp - row.timestamp) <= 2000);
+    return toFilteredRequest(row, hooks);
+  }
+
   private createBuiltinToolRouter(
     sessionId: string,
     reportId: string | null | undefined,
     requestMap: Map<number, FilteredRequest>,
     summaries: RequestSummary[],
   ) {
+    const lookup = (seq: number): FilteredRequest | null => this.lookupUnindexedRequest(sessionId, seq);
     return async (name: string, args: Record<string, unknown>): Promise<string> => {
-      const builtin = dispatchBuiltinRequestTool(name, args, requestMap, summaries);
+      const builtin = dispatchBuiltinRequestTool(name, args, requestMap, summaries, lookup);
       if (builtin) {
         recordToolSessionActivity(sessionId, reportId, builtin.fetchedSeqs, builtin.refLine);
         return builtin.result;
@@ -343,6 +358,7 @@ export class AiAnalyzer {
     );
     const fullData = assembler.assemble(sessionId);
     const allSummaries: RequestSummary[] = assembler.extractSummaries(fullData);
+    const capturedTotal = this.requestsRepo.countBySession(sessionId);
 
     let analysisData: AssembledData = fullData;
     let filterPromptTokens: number | null = null;
@@ -444,6 +460,7 @@ export class AiAnalyzer {
       template,
       summariesForPrompt,
       budget.contextMode,
+      capturedTotal,
     );
     const user = subagentContext
       ? `${baseUser}\n\n## 并行子分析导航（仅作定位线索，正文仍需工具验证）\n${subagentContext}`
@@ -520,7 +537,7 @@ export class AiAnalyzer {
       ));
     }
 
-    const enrichment = toSessionEnrichment(fullData, this.requestsRepo.countBySession(sessionId));
+    const enrichment = toSessionEnrichment(fullData, capturedTotal);
     const report: AnalysisReport = {
       id: uuidv4(),
       session_id: sessionId,

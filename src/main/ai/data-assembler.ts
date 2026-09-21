@@ -4,10 +4,31 @@ import { SceneDetector } from './scene-detector'
 import { CryptoScriptExtractor } from './crypto-script-extractor'
 
 const STATIC_EXTENSIONS = /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ttf|eot|ico|map)(\?|$)/i
-const API_CONTENT_TYPES = ['json', 'form-urlencoded', 'multipart']
+// XML / 纯文本 / protobuf 接口以前会被整条丢掉，而它们同样是协议分析的对象
+const API_CONTENT_TYPES = ['json', 'form-urlencoded', 'multipart', 'xml', 'text/plain', 'protobuf', 'ndjson', 'csv']
 const TOKEN_BUDGET = 30000
 const CHARS_PER_TOKEN = 4
 const CRYPTO_BUDGET_CHARS = 20000
+
+function parseJsonObject(json: string | null): Record<string, any> | null {
+  if (!json) return null
+  try { return JSON.parse(json) } catch { return null }
+}
+
+/**
+ * 库里的一行 → 分析用的 FilteredRequest。
+ * 组装时批量用，工具按序号回库补取单条时也用，两边形状必须一致。
+ */
+export function toFilteredRequest(row: CapturedRequest, hooks: JsHookRecord[]): FilteredRequest {
+  return {
+    seq: row.sequence, method: row.method, url: row.url,
+    headers: parseJsonObject(row.request_headers) || {},
+    body: row.request_body, status: row.status_code,
+    responseHeaders: row.response_headers ? parseJsonObject(row.response_headers) : null,
+    responseBody: row.response_body, hooks,
+    timestamp: row.timestamp,
+  }
+}
 
 /**
  * DataAssembler — Reads session data from SQLite, filters, associates, and budgets it.
@@ -22,17 +43,8 @@ export class DataAssembler {
 
     const filteredRequests = allRequests.filter(r => this.isRelevantRequest(r))
 
-    const assembledRequests = filteredRequests.map(r => {
-      const relatedHooks = allHooks.filter(h => Math.abs(h.timestamp - r.timestamp) <= 2000)
-      return {
-        seq: r.sequence, method: r.method, url: r.url,
-        headers: this.safeParseJson(r.request_headers) || {},
-        body: r.request_body, status: r.status_code,
-        responseHeaders: r.response_headers ? this.safeParseJson(r.response_headers) : null,
-        responseBody: r.response_body, hooks: relatedHooks,
-        timestamp: r.timestamp,
-      }
-    })
+    const assembledRequests = filteredRequests.map(r =>
+      toFilteredRequest(r, allHooks.filter(h => Math.abs(h.timestamp - r.timestamp) <= 2000)))
 
     const storageDiff = {
       cookies: this.calcDiff(allSnapshots, 'cookie'),
@@ -75,6 +87,9 @@ export class DataAssembler {
     if (r.content_type && API_CONTENT_TYPES.some(t => r.content_type!.includes(t))) return true
     if (r.content_type?.includes('html')) return true
     if (r.request_body) return true
+    // 服务端没给 content-type 但确实回了正文：API 最容易藏在这里。
+    // 二进制响应在捕获层就被跳过（body_status='skipped'），所以不会把图片字体放进来。
+    if (!r.content_type && r.body_status !== 'skipped' && r.response_body) return true
     return false
   }
 

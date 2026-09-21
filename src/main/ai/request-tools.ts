@@ -56,7 +56,7 @@ export const BUILTIN_REQUEST_TOOLS: MCPToolInfo[] = [
     serverName: "_builtin",
     name: "get_request_detail",
     description:
-      "按序号获取 HTTP 请求详情（请求头/体、响应头/体、关联 hooks）。首轮上下文只有索引，需要正文时必须调用本工具。支持单个 seq 或 seqs 数组，单次最多 5 条。",
+      "按序号获取 HTTP 请求详情（请求头/体、响应头/体、关联 hooks）。首轮上下文只有索引，需要正文时必须调用本工具。支持单个 seq 或 seqs 数组，单次最多 5 条。索引之外的请求（静态资源、无正文 GET）也可以按序号取到。",
     inputSchema: {
       type: "object",
       properties: {
@@ -79,6 +79,9 @@ export const BUILTIN_REQUEST_TOOLS: MCPToolInfo[] = [
     },
   },
 ];
+
+/** 索引之外的请求按序号回库补取；返回 null 表示库里也没有 */
+export type RequestLookup = (seq: number) => FilteredRequest | null;
 
 export interface ToolCallOutcome {
   result: string;
@@ -191,6 +194,7 @@ function parseSeqList(args: Record<string, unknown>): number[] {
 export function handleGetRequestDetail(
   args: Record<string, unknown>,
   requestMap: Map<number, FilteredRequest>,
+  lookup?: RequestLookup,
 ): ToolCallOutcome {
   const full = args.full === true;
   const rawOffset = typeof args.offset === "number" ? args.offset : Number(args.offset);
@@ -210,12 +214,15 @@ export function handleGetRequestDetail(
   const fetchedSeqs: number[] = [];
   const parts: string[] = [];
   for (const seq of seqs) {
-    const req = requestMap.get(seq);
+    const indexed = requestMap.get(seq);
+    // 索引只含通过相关性筛选的请求；其余的按序号回库补取，而不是报"没找到"
+    const req = indexed ?? lookup?.(seq) ?? null;
     if (!req) {
       parts.push(`Error: 未找到序号为 ${seq} 的请求`);
     } else {
       fetchedSeqs.push(seq);
-      parts.push(formatRequestDetail(req, full, offset));
+      const note = indexed ? "" : "\n> 该请求未纳入分析索引（静态资源或无正文 GET），这里按序号从捕获数据补取。\n";
+      parts.push(`${formatRequestDetail(req, full, offset)}${note}`);
     }
   }
   return {
@@ -366,10 +373,11 @@ export function dispatchBuiltinRequestTool(
   args: Record<string, unknown>,
   requestMap: Map<number, FilteredRequest>,
   summaries: RequestSummary[],
+  lookup?: RequestLookup,
 ): ToolCallOutcome | null {
   switch (name) {
     case "get_request_detail":
-      return handleGetRequestDetail(args, requestMap);
+      return handleGetRequestDetail(args, requestMap, lookup);
     case "list_requests":
       return handleListRequests(args, summaries);
     case "search_requests":

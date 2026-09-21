@@ -70,6 +70,8 @@ export class PromptBuilder {
     template?: PromptTemplate,
     allSummaries?: RequestSummary[],
     contextMode: ContextMode = "index_first",
+    /** 会话实际抓到的请求总数（含未纳入索引的静态资源等）；缺省则不提这件事 */
+    capturedTotal?: number,
   ): PromptMessages {
     const indexFirst = contextMode !== "legacy_inline";
     const summaries = allSummaries
@@ -96,7 +98,7 @@ export class PromptBuilder {
     const cryptoScriptsSection = this.formatCryptoScripts(data.cryptoScripts);
 
     if (indexFirst) {
-      const requestIndexSection = this.formatRequestIndex(summaries, 0, true);
+      const requestIndexSection = this.formatRequestIndex(summaries, 0, true, capturedTotal);
       const user = `以下是用户在 ${platformName} 上操作时的数据索引（默认不内联 request/response 正文）。
 
 ## 场景线索
@@ -134,7 +136,7 @@ ${analysisRequirements}
     const requestsSection = this.formatRequests(data.requests);
     const hooksSection = this.formatHooks(data.requests);
     const requestIndexSection = hasExtraIndex
-      ? this.formatRequestIndex(allSummaries!, data.requests.length, false)
+      ? this.formatRequestIndex(allSummaries!, data.requests.length, false, capturedTotal)
       : "";
 
     const user = `以下是用户在 ${platformName} 上操作时的完整数据。
@@ -417,14 +419,29 @@ ${DEFAULT_REQUIREMENTS}`;
     return { lines, truncated: true, shown: head.length + tail.length };
   }
 
-  private formatRequestIndex(summaries: RequestSummary[], analysisCount: number, indexFirst: boolean): string {
+  /**
+   * 索引只含通过相关性筛选的请求。以前表头写「所有 N 条」，而 N 是筛选之后的数——
+   * 模型据此以为看到了全部。这里如实说明差额，并告诉它差额部分仍可按序号点取。
+   */
+  private excludedNote(indexedCount: number, capturedTotal?: number): string {
+    if (capturedTotal === undefined || capturedTotal <= indexedCount) return "";
+    return `；本次会话实际抓到 ${capturedTotal} 条，另 ${capturedTotal - indexedCount} 条为静态资源或无正文 GET，未纳入索引（仍可用 get_request_detail 按序号点取）`;
+  }
+
+  private formatRequestIndex(
+    summaries: RequestSummary[],
+    analysisCount: number,
+    indexFirst: boolean,
+    capturedTotal?: number,
+  ): string {
     const { lines, truncated, shown } = this.paginateSummaries(summaries);
+    const excluded = this.excludedNote(summaries.length, capturedTotal);
 
     if (indexFirst) {
       const pageHint = truncated
         ? `\n首轮仅展示头 ${INDEX_HEAD_COUNT} + 尾 ${INDEX_TAIL_COUNT} 条（共展示 ${shown}/${summaries.length}）。超大会话请优先 list_requests / search_requests。`
         : "";
-      return `## 请求索引（共 ${summaries.length} 条，正文未内联）
+      return `## 请求索引（共 ${summaries.length} 条，正文未内联${excluded}）
 格式: #seq METHOD URL @ time -> status [content-type] body=.. resp=..
 可使用 list_requests / search_requests 缩小范围，再用 get_request_detail 查看详情。${pageHint}
 
@@ -433,9 +450,9 @@ ${lines.join("\n")}
     }
 
     return `
-## 完整请求索引（包含被过滤的请求）
-以下是本次会话中所有 ${summaries.length} 条请求的摘要（当前深度分析仅包含其中 ${analysisCount} 条${truncated ? `，索引已分页展示 ${shown} 条` : ""}）。
-如果你认为被过滤的请求可能与分析相关，可以调用 get_request_detail / list_requests 工具获取。
+## 请求索引
+以下是通过相关性筛选的 ${summaries.length} 条请求摘要（当前深度分析内联了其中 ${analysisCount} 条${truncated ? `，索引已分页展示 ${shown} 条` : ""}）${excluded}。
+未内联正文的请求，可以调用 get_request_detail / list_requests 工具获取。
 
 ${lines.join("\n")}
 

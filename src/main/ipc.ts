@@ -72,6 +72,8 @@ import type { BrowserCoordinator } from "./browser/browser-coordinator";
 
 /** Active analysis abort controllers, keyed by sessionId */
 const analysisControllers = new Map<string, AbortController>();
+/** 进行中的追问，按会话取消 */
+const chatControllers = new Map<string, AbortController>();
 
 /** Report IDs with in-flight chat calls — protected from cascade deletion */
 const activeChatReports = new Set<string>();
@@ -505,6 +507,11 @@ export function registerIpcHandlers(deps: {
     analysisControllers.delete(sessionId);
   });
 
+  ipcMain.handle("ai:cancelChat", async (_event, sessionId: string) => {
+    chatControllers.get(sessionId)?.abort();
+    chatControllers.delete(sessionId);
+  });
+
   ipcMain.handle(
     "ai:chat",
     async (
@@ -533,8 +540,12 @@ export function registerIpcHandlers(deps: {
         activeChatReports.add(reportId);
       }
 
+      chatControllers.get(sessionId)?.abort();
+      const controller = new AbortController();
+      chatControllers.set(sessionId, controller);
+
       try {
-        const reply = await aiAnalyzer.chat(sessionId, config, history, userMessage, onProgress, reportId);
+        const reply = await aiAnalyzer.chat(sessionId, config, history, userMessage, onProgress, reportId, controller.signal);
 
         // Persist user message and AI reply to database
         if (reportId) {
@@ -544,6 +555,8 @@ export function registerIpcHandlers(deps: {
 
         return reply;
       } finally {
+        // 只清自己那一个：后来的追问可能已经把表里换成了它的 controller
+        if (chatControllers.get(sessionId) === controller) chatControllers.delete(sessionId);
         if (reportId) {
           activeChatReports.delete(reportId);
         }

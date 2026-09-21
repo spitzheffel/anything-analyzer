@@ -886,6 +886,7 @@ export interface ElectronAPI {
 
   startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) => Promise<AnalysisReport>;
   cancelAnalysis: (sessionId: string) => Promise<void>;
+  cancelChat: (sessionId: string) => Promise<void>;
   sendFollowUp: (sessionId: string, reportId: string, history: ChatMessage[], userMessage: string) => Promise<string>;
   getChatMessages: (reportId: string) => Promise<ChatMessage[]>;
   /** 确保报告有结构化 Spec（没有则用轻量模型补抽），返回更新后的报告 */

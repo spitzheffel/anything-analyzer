@@ -12,6 +12,10 @@ vi.mock("electron", () => ({ app: { getPath: () => tmpdir() } }));
 const routerBehaviour = {
   analysisText: "# 报告\n登录接口 [#1]，资料接口 [#2]，还有一个不存在的 [#99]。",
   structured: null as null | (() => Promise<unknown>),
+  /** true 时工具循环一直挂着，只有 abort 能结束它 */
+  hangUntilAborted: false,
+  toolCalls: 0,
+  lastToolSignal: undefined as AbortSignal | undefined,
 };
 
 vi.mock("../../../src/main/ai/llm-router", () => {
@@ -19,7 +23,21 @@ vi.mock("../../../src/main/ai/llm-router", () => {
     async complete() {
       return { content: routerBehaviour.analysisText, promptTokens: 10, completionTokens: 5 };
     }
-    async completeWithTools() {
+    async completeWithTools(
+      _messages: unknown,
+      _tools: unknown,
+      _callTool: unknown,
+      _onEvent: unknown,
+      _maxRounds: unknown,
+      signal?: AbortSignal,
+    ) {
+      routerBehaviour.toolCalls += 1;
+      routerBehaviour.lastToolSignal = signal;
+      if (routerBehaviour.hangUntilAborted) {
+        return new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => reject(new Error("LLM 请求已取消")), { once: true });
+        });
+      }
       return { content: routerBehaviour.analysisText, promptTokens: 10, completionTokens: 5 };
     }
     async completeStructured() {
@@ -100,6 +118,9 @@ function makeAnalyzer() {
 
 beforeEach(() => {
   routerBehaviour.structured = null;
+  routerBehaviour.hangUntilAborted = false;
+  routerBehaviour.toolCalls = 0;
+  routerBehaviour.lastToolSignal = undefined;
   // 失败路径会打一条预期内的 warn，别让它污染测试输出
   vi.spyOn(console, "warn").mockImplementation(() => {});
 });
@@ -206,5 +227,35 @@ describe("AiAnalyzer artifacts", () => {
     expect(messages[0].content).toContain("引用规则");
     expect(messages[0].content).toContain("#1 POST /v1/login");
     expect(messages[1]).toEqual({ role: "assistant", content: "# 报告" });
+  });
+});
+
+describe("AiAnalyzer.chat cancellation", () => {
+  it("aborts an in-flight follow-up through the caller's signal", async () => {
+    routerBehaviour.hangUntilAborted = true;
+    const { analyzer } = makeAnalyzer();
+    const controller = new AbortController();
+
+    const pending = analyzer.chat("s1", config, [], "问题", undefined, "r1", controller.signal);
+    const settled = pending.then(() => null, (error: unknown) => error);
+    await vi.waitFor(() => expect(routerBehaviour.lastToolSignal).toBeInstanceOf(AbortSignal));
+
+    controller.abort();
+    const error = await settled;
+
+    expect(error).toBeInstanceOf(Error);
+    // 取消要原样冒上去，不能被包装成"追问工具调用失败"
+    expect((error as Error).message).toBe("LLM 请求已取消");
+  });
+
+  it("refuses a follow-up whose signal is already aborted, before spending a call", async () => {
+    const { analyzer } = makeAnalyzer();
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      analyzer.chat("s1", config, [], "问题", undefined, "r1", controller.signal),
+    ).rejects.toThrow();
+    expect(routerBehaviour.toolCalls).toBe(0);
   });
 });

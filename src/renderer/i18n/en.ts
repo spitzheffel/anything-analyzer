@@ -79,6 +79,7 @@ export const en = {
   'report.analysisModel': 'Analysis model',
   'report.refreshModels': 'Refresh model list',
   'report.stopAnalysis': 'Stop Analysis',
+  'report.stopChat': 'Stop',
   'report.startAnalysis': 'Start AI Analysis',
   'report.noReport': 'No analysis report yet',
   'report.analyzing': 'AI is analyzing captured data...',

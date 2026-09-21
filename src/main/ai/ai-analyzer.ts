@@ -33,6 +33,7 @@ import type {
 import { DataAssembler } from "./data-assembler";
 import { PromptBuilder } from "./prompt-builder";
 import { LLMRouter } from "./llm-router";
+import { LLMRequestCancelledError } from "./llm-fetch";
 import { resolveRoleConfig } from "./llm-roles";
 import { computeReportTokenBudget, extractProtocolSpec } from "./spec-extractor";
 import { buildInitialChatMessages } from "./chat-prompt";
@@ -635,7 +636,9 @@ export class AiAnalyzer {
     userMessage: string,
     onProgress?: (event: AiProgressEvent) => void,
     reportId?: string,
+    signal?: AbortSignal,
   ): Promise<string> {
+    signal?.throwIfAborted();
     // 从历史恢复侧态，并注入紧凑说明（无正文）
     const snapshot = hydrateToolSessionFromHistory(sessionId, reportId, history);
     const stateNote = buildToolStateNote(snapshot);
@@ -654,6 +657,7 @@ export class AiAnalyzer {
       sessionId,
       reportId,
       onProgress,
+      signal,
     );
 
     const router = this.createRouter(sessionId, reportId ?? null, "chat", config);
@@ -678,14 +682,18 @@ export class AiAnalyzer {
           allTools,
           callTool,
           onProgress,
+          undefined,
+          signal,
         );
         replyContent = result.content;
       } catch (error) {
+        // 取消不是工具失败，原样抛出交给上层识别
+        if (error instanceof LLMRequestCancelledError || signal?.aborted) throw error;
         const message = error instanceof Error ? error.message : String(error);
         throw new Error(`追问工具调用失败：${message}`);
       }
     } else {
-      const result = await router.complete(compactedMessages, onProgress);
+      const result = await router.complete(compactedMessages, onProgress, signal);
       applyUsageCalibration(compactedMessages, result.promptTokens);
       saveTokenCalibration(config);
       replyContent = result.content;

@@ -79,6 +79,7 @@ export const zh = {
   'report.analysisModel': '分析模型',
   'report.refreshModels': '刷新模型列表',
   'report.stopAnalysis': '停止分析',
+  'report.stopChat': '停止',
   'report.startAnalysis': '开始 AI 分析',
   'report.noReport': '暂无分析报告',
   'report.analyzing': 'AI 正在分析捕获的数据...',

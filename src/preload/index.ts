@@ -84,6 +84,8 @@ contextBridge.exposeInMainWorld("electronAPI", {
     ipcRenderer.invoke("ai:analyze", sessionId, purpose, selectedSeqs, model),
   cancelAnalysis: (sessionId: string) =>
     ipcRenderer.invoke("ai:cancel", sessionId),
+  cancelChat: (sessionId: string) =>
+    ipcRenderer.invoke("ai:cancelChat", sessionId),
   sendFollowUp: (sessionId: string, reportId: string, history: unknown[], userMessage: string) =>
     ipcRenderer.invoke("ai:chat", sessionId, reportId, history, userMessage),
   getChatMessages: (reportId: string) =>

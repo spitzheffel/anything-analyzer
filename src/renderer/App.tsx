@@ -132,7 +132,7 @@ function App(): React.ReactElement {
   /** Ref to browser placeholder for reporting exact bounds to main process */
   const placeholderRef = useRef<HTMLDivElement>(null)
 
-  const { requests, hooks, snapshots, reports, interactions, captureHealth, isAnalyzing, analysisError, streamingContent, streamingReasoning, startAnalysis, cancelAnalysis, chatHistory, latestContextUsage, isChatting, chatError, sendFollowUp, clearCaptureData, replaceReport } = useCapture(currentSessionId)
+  const { requests, hooks, snapshots, reports, interactions, captureHealth, isAnalyzing, analysisError, streamingContent, streamingReasoning, startAnalysis, cancelAnalysis, cancelChat, chatHistory, latestContextUsage, isChatting, chatError, sendFollowUp, clearCaptureData, replaceReport } = useCapture(currentSessionId)
 
   const [llmConfig, setLlmConfig] = useState<LLMProviderConfig | null>(null)
   const [defaultModel, setDefaultModel] = useState('')
@@ -305,6 +305,12 @@ function App(): React.ReactElement {
     if (!currentSessionId) return
     await cancelAnalysis(currentSessionId)
   }, [currentSessionId, cancelAnalysis])
+
+  // Cancel follow-up handler
+  const handleCancelChat = useCallback(async () => {
+    if (!currentSessionId) return
+    await cancelChat(currentSessionId)
+  }, [currentSessionId, cancelChat])
 
   // Export requests handler
   const handleExport = useCallback(async () => {
@@ -767,6 +773,7 @@ function App(): React.ReactElement {
           streamingReasoning={streamingReasoning}
           onReAnalyze={handleReportAnalyze}
           onCancelAnalysis={handleCancelAnalysis}
+          onCancelChat={handleCancelChat}
           chatHistory={chatHistory}
           isChatting={isChatting}
           chatError={chatError}

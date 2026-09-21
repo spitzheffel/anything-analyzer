@@ -33,6 +33,7 @@ interface ReportViewProps {
   isChatting: boolean
   chatError: string | null
   onSendFollowUp: (message: string) => void
+  onCancelChat: () => void
   // Context panel data
   sessionName?: string
   requests?: CapturedRequest[]
@@ -216,6 +217,7 @@ const ReportView: React.FC<ReportViewProps> = ({
   isChatting,
   chatError,
   onSendFollowUp,
+  onCancelChat,
   sessionName,
   requests = [],
   hooks = [],
@@ -750,6 +752,13 @@ const ReportView: React.FC<ReportViewProps> = ({
               <div style={{ textAlign: 'center', padding: 12 }}>
                 <Spinner size="sm" />
                 <span style={{ marginLeft: 8, color: 'var(--text-muted)' }}>{t('report.thinking')}</span>
+              </div>
+            )}
+
+            {/* 追问期间输入区整体禁用，停止是这里唯一的出口 */}
+            {isChatting && (
+              <div style={{ textAlign: 'center', padding: '4px 0 12px' }}>
+                <Button size="sm" onClick={onCancelChat}>{t('report.stopChat')}</Button>
               </div>
             )}
 

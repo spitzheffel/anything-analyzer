@@ -42,6 +42,7 @@ interface UseCaptureReturn extends UseCaptureState {
   selectRequest: (request: CapturedRequest | null) => void;
   startAnalysis: (sessionId: string, purpose?: string, selectedSeqs?: number[], model?: string) => Promise<void>;
   cancelAnalysis: (sessionId: string) => Promise<void>;
+  cancelChat: (sessionId: string) => Promise<void>;
   sendFollowUp: (sessionId: string, message: string) => Promise<void>;
   /** 用主进程返回的最新报告对象替换本地同 id 的报告（如补抽 Spec 之后） */
   replaceReport: (report: AnalysisReport) => void;
@@ -332,6 +333,23 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
     }));
   }, []);
 
+  // Cancel an in-progress follow-up
+  const cancelChat = useCallback(async (sid: string) => {
+    conversationVersionRef.current += 1;
+    await window.electronAPI.cancelChat(sid);
+    setState((prev) => ({
+      ...prev,
+      isChatting: false,
+      streamingContent: "",
+      streamingReasoning: "",
+      chatError: null,
+      // 取消时那条用户消息还没落库，回滚掉乐观追加的那条
+      chatHistory: prev.chatHistory[prev.chatHistory.length - 1]?.role === 'user'
+        ? prev.chatHistory.slice(0, -1)
+        : prev.chatHistory,
+    }));
+  }, []);
+
   const chatHistoryRef = useRef<ChatMessage[]>([]);
   useEffect(() => {
     chatHistoryRef.current = state.chatHistory;
@@ -524,6 +542,7 @@ export function useCapture(sessionId: string | null): UseCaptureReturn {
     selectRequest,
     startAnalysis,
     cancelAnalysis,
+    cancelChat,
     sendFollowUp,
     replaceReport,
   };

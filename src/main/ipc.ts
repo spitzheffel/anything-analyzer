@@ -64,6 +64,7 @@ import {
   normalizeMCPListenHost,
 } from "./mcp/mcp-server-listen";
 import { applyModelOverride, fetchLLMModels } from "./ai/model-catalog";
+import { clearToolSessionsForSession } from "./ai/tool-session-state";
 import type { BrowserCoordinator } from "./browser/browser-coordinator";
 
 /**
@@ -441,6 +442,8 @@ export function registerIpcHandlers(deps: {
 
   ipcMain.handle("data:clear", async (_event, sessionId: string) => {
     await sessionManager.withCaptureDataClear(sessionId, () => {
+      // 侧态记的是"已拉取过哪些序号"，请求没了它就只会误导模型
+      clearToolSessionsForSession(sessionId);
       requestsRepo.deleteBySession(sessionId);
       jsHooksRepo.deleteBySession(sessionId);
       storageSnapshotsRepo.deleteBySession(sessionId);

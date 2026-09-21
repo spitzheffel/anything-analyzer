@@ -10,6 +10,8 @@ export interface ToolSessionSnapshot {
 
 const store = new Map<string, ToolSessionSnapshot>();
 const MAX_RECENT_REFS = 12;
+/** 侧态说明里最多列这么多序号：这段会进每一轮追问的提示词，不能跟着会话一起涨 */
+export const MAX_NOTE_SEQS = 60;
 
 export function toolSessionKey(sessionId: string, reportId?: string | null): string {
   return `${sessionId}::${reportId ?? "default"}`;
@@ -51,12 +53,24 @@ export function clearToolSessionState(sessionId: string, reportId?: string | nul
   store.delete(toolSessionKey(sessionId, reportId));
 }
 
+/** 会话的抓包数据被清空时，它名下所有报告的侧态都过期了（序号指向的请求已经不在了） */
+export function clearToolSessionsForSession(sessionId: string): void {
+  const prefix = `${sessionId}::`;
+  for (const key of [...store.keys()]) {
+    if (key.startsWith(prefix)) store.delete(key);
+  }
+}
+
 /** 注入到 messages 的紧凑侧态说明（无正文） */
 export function buildToolStateNote(snapshot: ToolSessionSnapshot): string | null {
   if (snapshot.fetchedSeqs.length === 0 && snapshot.recentRefs.length === 0) return null;
   const lines = ["## 工具侧态（正文不在历史中；需要时重新 get_request_detail）"];
   if (snapshot.fetchedSeqs.length > 0) {
-    lines.push(`已拉取详情的请求: ${snapshot.fetchedSeqs.map((s) => `#${s}`).join(", ")}`);
+    // 只列尾部若干条并标注总数：漏掉的顶多让模型多调一次 get_request_detail
+    const shown = snapshot.fetchedSeqs.slice(-MAX_NOTE_SEQS);
+    const omitted = snapshot.fetchedSeqs.length - shown.length;
+    const suffix = omitted > 0 ? `（共 ${snapshot.fetchedSeqs.length} 条，此处列出最后 ${shown.length} 条）` : "";
+    lines.push(`已拉取详情的请求${suffix}: ${shown.map((s) => `#${s}`).join(", ")}`);
   }
   if (snapshot.recentRefs.length > 0) {
     lines.push("最近工具调用:");

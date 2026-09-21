@@ -294,12 +294,85 @@ export function createLoggingFetch(options: LoggingFetchOptions = {}): FetchLike
       })
       .finally(detachCallerListener);
 
-    return new Response(forConsumer, {
+    return new Response(repairEventStream(forConsumer), {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
     });
   };
+}
+
+/**
+ * OpenAI sends a tool call's `id`, `type` and `function.name` on the first
+ * delta and omits them from the continuations. Several OpenAI-compatible
+ * services send empty strings there instead, which the strict OpenAI schema
+ * rejects — `type` is `z.literal('function').nullish()`, so absent is fine and
+ * `""` is not, and one non-compliant continuation fails the whole analysis.
+ *
+ * Drop exactly those empty discriminators, so the chunk reads the way an
+ * omission would. Anything else in the payload is passed through untouched:
+ * `function.arguments` carries the content and an empty string is meaningful
+ * there, the repair is skipped unless the line parses as a chunk, and the
+ * unmodified bytes still reach the request log.
+ */
+export function repairToolCallChunk(line: string): string {
+  if (!line.startsWith("data:")) return line;
+  const payload = line.slice(5).trim();
+  if (!payload || payload === "[DONE]" || !payload.startsWith("{")) return line;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return line;
+  }
+  const choices = (parsed as { choices?: unknown })?.choices;
+  if (!Array.isArray(choices)) return line;
+
+  let repaired = false;
+  for (const choice of choices) {
+    const toolCalls = (choice as { delta?: { tool_calls?: unknown } })?.delta?.tool_calls;
+    if (!Array.isArray(toolCalls)) continue;
+    for (const call of toolCalls) {
+      if (!call || typeof call !== "object") continue;
+      const entry = call as Record<string, unknown> & { function?: Record<string, unknown> };
+      for (const field of ["id", "type"]) {
+        if (entry[field] === "") {
+          delete entry[field];
+          repaired = true;
+        }
+      }
+      if (entry.function && entry.function.name === "") {
+        delete entry.function.name;
+        repaired = true;
+      }
+    }
+  }
+  return repaired ? `data: ${JSON.stringify(parsed)}` : line;
+}
+
+/** Rewrite SSE lines as they stream, without buffering the whole response. */
+function repairEventStream(stream: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let pending = "";
+  return stream.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, controller) {
+        pending += decoder.decode(chunk, { stream: true });
+        const lines = pending.split("\n");
+        // The last element is whatever arrived without its newline yet.
+        pending = lines.pop() ?? "";
+        if (lines.length === 0) return;
+        controller.enqueue(
+          encoder.encode(lines.map((line) => repairToolCallChunk(line)).join("\n") + "\n"),
+        );
+      },
+      flush(controller) {
+        pending += decoder.decode();
+        if (pending) controller.enqueue(encoder.encode(repairToolCallChunk(pending)));
+      },
+    }),
+  );
 }
 
 async function collectStreamForLog(stream: ReadableStream<Uint8Array>, limit: number): Promise<string> {

@@ -4,11 +4,50 @@ import {
   createLoggingFetch,
   diagnoseNetworkError,
   maskSensitiveHeaders,
+  repairToolCallChunk,
   sanitizeForJson,
 } from "../../../src/main/ai/llm-fetch";
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("repairToolCallChunk", () => {
+  // Verbatim from a step-5-preview continuation that failed analysis outright.
+  const nonCompliant =
+    'data: {"id":"b06876a6.3a2fd6e0","object":"chat.completion.chunk","created":1789954158,' +
+    '"model":"step-5-preview","choices":[{"index":0,"delta":{"role":"assistant","content":"",' +
+    '"tool_calls":[{"index":0,"id":"","type":"","function":{"name":"","arguments":"\\"seqs\\": "}}]}}]}';
+
+  it("drops the empty discriminators the strict OpenAI schema rejects", () => {
+    const call = JSON.parse(repairToolCallChunk(nonCompliant).slice(5))
+      .choices[0].delta.tool_calls[0];
+
+    expect(call).not.toHaveProperty("id");
+    expect(call).not.toHaveProperty("type");
+    expect(call.function).not.toHaveProperty("name");
+    // The payload itself survives, including its index.
+    expect(call.index).toBe(0);
+    expect(call.function.arguments).toBe('"seqs": ');
+  });
+
+  it("leaves compliant and non-chunk lines exactly as they are", () => {
+    const first =
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function",' +
+      '"function":{"name":"pick","arguments":""}}]}}]}';
+    expect(repairToolCallChunk(first)).toBe(first);
+    expect(repairToolCallChunk("data: [DONE]")).toBe("data: [DONE]");
+    expect(repairToolCallChunk("")).toBe("");
+    expect(repairToolCallChunk(": keep-alive")).toBe(": keep-alive");
+    expect(repairToolCallChunk("data: not json")).toBe("data: not json");
+  });
+
+  it("keeps an empty arguments delta, which is content rather than a discriminator", () => {
+    const line =
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":""}}]}}]}';
+    const call = JSON.parse(repairToolCallChunk(line).slice(5)).choices[0].delta.tool_calls[0];
+    expect(call.function.arguments).toBe("");
+  });
 });
 
 describe("sanitizeForJson", () => {
@@ -134,6 +173,43 @@ describe("createLoggingFetch", () => {
     expect(await response.text()).toBe(chunks.join(""));
     await vi.waitFor(() => expect(bodies).toHaveLength(1));
     expect(bodies[0]).toEqual([3, chunks.join("")]);
+  });
+
+  it("repairs tool-call chunks split across network boundaries, and logs what arrived", async () => {
+    const line =
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","type":"",' +
+      '"function":{"name":"","arguments":"\\"seqs\\": "}}]}}]}';
+    const raw = `${line}\n\ndata: [DONE]\n\n`;
+    // Split mid-JSON, where a naive line-wise rewrite would corrupt the body.
+    const chunks = [raw.slice(0, 40), raw.slice(40, 95), raw.slice(95)];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(new TextEncoder().encode(chunk));
+        controller.close();
+      },
+    });
+    const inner = vi.fn(async () => new Response(stream, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    }));
+    const bodies: Array<[number, string]> = [];
+    const fetchImpl = createLoggingFetch({
+      fetchImpl: inner,
+      onRequestComplete: () => 7,
+      onResponseBody: (id, body) => bodies.push([id, body]),
+    });
+
+    const response = await fetchImpl("https://api.test/v1/x", { method: "POST", body: '{"stream":true}' });
+    const received = await response.text();
+
+    const payload = received.split("\n").find((entry) => entry.startsWith("data: {"))!;
+    const call = JSON.parse(payload.slice(5)).choices[0].delta.tool_calls[0];
+    expect(call).not.toHaveProperty("type");
+    expect(call.function.arguments).toBe('"seqs": ');
+    expect(received).toContain("data: [DONE]");
+    // The log keeps the bytes the provider actually sent.
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    expect(bodies[0][1]).toBe(raw);
   });
 
   it("aborts on timeout with a readable diagnosis", async () => {

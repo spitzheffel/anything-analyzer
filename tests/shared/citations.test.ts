@@ -49,6 +49,45 @@ describe("linkifyCitations", () => {
     const md = "文档见 [#12](https://example.com/docs) 与引用 [#12]";
     expect(linkifyCitations(md)).toBe("文档见 [#12](https://example.com/docs) 与引用 [#12](seq://12)");
   });
+
+  it("leaves fenced code blocks alone — the reproduction snippet gets copied out verbatim", () => {
+    const md = [
+      "登录见 [#1]。",
+      "```python",
+      "# 登录接口见 [#12]",
+      "resp = post(url)  # 响应同 [#13]",
+      "```",
+      "之后再看 [#2]。",
+    ].join("\n");
+
+    const linked = linkifyCitations(md);
+
+    expect(linked).toContain("# 登录接口见 [#12]\n");
+    expect(linked).not.toContain("seq://12");
+    expect(linked).not.toContain("seq://13");
+    expect(linked).toContain("登录见 [#1](seq://1)。");
+    expect(linked).toContain("之后再看 [#2](seq://2)。");
+  });
+
+  it("handles ~~~ fences, longer closing fences and an unterminated block", () => {
+    const tilde = ["~~~", "见 [#3]", "~~~", "见 [#4]"].join("\n");
+    expect(linkifyCitations(tilde)).toBe(["~~~", "见 [#3]", "~~~", "见 [#4](seq://4)"].join("\n"));
+
+    // 结束围栏可以更长，但不能更短
+    const longer = ["```", "见 [#3]", "````", "见 [#4]"].join("\n");
+    expect(linkifyCitations(longer)).toBe(["```", "见 [#3]", "````", "见 [#4](seq://4)"].join("\n"));
+
+    // 没有收尾的围栏：剩下的全部当代码，宁可不改也不要改坏
+    const unterminated = ["```", "见 [#3]", "见 [#4]"].join("\n");
+    expect(linkifyCitations(unterminated)).toBe(unterminated);
+  });
+
+  it("leaves inline code alone but keeps rewriting the rest of the line", () => {
+    expect(linkifyCitations("参数 `payload[#9]` 出自 [#9]"))
+      .toBe("参数 `payload[#9]` 出自 [#9](seq://9)");
+    // 反引号没有配对时，从它开始都不动
+    expect(linkifyCitations("未闭合 `[#8] 还有 [#8]")).toBe("未闭合 `[#8] 还有 [#8]");
+  });
 });
 
 describe("parseCitationHref", () => {

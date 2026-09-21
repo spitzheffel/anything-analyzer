@@ -190,9 +190,21 @@
     return undefined
   }
 
+  // 与网络正文的保留上限一致（cdp-manager 的 MAX_BODY_SIZE = 1 MB）：这个量级内整条保存，
+  // 密文/明文才复现得出来。超过的留头尾——头部有算法特征和魔数，尾部有 MAC / padding。
+  const MAX_CRYPTO_BUFFER_BYTES = 1024 * 1024
+  const CRYPTO_BUFFER_EDGE_BYTES = 32 * 1024
+
+  function serializeBuffer(buffer: ArrayBufferLike, byteOffset: number, byteLength: number): string {
+    if (byteLength <= MAX_CRYPTO_BUFFER_BYTES) return arrayBufferToHex(buffer, byteOffset, byteLength)
+    const head = arrayBufferToHex(buffer, byteOffset, CRYPTO_BUFFER_EDGE_BYTES)
+    const tail = arrayBufferToHex(buffer, byteOffset + byteLength - CRYPTO_BUFFER_EDGE_BYTES, CRYPTO_BUFFER_EDGE_BYTES)
+    return head + '...[truncated: ' + byteLength + ' bytes total, first and last ' + CRYPTO_BUFFER_EDGE_BYTES + ' shown]...' + tail
+  }
+
   function serializeCryptoArgument(argument: unknown): unknown {
-    if (argument instanceof ArrayBuffer) return arrayBufferToHex(argument)
-    if (ArrayBuffer.isView(argument)) return arrayBufferToHex(argument.buffer, argument.byteOffset, argument.byteLength)
+    if (argument instanceof ArrayBuffer) return serializeBuffer(argument, 0, argument.byteLength)
+    if (ArrayBuffer.isView(argument)) return serializeBuffer(argument.buffer, argument.byteOffset, argument.byteLength)
     return argument
   }
 

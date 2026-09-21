@@ -514,3 +514,31 @@ describe('realm-safe interaction hooks', () => {
     expect(page.postMessage).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('crypto.subtle buffers are kept whole up to the body limit', () => {
+  it('serializes a 200 KB buffer in full', () => {
+    const { capture, context } = createWorkerHarness()
+    installScripts(context)
+    runInContext('crypto.subtle.digest("SHA-256", new Uint8Array(200 * 1024).fill(0xab))', context)
+    const [, data] = JSON.parse(findHookPayloads(capture, 'crypto.subtle.digest')[0].arguments as string) as [string, string]
+    expect(data).toHaveLength(200 * 1024 * 2)
+    expect(data).not.toContain('truncated')
+    expect(data.startsWith('abab')).toBe(true)
+  })
+
+  it('keeps head and tail above 1 MB and says how much it skipped', () => {
+    const { capture, context } = createWorkerHarness()
+    installScripts(context)
+    runInContext(`
+      const bytes = new Uint8Array(1536 * 1024).fill(0x11);
+      bytes[0] = 0xaa; bytes[bytes.length - 1] = 0xff;
+      crypto.subtle.decrypt({ name: 'AES-GCM' }, {}, bytes);
+    `, context)
+    const [, , data] = JSON.parse(findHookPayloads(capture, 'crypto.subtle.decrypt')[0].arguments as string) as [unknown, unknown, string]
+    expect(data.startsWith('aa11')).toBe(true)
+    expect(data.endsWith('11ff')).toBe(true)
+    expect(data).toContain('...[truncated: 1572864 bytes total, first and last 32768 shown]...')
+    // 头尾各 32 KB 的 hex 加标记，远小于整条的 3 M 字符
+    expect(data.length).toBeLessThan(2 * 32 * 1024 * 2 + 200)
+  })
+})

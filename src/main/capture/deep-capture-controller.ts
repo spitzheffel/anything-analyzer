@@ -3,14 +3,16 @@ import type { BrowserContext as PlaywrightContext, Disposable, Frame } from 'pla
 import type { BrowserContext } from '../browser/contracts'
 import type { CaptureRealmConnection, CloakRealmRouter } from '../browser/cloak-realm-router'
 import type { CaptureReliabilityRepo } from '../db/capture-reliability-repo'
-import { CAPTURE_BRIDGE_NAME, CAPTURE_PUSH_BINDING, classifyCaptureFailure } from '@shared/capture-protocol'
-import type { CaptureAcceptedRecord, CaptureBatch, CaptureFailureCode, CaptureGap, CaptureHealthSnapshot, CaptureRealmHealth } from '@shared/capture-protocol'
+import { CAPTURE_BRIDGE_NAME, CAPTURE_DROP_REASONS, CAPTURE_PUSH_BINDING, classifyCaptureFailure } from '@shared/capture-protocol'
+import type { CaptureAcceptedRecord, CaptureBatch, CaptureGap, CaptureHealthSnapshot, CaptureRealmHealth } from '@shared/capture-protocol'
 import { buildDeepBootstrap } from './deep-bootstrap'
 import { withCaptureDeadline } from './capture-deadline'
 
 const POLL_INTERVAL_MS = 750
 const MAXIMUM_REALMS = 128
 const MAXIMUM_CONTEXT_PENDING_BYTES = 32 * 1024 * 1024
+/** 一批最多 9 MB（bootstrap 按 UTF-16 记，≈4.5 M 字符）；再留些余量，别在最后一道把整批扔掉 */
+const MAXIMUM_PUSH_PAYLOAD_CHARS = 5 * 1024 * 1024
 const DRAIN_TIMEOUT_MS = 5000
 const bridgeExpression = `globalThis[${JSON.stringify(CAPTURE_BRIDGE_NAME)}]`
 
@@ -148,7 +150,8 @@ export class DeepCaptureController {
       }, processing: null, closed: false, producerStopped: false, recoveryUntil: Date.now() + 10000, pendingPush: null,
       health: { ...connection.info, runId: this.runId, producerId: previous?.health.producerId ?? null, state: 'starting',
         transport: 'unavailable', installed: {}, installedAtBootstrap: {}, pendingEvents: 0, pendingBytes: 0,
-        droppedEvents: previous?.health.droppedEvents ?? 0, lastConfirmedAt: null, reason: null },
+        droppedEvents: previous?.health.droppedEvents ?? 0, droppedByReason: previous?.health.droppedByReason ?? null,
+        lastConfirmedAt: null, reason: null },
     }
     this.realms.set(connection.info.realmId, state)
     if (!connection.info.earlyInjection) {
@@ -159,7 +162,7 @@ export class DeepCaptureController {
       await state.connection.evaluate(this.source)
       try {
         await withCaptureDeadline(connection.installBinding(CAPTURE_PUSH_BINDING, (payload) => {
-          if (payload.length > 512 * 1024) return
+          if (payload.length > MAXIMUM_PUSH_PAYLOAD_CHARS) return
           try { void this.processBatch(state, JSON.parse(payload) as CaptureBatch, 'push') }
           catch { this.markFailure(state, 'invalid-push-payload') }
         }), 2000, 'Realm binding registration')
@@ -196,16 +199,27 @@ export class DeepCaptureController {
           return
         }
         const previousDropped = state.health.droppedEvents
+        const previousByReason = state.health.droppedByReason
         state.health.producerId = batch.producerId
         state.health.installed = batch.status.installed
         state.health.installedAtBootstrap = batch.status.installedAtBootstrap ?? {}
         state.health.pendingEvents = batch.status.pendingEvents
         state.health.pendingBytes = batch.status.pendingBytes
         state.health.droppedEvents = Math.max(previousDropped, batch.status.droppedEvents)
+        if (batch.status.droppedByReason) state.health.droppedByReason = { ...batch.status.droppedByReason }
         state.producerStopped = !batch.status.recording
         state.health.transport = transport === 'push' ? 'push' : state.health.transport === 'unavailable' ? 'poll' : state.health.transport
         if (batch.status.droppedEvents > previousDropped) {
-          this.addGap(state.health.realmId, 'producer-queue-loss', 'known-loss', batch.status.droppedEvents - previousDropped)
+          const byReason = batch.status.droppedByReason
+          if (byReason) {
+            // 按原因分开记：太大 / 队列满 / 背压 / 序列化失败，处理方式完全不同
+            for (const reason of CAPTURE_DROP_REASONS) {
+              const delta = byReason[reason] - (previousByReason?.[reason] ?? 0)
+              if (delta > 0) this.addGap(state.health.realmId, 'producer-queue-loss', 'known-loss', delta, reason)
+            }
+          } else {
+            this.addGap(state.health.realmId, 'producer-queue-loss', 'known-loss', batch.status.droppedEvents - previousDropped)
+          }
         }
         for (const record of result.records) {
           try { this.onRecord(record) } catch { /* Persistence already committed; never revoke its receipt. */ }
@@ -384,9 +398,10 @@ export class DeepCaptureController {
     reason: string,
     certainty: CaptureGap['certainty'],
     droppedEvents: number | null = null,
-    detail: CaptureFailureCode | null = null,
+    detail: CaptureGap['detail'] = null,
   ): void {
-    const previous = this.snapshot.gaps.find(gap => gap.realmId === realmId && gap.reason === reason && gap.endedAt === null)
+    const previous = this.snapshot.gaps.find(gap => gap.realmId === realmId && gap.reason === reason
+      && (gap.detail ?? null) === (detail ?? null) && gap.endedAt === null)
     if (previous) {
       if (droppedEvents !== null) previous.droppedEvents = (previous.droppedEvents ?? 0) + droppedEvents
       // 同一个缺口里第一次说得出细分原因就留下，后面的重复上报不覆盖

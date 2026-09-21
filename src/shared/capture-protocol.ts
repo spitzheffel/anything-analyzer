@@ -33,6 +33,15 @@ export interface CaptureBatch {
 
 export type CaptureHookInstallationState = 'installed' | 'failed' | 'not-applicable' | 'overwritten'
 
+/**
+ * 页面里的 bridge 为什么扔掉了一个事件。以前只有一个总数，"太大""队列满""序列化抛错"
+ * 三种情况混在一个数里，健康面板上根本分不出来。
+ */
+export type CaptureDropReason = 'event-oversize' | 'queue-full' | 'backpressure' | 'serialization-failed'
+export const CAPTURE_DROP_REASONS: readonly CaptureDropReason[] =
+  ['event-oversize', 'queue-full', 'backpressure', 'serialization-failed']
+export type CaptureDropCounts = Record<CaptureDropReason, number>
+
 export interface CaptureProducerStatus {
   /** Live verdict, re-measured on every snapshot and revised by repairs. */
   installed: Record<string, CaptureHookInstallationState>
@@ -47,6 +56,8 @@ export interface CaptureProducerStatus {
   pendingBytes: number
   generatedSequence: number
   droppedEvents: number
+  /** 按原因拆开的丢弃数；旧版 bootstrap 不上报，字段缺省 */
+  droppedByReason?: CaptureDropCounts
   droppedThroughSequence: number
   recording: boolean
 }
@@ -78,6 +89,8 @@ export interface CaptureRealmHealth extends CaptureRealmInfo {
   pendingEvents: number
   pendingBytes: number
   droppedEvents: number
+  /** 按原因拆开的累计丢弃数；producer 不上报时为空 */
+  droppedByReason?: CaptureDropCounts | null
   lastConfirmedAt: number | null
   reason: string | null
 }
@@ -122,7 +135,7 @@ export interface CaptureGap {
   certainty: 'known-loss' | 'unknown-coverage' | 'delivery-delay'
   droppedEvents: number | null
   /** 细分原因；沿用旧快照时为空 */
-  detail?: CaptureFailureCode | null
+  detail?: CaptureFailureCode | CaptureDropReason | null
 }
 
 /** router 的失败原文 → 有限的码。认不出来时给 'other'，不回落到原文。 */

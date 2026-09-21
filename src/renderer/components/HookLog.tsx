@@ -99,7 +99,7 @@ const HookLog: React.FC<HookLogProps> = ({ hooks, captureMode }) => {
       title: 'Arguments',
       dataIndex: 'arguments',
       render: (val) => (
-        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-sm)' }} title={val as string}>
+        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--font-size-sm)' }} title={truncate(val as string, 2000)}>
           {truncate(val as string)}
         </span>
       ),

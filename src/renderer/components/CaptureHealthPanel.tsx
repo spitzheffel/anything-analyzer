@@ -142,7 +142,12 @@ export default function CaptureHealthPanel({
             <strong>{realm.kind}: {realm.realmId}</strong>
             <div>State: {realm.state} | Transport: {realm.transport}</div>
             <div>Installation: {Object.entries(realm.installed).map(([hookName, status]) => `${hookName}: ${status}`).join(', ') || 'Unknown'}</div>
-            <div>Pending: {realm.pendingEvents} events / {realm.pendingBytes} bytes | Dropped: {realm.droppedEvents}</div>
+            <div>
+              Pending: {realm.pendingEvents} events / {realm.pendingBytes} bytes | Dropped: {realm.droppedEvents}
+              {realm.droppedByReason && realm.droppedEvents > 0 && (
+                <span> ({Object.entries(realm.droppedByReason).filter(([, n]) => n > 0).map(([k, n]) => `${k}: ${n}`).join(', ')})</span>
+              )}
+            </div>
             <div>Last confirmed: {formatConfirmedAt(realm.lastConfirmedAt)}</div>
             <div>Early injection: {realm.earlyInjection ? 'Verified for this realm' : 'Unknown / attached late'}</div>
             <div>Reason: {realm.reason ?? 'None reported'}</div>

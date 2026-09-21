@@ -187,3 +187,125 @@ describe('gap diagnostics say what they know', () => {
     expect(gap.droppedEvents).toBe(stuck)
   })
 })
+
+describe('a 1 MB crypto operation survives the whole delivery chain', () => {
+  // 1 MB 的 buffer 转 hex 是 2 M 字符；.result 事件把参数再带一遍加上结果
+  const oneMegabyteHex = 'ab'.repeat(1024 * 1024)
+  const resultEvent = () => ({
+    type: 'ar-hook', hookType: 'crypto', functionName: 'crypto.subtle.decrypt.result',
+    arguments: JSON.stringify([{ name: 'AES-GCM' }, oneMegabyteHex]), result: JSON.stringify(oneMegabyteHex),
+    callStack: null, timestamp: 1,
+  })
+
+  it('is accepted by the bridge, fits one batch, and fits the push guard', () => {
+    const { bridge } = createProducer('run-1')
+    bridge.enqueue('hook', resultEvent())
+    const snapshot = bridge.snapshot()
+    // 改之前：单事件 64 KB 上限，这里 droppedEvents 会是 1
+    expect(snapshot.status.droppedEvents).toBe(0)
+    expect(snapshot.events).toHaveLength(2) // probe 控制事件 + 这一条
+    // 推送接收端按字符数设限，整批序列化后必须过得去
+    expect(JSON.stringify(snapshot).length).toBeLessThan(5 * 1024 * 1024)
+  })
+
+  it('always puts the head event into a batch, however large it is', () => {
+    const { bridge } = createProducer('run-1')
+    bridge.enqueue('hook', resultEvent())
+    bridge.enqueue('hook', resultEvent())
+    const first = bridge.snapshot()
+    // 两条各约 8.4 MB，一批装不下两条——但至少要装一条，否则队头永远发不出去
+    expect(first.events.filter(event => event.stream === 'hook')).toHaveLength(1)
+  })
+
+  it('says why it dropped an event', () => {
+    const { bridge } = createProducer('run-1')
+    const status = () => bridge.snapshot().status
+    bridge.enqueue('hook', { huge: 'x'.repeat(5 * 1024 * 1024) })
+    expect(status().droppedByReason).toMatchObject({ 'event-oversize': 1 })
+    bridge.setBackpressure(true)
+    bridge.enqueue('hook', { marker: 'blocked' })
+    bridge.setBackpressure(false)
+    expect(status().droppedByReason).toMatchObject({ 'event-oversize': 1, backpressure: 1 })
+    bridge.recordLoss()
+    expect(status().droppedByReason).toMatchObject({ 'serialization-failed': 1 })
+    expect(status().droppedEvents).toBe(3)
+    // 换纪元时一起清零
+    bridge.configure('run-2')
+    expect(status().droppedEvents).toBe(0)
+    expect(status().droppedByReason).toEqual({ 'event-oversize': 0, 'queue-full': 0, backpressure: 0, 'serialization-failed': 0 })
+  })
+
+  it('records a separate producer-queue-loss gap per drop reason', async () => {
+    vi.useFakeTimers()
+    const acceptBatch = vi.fn((_session: string, runId: string, _realm: unknown, batch: CaptureBatch): CaptureIngestionResult => ({
+      receipt: { runId, producerId: batch.producerId, acknowledged: batch.events.map(event => event.sequence), disposition: 'committed' },
+      records: [],
+    }))
+    const repository = {
+      beginRun: vi.fn(), endRun: vi.fn(), saveHealth: vi.fn(), getHealth: () => ({ gaps: [] }), acceptBatch,
+    } as unknown as CaptureReliabilityRepo
+    const context = { sessionId: 'session-1', isClosed: () => false, targets: async () => [], getNativeHandle: () => ({
+      addInitScript: async () => ({ dispose: vi.fn() }),
+    }) } as unknown as BrowserContext
+    const controller = new DeepCaptureController(context, repository, vi.fn(), vi.fn(), { hook: '', interaction: '' })
+    await controller.start('isolated-profile')
+    const producer = createProducer(controller.runId)
+    producer.bridge.enqueue('hook', { huge: 'x'.repeat(5 * 1024 * 1024) })
+    producer.bridge.recordLoss()
+    producer.bridge.enqueue('hook', { marker: 'fine' })
+    const connection: CaptureRealmConnection = {
+      info: { realmId: 'realm-1', kind: 'worker', targetId: 'target-1', frameId: null, tabId: null, earlyInjection: true },
+      installBinding: async () => { throw new Error('binding-unavailable') },
+      evaluate: async <Value>(expression: string): Promise<Value> => producer.evaluate<Value>(expression),
+    }
+    routing.options!.onRealm(connection)
+    await vi.advanceTimersByTimeAsync(0)
+
+    const gaps = controller.getHealth().gaps.filter(gap => gap.reason === 'producer-queue-loss')
+    // 改之前是一条 detail 为空的缺口，两种原因合在一个数里
+    expect(gaps.map(gap => [gap.detail, gap.droppedEvents]).sort()).toEqual([
+      ['event-oversize', 1],
+      ['serialization-failed', 1],
+    ])
+    expect(controller.getHealth().realms[0].droppedByReason).toMatchObject({ 'event-oversize': 1, 'serialization-failed': 1 })
+    await controller.stop()
+  })
+
+  it('lets a multi-megabyte push through and still refuses a runaway one', async () => {
+    const acceptBatch = vi.fn((_session: string, runId: string, _realm: unknown, batch: CaptureBatch): CaptureIngestionResult => ({
+      receipt: { runId, producerId: batch.producerId, acknowledged: batch.events.map(event => event.sequence), disposition: 'committed' },
+      records: [],
+    }))
+    const repository = {
+      beginRun: vi.fn(), endRun: vi.fn(), saveHealth: vi.fn(), getHealth: () => ({ gaps: [] }), acceptBatch,
+    } as unknown as CaptureReliabilityRepo
+    const context = { sessionId: 'session-1', isClosed: () => false, targets: async () => [], getNativeHandle: () => ({
+      addInitScript: async () => ({ dispose: vi.fn() }),
+    }) } as unknown as BrowserContext
+    const controller = new DeepCaptureController(context, repository, vi.fn(), vi.fn(), { hook: '', interaction: '' })
+    await controller.start('isolated-profile')
+    let push: ((payload: string) => void) | null = null
+    const connection: CaptureRealmConnection = {
+      info: { realmId: 'realm-1', kind: 'worker', targetId: 'target-1', frameId: null, tabId: null, earlyInjection: true },
+      installBinding: async (_name: string, callback: (payload: string) => void) => { push = callback },
+      evaluate: async <Value>(): Promise<Value> => undefined as Value,
+    }
+    routing.options!.onRealm(connection)
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(push).not.toBeNull()
+
+    const batch = (chars: number): string => JSON.stringify({
+      protocolVersion: 1, runId: controller.runId, producerId: 'p',
+      events: [{ stream: 'hook', sequence: 1, timestamp: 1, payload: { big: 'x'.repeat(chars) } }],
+      status: { installed: {}, pendingEvents: 1, pendingBytes: chars * 2, generatedSequence: 1, droppedEvents: 0, droppedThroughSequence: 0, recording: true },
+    })
+    push!(batch(4 * 1024 * 1024))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    // 改之前接收端 512 K 字符就整批扔掉
+    expect(acceptBatch).toHaveBeenCalledTimes(1)
+    push!(batch(6 * 1024 * 1024))
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(acceptBatch).toHaveBeenCalledTimes(1)
+    await controller.stop()
+  })
+})

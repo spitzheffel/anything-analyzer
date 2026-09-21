@@ -33,9 +33,14 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
   const randomIdentifier = globalThis.crypto?.randomUUID?.bind(globalThis.crypto)
   const producerId = randomIdentifier?.() ?? `${now()}-${Math.random().toString(36).slice(2)}`
   const maximumEvents = 4096
-  const maximumBytes = 2 * 1024 * 1024
-  const maximumEventBytes = 64 * 1024
-  const maximumBatchBytes = 128 * 1024
+  // 这几个数按"一次 1 MB 的 crypto.subtle 操作要整条保存"来定：网络正文的保留上限就是 1 MB
+  // （cdp-manager 的 MAX_BODY_SIZE），加密参数按同一条线。1 MB 的 buffer 转 hex 是 2 M 字符，
+  // 按下面 UTF-16 的口径记 4 MB；.result 事件把参数再带一遍加上结果，约 8.4 MB。
+  // 原来单事件 64 KB，任何 ≥16 KB 的 buffer 两条记录全丢，一个邮箱页面一次丢了 426 条。
+  const maximumBytes = 32 * 1024 * 1024
+  const maximumEventBytes = 9 * 1024 * 1024
+  // 批次上限必须 ≥ 单事件上限：批次循环从 0 起算，比批次还大的事件会永远卡在队头
+  const maximumBatchBytes = 9 * 1024 * 1024
   const queued: Array<{ event: CaptureEnvelope; bytes: number }> = []
   const verifiers = new Map<string, (() => boolean) | null>()
   const repairs = new Map<string, () => void>()
@@ -47,6 +52,12 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
   let generatedSequence = 0
   let pendingBytes = 0
   let droppedEvents = 0
+  const droppedByReason = { 'event-oversize': 0, 'queue-full': 0, 'backpressure': 0, 'serialization-failed': 0 }
+  function drop(reason: keyof typeof droppedByReason): void {
+    droppedEvents += 1
+    droppedByReason[reason] += 1
+    droppedThroughSequence = generatedSequence
+  }
   let droppedThroughSequence = 0
   let pushScheduled = false
   let backpressure = false
@@ -60,7 +71,8 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
     let batchBytes = 0
     const events: CaptureEnvelope[] = []
     for (const entry of queued) {
-      if (events.length >= 128 || batchBytes + entry.bytes > maximumBatchBytes) break
+      // 队头那条无论多大都要进批次，否则它永远发不出去，后面的全被堵住
+      if (events.length > 0 && (events.length >= 128 || batchBytes + entry.bytes > maximumBatchBytes)) break
       events.push(entry.event)
       batchBytes += entry.bytes
     }
@@ -71,7 +83,7 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
       events,
       status: { installed: { ...installed }, installedAtBootstrap: { ...installedAtBootstrap },
         pendingEvents: queued.length, pendingBytes,
-        generatedSequence, droppedEvents, droppedThroughSequence, recording },
+        generatedSequence, droppedEvents, droppedByReason: { ...droppedByReason }, droppedThroughSequence, recording },
     }
   }
 
@@ -96,18 +108,15 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
       const bytes = encoded.length * 2 + 128
       const eventLimit = stream === 'control' ? maximumEvents : maximumEvents - 16
       const byteLimit = stream === 'control' ? maximumBytes : maximumBytes - 8192
-      if (bytes > maximumEventBytes || queued.length >= eventLimit || pendingBytes + bytes > byteLimit || (backpressure && stream !== 'control')) {
-        droppedEvents += 1
-        droppedThroughSequence = generatedSequence
-        return
-      }
+      if (bytes > maximumEventBytes) { drop('event-oversize'); return }
+      if (queued.length >= eventLimit || pendingBytes + bytes > byteLimit) { drop('queue-full'); return }
+      if (backpressure && stream !== 'control') { drop('backpressure'); return }
       const event = { stream, sequence: generatedSequence, timestamp: now(), payload: deserialize(encoded) }
       queued.push({ event, bytes })
       pendingBytes += bytes
       schedulePush()
     } catch {
-      droppedEvents += 1
-      droppedThroughSequence = generatedSequence
+      drop('serialization-failed')
     }
   }
 
@@ -121,6 +130,7 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
       pendingBytes = 0
       generatedSequence = 0
       droppedEvents = 0
+      for (const key of Object.keys(droppedByReason) as Array<keyof typeof droppedByReason>) droppedByReason[key] = 0
       droppedThroughSequence = 0
       backpressure = false
       currentRunId = nextRunId
@@ -156,8 +166,7 @@ function installCaptureProducer(runId: string, bridgeName: string, pushBinding: 
     recordLoss() {
       if (!recording) return
       generatedSequence += 1
-      droppedEvents += 1
-      droppedThroughSequence = generatedSequence
+      drop('serialization-failed')
     },
     repairHooks() {
       for (const [name, repair] of repairs) {

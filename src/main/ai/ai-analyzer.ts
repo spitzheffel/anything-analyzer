@@ -35,7 +35,7 @@ import { PromptBuilder } from "./prompt-builder";
 import { LLMRouter, extractJsonArrayText } from "./llm-router";
 import { LLMRequestCancelledError } from "./llm-fetch";
 import { resolveRoleConfig } from "./llm-roles";
-import { computeReportTokenBudget, extractProtocolSpec } from "./spec-extractor";
+import { extractProtocolSpec } from "./spec-extractor";
 import { buildInitialChatMessages } from "./chat-prompt";
 import type { MCPClientManager, MCPToolInfo } from "../mcp/mcp-manager";
 import {
@@ -581,7 +581,7 @@ export class AiAnalyzer {
         summaries,
         enrichment,
         purpose: report.purpose,
-        maxReportTokens: computeReportTokenBudget(extractConfig),
+        extractConfig,
       }, signal);
       const specJson = JSON.stringify(result.spec);
       this.reportsRepo.updateSpec(report.id, specJson, null);

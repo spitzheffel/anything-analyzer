@@ -4,8 +4,8 @@ import type { LLMProviderConfig, RequestSummary } from "../../../src/shared/type
 import { LLMRouter } from "../../../src/main/ai/llm-router";
 import {
   buildSpecExtractionMessages,
-  computeReportTokenBudget,
   extractProtocolSpec,
+  INDEX_MIN_LIMIT,
   INDEX_TOTAL_LIMIT,
   MAX_REPORT_TOKENS,
   MIN_REPORT_TOKENS,
@@ -104,15 +104,51 @@ describe("buildSpecExtractionMessages", () => {
   });
 });
 
-describe("computeReportTokenBudget", () => {
-  it("shrinks the report allowance for small context windows and caps it for large ones", () => {
-    const small = computeReportTokenBudget({ ...config, maxTokens: 8192, contextBudget: { maxContextTokens: 32_000, autoContextWindow: false } });
-    // 32000 - 8192 - 16000
-    expect(small).toBe(7_808);
-    const tiny = computeReportTokenBudget({ ...config, maxTokens: 8192, contextBudget: { maxContextTokens: 16_000, autoContextWindow: false } });
-    expect(tiny).toBe(MIN_REPORT_TOKENS);
-    const large = computeReportTokenBudget({ ...config, maxTokens: 8192, contextBudget: { maxContextTokens: 400_000, autoContextWindow: false } });
-    expect(large).toBe(MAX_REPORT_TOKENS);
+describe("report budget is measured, not guessed", () => {
+  const many: RequestSummary[] = Array.from({ length: 300 }, (_, i) => ({
+    ...summaries[0], seq: i + 1, url: `https://api.example.com/v1/resource/${i + 1}?trace=${"x".repeat(40)}`,
+  }));
+  // 引用 200 条，索引会填到 INDEX_TOTAL_LIMIT；实测提示词骨架约 10k token
+  const report = Array.from({ length: 200 }, (_, i) => `见 [#${i + 1}]`).join("\n")
+    + "\n" + "登录接口返回的令牌会写入本地存储，随后每个请求都在头部携带。".repeat(2_000);
+
+  function build(maxContextTokens: number, maxTokens: number) {
+    return buildSpecExtractionMessages({
+      reportContent: report, summaries: many, enrichment: null,
+      extractConfig: { ...config, maxTokens, contextBudget: { maxContextTokens, autoContextWindow: false } },
+    });
+  }
+  function indexLinesOf(messages: { content: string }[]): string[] {
+    return messages[1].content.split("\n").filter((line) => /^#\d+ POST /.test(line));
+  }
+  function reportTokensOf(messages: { content: string }[]): number {
+    return estimateTextTokens(messages[1].content.split("## 分析报告")[1] ?? "");
+  }
+
+  it("gives the report whatever the real window has left over, instead of a fixed reservation", () => {
+    const big = build(400_000, 8_192);
+    const tight = build(34_000, 8_192);
+
+    // 大窗口够到 MAX_REPORT_TOKENS 的天花板；窗口小了报告就该跟着缩，而不是照常要 20k
+    expect(reportTokensOf(big)).toBeGreaterThan(reportTokensOf(tight));
+    expect(reportTokensOf(big)).toBeLessThanOrEqual(MAX_REPORT_TOKENS + 50);
+    // 两边都必须真的装得进各自的窗口
+    expect(estimateTextTokens(big[0].content + big[1].content)).toBeLessThan(400_000 - 8_192);
+    expect(estimateTextTokens(tight[0].content + tight[1].content)).toBeLessThan(34_000 - 8_192);
+    expect(indexLinesOf(tight)).toHaveLength(INDEX_TOTAL_LIMIT);
+  });
+
+  it("shrinks the index before giving up on a tight window", () => {
+    const messages = build(14_000, 2_048);
+
+    expect(indexLinesOf(messages).length).toBeLessThanOrEqual(INDEX_MIN_LIMIT);
+    expect(reportTokensOf(messages)).toBeGreaterThanOrEqual(MIN_REPORT_TOKENS);
+    expect(estimateTextTokens(messages[0].content + messages[1].content)).toBeLessThan(14_000 - 2_048);
+  });
+
+  it("says what to change when the window cannot fit the prompt at all", () => {
+    // 以前这里会静默返回 3000，然后被服务端以 400 拒掉
+    expect(() => build(8_000, 2_048)).toThrow(/抽取模型上下文窗口不足[\s\S]*lightweightModel/);
   });
 });
 
@@ -121,23 +157,30 @@ describe("truncateReportToTokenBudget", () => {
     expect(truncateReportToTokenBudget("短报告", 100)).toBe("短报告");
   });
 
-  it("cuts Chinese-heavy reports by estimated tokens, not by a fixed char ratio", () => {
-    const chinese = "登录接口返回的令牌会写入本地存储，随后每个请求都在头部携带。".repeat(400);
+  it("keeps the tail as well as the head — that is where the reproduction code lives", () => {
+    const body = "登录接口返回的令牌会写入本地存储，随后每个请求都在头部携带。".repeat(400);
+    const chinese = `开头标记${body}结尾标记`;
+
     const truncated = truncateReportToTokenBudget(chinese, 1_000);
-    expect(truncated.endsWith("...[报告过长，已截断]")).toBe(true);
+
+    expect(truncated).toContain("开头标记");
+    expect(truncated).toContain("结尾标记");
+    expect(truncated).toContain("...[报告中段已省略，原文共");
     expect(estimateTextTokens(truncated)).toBeLessThanOrEqual(1_000);
-    // 中文按字符折算会保留得多得多；按 token 截后剩下的字符数明显少于 1000 * 2
+    // 中文按字符折算会保留得多得多；按 token 裁后剩下的字符数明显少于 1000 * 2
     expect(truncated.length).toBeLessThan(2_000);
   });
 
   it("is applied when building the extraction prompt", () => {
     const messages = buildSpecExtractionMessages({
-      reportContent: "x".repeat(40_000),
+      reportContent: `HEAD-MARK${"x".repeat(40_000)}TAIL-MARK`,
       summaries,
       enrichment: null,
       maxReportTokens: MIN_REPORT_TOKENS,
     });
-    expect(messages[1].content).toContain("...[报告过长，已截断]");
+    expect(messages[1].content).toContain("...[报告中段已省略，原文共");
+    expect(messages[1].content).toContain("HEAD-MARK");
+    expect(messages[1].content).toContain("TAIL-MARK");
     expect(messages[1].content.length).toBeLessThan(40_000);
   });
 });

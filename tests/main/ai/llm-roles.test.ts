@@ -45,6 +45,19 @@ describe("extract role output cap", () => {
     expect(resolveExtractMaxTokens({ ...base, maxTokens: 32_000 }, "gpt-5")).toBe(32_000);
   });
 
+  it("will not let the output limit eat a small window", () => {
+    // 16k 窗口配 8192 输出，提示词就只剩一半，索引加报告根本放不下
+    expect(resolveExtractMaxTokens({ ...base, maxTokens: 8_192 }, "gpt-3.5-turbo")).toBe(4_096);
+
+    // 模型认不出来时按配置的窗口算，同样要受份额约束
+    const unknownSmall = { ...base, maxTokens: 8_192, contextBudget: { maxContextTokens: 16_000, autoContextWindow: false } };
+    expect(resolveExtractMaxTokens(unknownSmall, "mystery-1")).toBe(4_000);
+
+    // 大窗口不受影响
+    const unknownLarge = { ...base, maxTokens: 8_192, contextBudget: { maxContextTokens: 200_000, autoContextWindow: false } };
+    expect(resolveExtractMaxTokens(unknownLarge, "mystery-1")).toBe(8_192);
+  });
+
   it("uses the lightweight model when deciding the cap", () => {
     const resolved = resolveRoleConfig({ ...base, maxTokens: 512, lightweightModel: "gpt-4-turbo" }, "extract");
     expect(resolved.model).toBe("gpt-4-turbo");

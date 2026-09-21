@@ -14,53 +14,53 @@ import type { MessageLike } from "./context-budget";
 
 /** 索引超过这个数时，只给报告引用过的 + 头部这么多条 */
 const INDEX_HEAD_LIMIT = 120;
-/** 索引行数硬上限：引用再多也不能把提示词撑爆（PROMPT_OVERHEAD_TOKENS 按这个数预留） */
+/** 索引行数硬上限：引用再多也不能把提示词撑爆 */
 export const INDEX_TOTAL_LIMIT = 240;
+/** 窗口装不下时索引压缩到的行数；再少就没有定位价值了 */
+export const INDEX_MIN_LIMIT = 40;
 /** 报告正文喂给抽取器的上限（token）；再大也没必要 */
 export const MAX_REPORT_TOKENS = 20_000;
 /** 报告正文至少保留这么多 token，再少抽不出东西 */
 export const MIN_REPORT_TOKENS = 3_000;
-/**
- * 索引 + 系统提示 + 线索 + schema 提示的预留，单位 token。
- * 实测：一条长 URL 的索引行约 46 token，240 行约 11k；ProtocolSpec 的 schema 提示约 1.3k。
- */
-const PROMPT_OVERHEAD_TOKENS = 16_000;
-const REPORT_TRUNCATION_MARKER = "\n...[报告过长，已截断]";
+/** token 估算有误差，给服务端留一点余量 */
+const SAFETY_MARGIN_TOKENS = 1_000;
 
 export interface SpecExtractionInput {
   reportContent: string;
   summaries: RequestSummary[];
   enrichment: SessionEnrichment | null;
   purpose?: string | null;
-  /** 报告正文 token 上限；不传则按 MAX_REPORT_TOKENS */
+  /** 报告正文 token 上限；给了就按它来，不再按窗口实测 */
   maxReportTokens?: number;
+  /** 抽取角色的配置：用真实窗口和输出上限把报告预算算准，而不是靠一个常量预留 */
+  extractConfig?: LLMProviderConfig;
 }
 
 /**
- * 按抽取角色的上下文窗口算报告正文能塞多少 token：窗口 − 输出上限 − 提示词预留。
- */
-export function computeReportTokenBudget(extractConfig: LLMProviderConfig): number {
-  const budget = resolveContextBudget(extractConfig);
-  const inputTokens = budget.maxContextTokens - extractConfig.maxTokens - PROMPT_OVERHEAD_TOKENS;
-  return Math.max(MIN_REPORT_TOKENS, Math.min(MAX_REPORT_TOKENS, inputTokens));
-}
-
-/**
- * 按 token 预算截取报告开头：用项目自带的中英混排估算器二分找最长合法前缀，
- * 比固定"每 token N 个字符"的折算对中文靠谱得多。
+ * 按 token 预算裁剪报告：保留头 70% / 尾 30%，中段省略。
+ * 只留开头会把复现代码、风险和未决问题整段丢掉，而那些正是 Spec 要抽的东西。
  */
 export function truncateReportToTokenBudget(report: string, maxTokens: number): string {
   if (estimateTextTokens(report) <= maxTokens) return report;
-  const markerTokens = estimateTextTokens(REPORT_TRUNCATION_MARKER);
-  const bodyBudget = Math.max(1, maxTokens - markerTokens);
+  const marker = `\n...[报告中段已省略，原文共 ${report.length} 字符]\n`;
+  if (maxTokens <= estimateTextTokens(marker)) return marker.trim();
+
   let low = 0;
   let high = report.length;
-  while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
-    if (estimateTextTokens(report.slice(0, mid)) <= bodyBudget) low = mid;
-    else high = mid - 1;
+  let best = marker.trim();
+  while (low <= high) {
+    const keepChars = Math.floor((low + high) / 2);
+    const headChars = Math.ceil(keepChars * 0.7);
+    const tailChars = Math.max(0, keepChars - headChars);
+    const candidate = `${report.slice(0, headChars)}${marker}${tailChars > 0 ? report.slice(-tailChars) : ""}`;
+    if (estimateTextTokens(candidate) <= maxTokens) {
+      best = candidate;
+      low = keepChars + 1;
+    } else {
+      high = keepChars - 1;
+    }
   }
-  return `${report.slice(0, low)}${REPORT_TRUNCATION_MARKER}`;
+  return best;
 }
 
 export interface SpecExtractionResult {
@@ -79,17 +79,24 @@ const SYSTEM_PROMPT = `你是协议分析结果的结构化抽取器。给定一
 5. 报告里有复现代码就放进 reproduction，没有则为 null。
 6. 文本字段使用简体中文，枚举和标识符保持英文。`;
 
-function selectIndexLines(summaries: RequestSummary[], reportContent: string, builder: PromptBuilder): string[] {
-  if (summaries.length <= INDEX_HEAD_LIMIT) return summaries.map((summary) => builder.formatIndexLine(summary));
+function selectIndexLines(
+  summaries: RequestSummary[],
+  reportContent: string,
+  builder: PromptBuilder,
+  totalLimit: number = INDEX_TOTAL_LIMIT,
+): string[] {
+  if (summaries.length <= Math.min(INDEX_HEAD_LIMIT, totalLimit)) {
+    return summaries.map((summary) => builder.formatIndexLine(summary));
+  }
   const cited = new Set(extractCitedSeqs(reportContent));
   const picked = new Map<number, RequestSummary>();
   // 引用过的优先：Spec 的 exampleSeqs / evidenceSeqs 只能落在索引里真实出现过的行上
   for (const summary of summaries) {
-    if (picked.size >= INDEX_TOTAL_LIMIT) break;
+    if (picked.size >= totalLimit) break;
     if (cited.has(summary.seq)) picked.set(summary.seq, summary);
   }
   // 再用头部补出会话起始的脉络，总量仍受硬上限约束
-  const headTarget = Math.min(INDEX_TOTAL_LIMIT, picked.size + INDEX_HEAD_LIMIT);
+  const headTarget = Math.min(totalLimit, picked.size + INDEX_HEAD_LIMIT);
   for (const summary of summaries) {
     if (picked.size >= headTarget) break;
     picked.set(summary.seq, summary);
@@ -113,13 +120,8 @@ function formatEnrichment(enrichment: SessionEnrichment | null): string {
   return `${scenes}\n${auth}\n${streaming}`;
 }
 
-export function buildSpecExtractionMessages(input: SpecExtractionInput): MessageLike[] {
-  const builder = new PromptBuilder();
-  const indexLines = selectIndexLines(input.summaries, input.reportContent, builder);
-  const reportTokenLimit = Math.max(MIN_REPORT_TOKENS, Math.min(MAX_REPORT_TOKENS, input.maxReportTokens ?? MAX_REPORT_TOKENS));
-  const report = truncateReportToTokenBudget(input.reportContent, reportTokenLimit);
-
-  const user = `## 分析目的
+function buildUserMessage(input: SpecExtractionInput, indexLines: string[], report: string): string {
+  return `## 分析目的
 ${input.purpose?.trim() || "auto"}
 
 ## 规则派生线索（程序自动计算，可作为补充依据）
@@ -133,10 +135,50 @@ ${indexLines.join("\n")}
 ${report}
 
 请输出 ProtocolSpec JSON。`;
+}
 
+/** 除报告正文之外的一切（系统提示 + 线索 + 索引）实际占多少 token */
+function measureScaffold(input: SpecExtractionInput, totalLimit: number): { indexLines: string[]; tokens: number } {
+  const indexLines = selectIndexLines(input.summaries, input.reportContent, new PromptBuilder(), totalLimit);
+  const scaffold = `${SYSTEM_PROMPT}\n${buildUserMessage(input, indexLines, "")}`;
+  return { indexLines, tokens: estimateTextTokens(scaffold) };
+}
+
+/** 报告正文还剩多少 token 可用：给了 maxReportTokens 就照它，否则按真实窗口减去实测占用 */
+function resolveReportBudget(input: SpecExtractionInput, scaffoldTokens: number): number {
+  if (input.maxReportTokens !== undefined) {
+    return Math.max(MIN_REPORT_TOKENS, Math.min(MAX_REPORT_TOKENS, input.maxReportTokens));
+  }
+  if (!input.extractConfig) return MAX_REPORT_TOKENS;
+  const window = resolveContextBudget(input.extractConfig).maxContextTokens;
+  const available = window - input.extractConfig.maxTokens - scaffoldTokens - SAFETY_MARGIN_TOKENS;
+  return Math.min(MAX_REPORT_TOKENS, available);
+}
+
+export function buildSpecExtractionMessages(input: SpecExtractionInput): MessageLike[] {
+  // 先把提示词建出来量一遍，再决定报告能塞多少——预留量不该是个常量猜测
+  let { indexLines, tokens } = measureScaffold(input, INDEX_TOTAL_LIMIT);
+  let reportBudget = resolveReportBudget(input, tokens);
+
+  // 装不下就先缩索引，再不行才认输
+  if (reportBudget < MIN_REPORT_TOKENS) {
+    ({ indexLines, tokens } = measureScaffold(input, INDEX_MIN_LIMIT));
+    reportBudget = resolveReportBudget(input, tokens);
+  }
+  if (reportBudget < MIN_REPORT_TOKENS) {
+    const config = input.extractConfig!;
+    const window = resolveContextBudget(config).maxContextTokens;
+    throw new Error(
+      `抽取模型上下文窗口不足：窗口 ${window} token，要装下输出上限 ${config.maxTokens} ` +
+      `和提示词约 ${tokens} token（索引已压到 ${indexLines.length} 行），报告正文只剩 ${Math.max(0, reportBudget)} token，` +
+      `低于最低需要的 ${MIN_REPORT_TOKENS}。请在设置里为轻量模型（lightweightModel）换一个窗口更大的模型。`,
+    );
+  }
+
+  const report = truncateReportToTokenBudget(input.reportContent, reportBudget);
   return [
     { role: "system", content: SYSTEM_PROMPT },
-    { role: "user", content: user },
+    { role: "user", content: buildUserMessage(input, indexLines, report) },
   ];
 }
 

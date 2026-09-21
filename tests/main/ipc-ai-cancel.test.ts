@@ -67,9 +67,10 @@ function pendingCall(record: { signal?: AbortSignal }) {
   };
 }
 
-function setup() {
+function setup(options: { chatResolves?: () => Promise<string> } = {}) {
   const analyzeCalls: Array<{ signal?: AbortSignal }> = [];
   const chatCalls: Array<{ signal?: AbortSignal }> = [];
+  const appended: Array<[string, string]> = [];
   const aiAnalyzer = {
     analyze: vi.fn((_sessionId, _config, _onProgress, _purpose, _template, _seqs, signal?: AbortSignal) => {
       const record: { signal?: AbortSignal } = {};
@@ -77,8 +78,9 @@ function setup() {
       return pendingCall(record)(signal);
     }),
     chat: vi.fn((_sessionId, _config, _history, _message, _onProgress, _reportId, signal?: AbortSignal) => {
-      const record: { signal?: AbortSignal } = {};
+      const record: { signal?: AbortSignal } = { signal };
       chatCalls.push(record);
+      if (options.chatResolves) return options.chatResolves();
       return pendingCall(record)(signal);
     }),
     buildInitialChatMessages: () => [],
@@ -105,7 +107,11 @@ function setup() {
       deleteBySession: () => void deleted.push("*"),
       deleteById: (id: string) => void deleted.push(id),
     },
-    chatMessagesRepo: { insertMany: vi.fn(), append: vi.fn(), findByReport: () => [] },
+    chatMessagesRepo: {
+      insertMany: vi.fn(),
+      append: (_reportId: string, role: string, content: string) => void appended.push([role, content]),
+      findByReport: () => [],
+    },
     browserCoordinator: {},
   } as unknown as Parameters<typeof registerIpcHandlers>[0]);
 
@@ -114,7 +120,7 @@ function setup() {
     if (!found) throw new Error(`${channel} was not registered`);
     return found;
   };
-  return { analyzeCalls, chatCalls, deleted, handler };
+  return { analyzeCalls, chatCalls, appended, deleted, handler };
 }
 
 beforeEach(() => {
@@ -192,6 +198,30 @@ describe("AI cancellation IPC", () => {
     expect(chatCalls).toHaveLength(2);
     expect(chatCalls[1].signal?.aborted).toBe(true);
     await expect(second).rejects.toThrow("aborted");
+  });
+
+  it("does not persist a follow-up that was cancelled just as it finished", async () => {
+    // 流已经结束时 abort 拦不住回复；界面那边已经回滚，落库就会让它复活
+    let finish: (reply: string) => void = () => {};
+    const replied = new Promise<string>((resolve) => { finish = resolve; });
+    const { appended, handler } = setup({ chatResolves: () => replied });
+
+    const chat = handler("ai:chat")({}, "s1", "r1", [], "问题");
+    await Promise.resolve();
+
+    await handler("ai:cancelChat")({}, "s1");
+    finish("回复正文");
+    await expect(chat).resolves.toBe("回复正文");
+
+    expect(appended).toEqual([]);
+  });
+
+  it("persists a follow-up that finished without being cancelled", async () => {
+    const { appended, handler } = setup({ chatResolves: async () => "回复正文" });
+
+    await expect(handler("ai:chat")({}, "s1", "r1", [], "问题")).resolves.toBe("回复正文");
+
+    expect(appended).toEqual([["user", "问题"], ["assistant", "回复正文"]]);
   });
 
   it("keeps a report protected while a replaced follow-up is still unwinding", async () => {

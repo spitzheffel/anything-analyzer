@@ -558,8 +558,10 @@ export function registerIpcHandlers(deps: {
       try {
         const reply = await aiAnalyzer.chat(sessionId, config, history, userMessage, onProgress, reportId, controller.signal);
 
-        // Persist user message and AI reply to database
-        if (reportId) {
+        // Persist user message and AI reply to database.
+        // 取消和"回复刚好写完"可能擦肩而过：流已经结束时 abort 拦不住它。
+        // 这时渲染进程那边已经回滚了乐观追加的用户消息，再落库下次读取就会复活。
+        if (reportId && !controller.signal.aborted) {
           chatMessagesRepo.append(reportId, 'user', userMessage);
           chatMessagesRepo.append(reportId, 'assistant', reply);
         }

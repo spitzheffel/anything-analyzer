@@ -284,6 +284,8 @@ export interface AnalysisReport {
   spec_error: string | null;
   /** 规则派生的 SessionEnrichment JSON（场景线索 / 鉴权链 / 存储 diff / 流式请求） */
   enrichment_json: string | null;
+  /** ReportEvidence 的 JSON：机械校验出的「说不出依据」的条目；旧报告为 undefined */
+  evidence_json?: string | null;
 }
 
 // ---- AI Request Log ----

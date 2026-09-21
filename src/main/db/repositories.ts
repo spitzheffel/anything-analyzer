@@ -379,8 +379,8 @@ export class AnalysisReportsRepo {
   constructor(private db: Database.Database) {
     this.stmts = {
       insert: db.prepare(
-        `INSERT INTO analysis_reports (id, session_id, created_at, llm_provider, llm_model, prompt_tokens, completion_tokens, report_content, filter_prompt_tokens, filter_completion_tokens, purpose, spec_json, spec_error, enrichment_json)
-         VALUES (@id, @session_id, @created_at, @llm_provider, @llm_model, @prompt_tokens, @completion_tokens, @report_content, @filter_prompt_tokens, @filter_completion_tokens, @purpose, @spec_json, @spec_error, @enrichment_json)`
+        `INSERT INTO analysis_reports (id, session_id, created_at, llm_provider, llm_model, prompt_tokens, completion_tokens, report_content, filter_prompt_tokens, filter_completion_tokens, purpose, spec_json, spec_error, enrichment_json, evidence_json)
+         VALUES (@id, @session_id, @created_at, @llm_provider, @llm_model, @prompt_tokens, @completion_tokens, @report_content, @filter_prompt_tokens, @filter_completion_tokens, @purpose, @spec_json, @spec_error, @enrichment_json, @evidence_json)`
       ),
       findBySession: db.prepare(
         'SELECT * FROM analysis_reports WHERE session_id = ? ORDER BY created_at DESC'
@@ -389,7 +389,7 @@ export class AnalysisReportsRepo {
       deleteBySession: db.prepare('DELETE FROM analysis_reports WHERE session_id = ?'),
       deleteById: db.prepare('DELETE FROM analysis_reports WHERE id = ?'),
       updateSpec: db.prepare(
-        'UPDATE analysis_reports SET spec_json = ?, spec_error = ? WHERE id = ?'
+        'UPDATE analysis_reports SET spec_json = ?, spec_error = ?, evidence_json = ? WHERE id = ?'
       ),
       countBySession: db.prepare('SELECT COUNT(*) AS cnt FROM analysis_reports WHERE session_id = ?'),
     }
@@ -407,11 +407,12 @@ export class AnalysisReportsRepo {
       spec_json: report.spec_json ?? null,
       spec_error: report.spec_error ?? null,
       enrichment_json: report.enrichment_json ?? null,
+      evidence_json: report.evidence_json ?? null,
     })
   }
 
-  updateSpec(id: string, specJson: string | null, specError: string | null): void {
-    this.stmts.updateSpec.run(specJson, specError, id)
+  updateSpec(id: string, specJson: string | null, specError: string | null, evidenceJson: string | null = null): void {
+    this.stmts.updateSpec.run(specJson, specError, evidenceJson, id)
   }
 
   findBySession(sessionId: string): AnalysisReport[] {

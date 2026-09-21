@@ -116,6 +116,7 @@ export function runMigrations(db: Database.Database): void {
     migrateAddInteractionEventsTable(db)
     migrateAddBrowserPersistenceTables(db)
     migrateAddReportArtifactColumns(db)
+    migrateAddReportEvidenceColumn(db)
     migrateAddCaptureReliability(db)
   })()
 }
@@ -176,6 +177,16 @@ export function migrateAddCaptureReliability(db: Database.Database): void {
  * (purpose, ProtocolSpec JSON + extraction error, rule-derived enrichment JSON).
  * Safe to call multiple times (handles duplicate column errors).
  */
+export function migrateAddReportEvidenceColumn(db: Database.Database): void {
+  try {
+    db.exec(`ALTER TABLE analysis_reports ADD COLUMN evidence_json TEXT`)
+  } catch (err) {
+    if (!String(err).includes('duplicate column name')) {
+      throw err
+    }
+  }
+}
+
 export function migrateAddReportArtifactColumns(db: Database.Database): void {
   const migrations = [
     `ALTER TABLE analysis_reports ADD COLUMN purpose TEXT`,

@@ -13,6 +13,7 @@ import type {
 } from "@shared/types";
 import { resetEvent, statusEvent } from "@shared/ai-progress";
 import { validateCitations } from "@shared/citations";
+import { checkReportEvidence, countEvidenceGaps } from "@shared/spec-evidence";
 import {
   isEnrichmentFresh,
   parseProtocolSpecJson,
@@ -584,8 +585,9 @@ export class AiAnalyzer {
         extractConfig,
       }, signal);
       const specJson = JSON.stringify(result.spec);
-      this.reportsRepo.updateSpec(report.id, specJson, null);
-      return { ...report, spec_json: specJson, spec_error: null };
+      const evidenceJson = this.checkEvidence(report, summaries, result.spec);
+      this.reportsRepo.updateSpec(report.id, specJson, null, evidenceJson);
+      return { ...report, spec_json: specJson, spec_error: null, evidence_json: evidenceJson };
     } catch (error) {
       // 报告此时已经落库；取消抽取不应该让整次分析以失败收场，记一笔留给 ensureSpec 补抽
       const message = signal?.aborted
@@ -594,8 +596,32 @@ export class AiAnalyzer {
       if (!signal?.aborted) {
         console.warn(`[AiAnalyzer] ProtocolSpec extraction failed for report ${report.id}: ${message}`);
       }
-      this.reportsRepo.updateSpec(report.id, null, message);
-      return { ...report, spec_json: null, spec_error: message };
+      // 抽取失败也还能校验报告正文的引用，别把这份结论一起丢掉
+      const evidenceJson = this.checkEvidence(report, summaries, null);
+      this.reportsRepo.updateSpec(report.id, null, message, evidenceJson);
+      return { ...report, spec_json: null, spec_error: message, evidence_json: evidenceJson };
+    }
+  }
+
+  /**
+   * 机械校验「说得出依据吗」：引用的序号是否存在、Spec 条目有没有证据、端点能不能对上抓到的请求。
+   * 只落库不阻断——它是提示，不是判决。
+   */
+  private checkEvidence(
+    report: AnalysisReport,
+    summaries: RequestSummary[],
+    spec: ProtocolSpec | null,
+  ): string | null {
+    try {
+      const evidence = checkReportEvidence({
+        reportContent: report.report_content,
+        spec,
+        requests: summaries,
+      });
+      return countEvidenceGaps(evidence) > 0 ? JSON.stringify(evidence) : null;
+    } catch (error) {
+      console.warn(`[AiAnalyzer] evidence check failed for report ${report.id}:`, error);
+      return null;
     }
   }
 

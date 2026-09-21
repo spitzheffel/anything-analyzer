@@ -9,6 +9,7 @@ import type { AnalysisReport, ChatMessage, CapturedRequest, JsHookRecord } from 
 import { stripToolContext } from '@shared/types'
 import { resolveContextBudget } from '@shared/model-context-windows'
 import { linkifyCitations, parseCitationHref } from '@shared/citations'
+import { countEvidenceGaps, parseReportEvidenceJson } from '@shared/spec-evidence'
 import { parseProtocolSpecJson, type ProtocolSpec } from '@shared/protocol-spec'
 import { AiLogView } from './AiLogView'
 import ContextUsageBar from './ContextUsageBar'
@@ -240,6 +241,7 @@ const ReportView: React.FC<ReportViewProps> = ({
   const exportMenuRef = useRef<HTMLDivElement>(null)
 
   const spec: ProtocolSpec | null = React.useMemo(() => parseProtocolSpecJson(report?.spec_json), [report?.spec_json])
+  const evidence = React.useMemo(() => parseReportEvidenceJson(report?.evidence_json), [report?.evidence_json])
 
   useEffect(() => {
     if (!exportMenuOpen) return
@@ -423,6 +425,34 @@ const ReportView: React.FC<ReportViewProps> = ({
             {spec.scene}
           </div>
           {spec.summary && <div className={styles.specSummary}>{spec.summary}</div>}
+        </div>
+      )}
+
+      {/* Mechanical evidence check: shown whenever anything could not be backed up */}
+      {evidence && countEvidenceGaps(evidence) > 0 && (
+        <div className={styles.contextSection}>
+          <div className={styles.contextLabel}>{t('report.evidence')}</div>
+          {evidence.unknownCitations.length > 0 && (
+            <div className={styles.evidenceWarning}>
+              {t('report.evidenceUnknownCitations', { list: evidence.unknownCitations.map((seq) => `#${seq}`).join(' ') })}
+            </div>
+          )}
+          {evidence.endpointsWithoutEvidence.length > 0 && (
+            <div className={styles.evidenceWarning}>
+              {t('report.evidenceEndpointsNoSeq', { list: evidence.endpointsWithoutEvidence.join('、') })}
+            </div>
+          )}
+          {evidence.endpointsNotInCapture.length > 0 && (
+            <div className={styles.evidenceWarning}>
+              {t('report.evidenceEndpointsNoMatch', { list: evidence.endpointsNotInCapture.join('、') })}
+            </div>
+          )}
+          {evidence.entriesWithoutEvidence.length > 0 && (
+            <div className={styles.evidenceWarning}>
+              {t('report.evidenceEntriesNoSeq', { list: evidence.entriesWithoutEvidence.map((entry) => `${entry.kind}/${entry.label}`).join('、') })}
+            </div>
+          )}
+          <div className={styles.evidenceHint}>{t('report.evidenceHint')}</div>
         </div>
       )}
 

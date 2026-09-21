@@ -4,6 +4,7 @@ import {
   migrateAddStreamingAndWebSocketFlags,
   migrateAddBrowserPersistenceTables,
   migrateAddReportArtifactColumns,
+  migrateAddReportEvidenceColumn,
 } from "../../../src/main/db/migrations";
 import {
   AnalysisReportsRepo,
@@ -242,6 +243,36 @@ describeDatabaseMigrations("Database Migrations", () => {
     delete legacy.enrichment_json;
     expect(() => repo.insert(legacy as AnalysisReport)).not.toThrow();
     expect(repo.findById("r-legacy")).toMatchObject({ purpose: null, spec_json: null });
+  });
+
+  it("应该以幂等方式添加 evidence_json 列，并随 Spec 一起更新", () => {
+    expect(() => migrateAddReportEvidenceColumn(db!)).not.toThrow();
+    expect(() => migrateAddReportEvidenceColumn(db!)).not.toThrow();
+
+    const columns = (db!.prepare("PRAGMA table_info(analysis_reports)").all() as Array<{ name: string }>).map((c) => c.name);
+    expect(columns).toContain("evidence_json");
+
+    db!.prepare("INSERT INTO sessions (id, name, created_at) VALUES (?, ?, ?)").run("s-ev", "Ev", Date.now());
+    const repo = new AnalysisReportsRepo(db!);
+    const report: AnalysisReport = {
+      id: "r-ev", session_id: "s-ev", created_at: Date.now(),
+      llm_provider: "openai", llm_model: "gpt-4o",
+      prompt_tokens: 1, completion_tokens: 1, report_content: "# r",
+      filter_prompt_tokens: null, filter_completion_tokens: null,
+      purpose: null, spec_json: null, spec_error: null, enrichment_json: null,
+    };
+    repo.insert(report);
+    expect(repo.findById("r-ev")).toMatchObject({ evidence_json: null });
+
+    repo.updateSpec("r-ev", '{"specVersion":1}', null, '{"unknownCitations":[7]}');
+    expect(repo.findById("r-ev")).toMatchObject({
+      spec_json: '{"specVersion":1}',
+      evidence_json: '{"unknownCitations":[7]}',
+    });
+
+    // 不传第四个参数时清空，不是保留旧值——重抽的结论必须覆盖上一次的
+    repo.updateSpec("r-ev", null, "boom");
+    expect(repo.findById("r-ev")).toMatchObject({ spec_error: "boom", evidence_json: null });
   });
 
   it("应该为没有浏览器配置的历史会话返回 electron/deep 默认值", () => {

@@ -160,6 +160,22 @@
   white-space: nowrap;
 }
 
+/* 证据存疑：可能是好几条，不能像 .specError 那样单行省略 */
+.evidenceWarning {
+  margin-top: 4px;
+  font-size: var(--font-size-3xs);
+  color: var(--color-warning);
+  line-height: 1.6;
+  word-break: break-word;
+}
+
+.evidenceHint {
+  margin-top: 4px;
+  font-size: var(--font-size-3xs);
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
 .authBadge {
   font-family: var(--font-mono);
   font-size: 9px;

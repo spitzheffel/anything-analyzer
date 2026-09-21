@@ -108,9 +108,9 @@ function makeAnalyzer(requestCount?: number) {
       insert: (report: AnalysisReport) => { reports.set(report.id, { ...report }); },
       findById: (id: string) => reports.get(id),
       findBySession: () => [...reports.values()],
-      updateSpec: (id: string, specJson: string | null, specError: string | null) => {
+      updateSpec: (id: string, specJson: string | null, specError: string | null, evidenceJson: string | null = null) => {
         const existing = reports.get(id);
-        if (existing) reports.set(id, { ...existing, spec_json: specJson, spec_error: specError });
+        if (existing) reports.set(id, { ...existing, spec_json: specJson, spec_error: specError, evidence_json: evidenceJson });
       },
     },
     aiRequestLogRepo: { insert: () => 1, updateTokensById: () => {}, updateResponseBodyById: () => {} },
@@ -128,8 +128,11 @@ function makeAnalyzer(requestCount?: number) {
   return { analyzer, reports, requests, repos };
 }
 
+const DEFAULT_ANALYSIS_TEXT = routerBehaviour.analysisText;
+
 beforeEach(() => {
   routerBehaviour.structured = null;
+  routerBehaviour.analysisText = DEFAULT_ANALYSIS_TEXT;
   routerBehaviour.hangUntilAborted = false;
   routerBehaviour.toolCalls = 0;
   routerBehaviour.lastToolSignal = undefined;
@@ -322,5 +325,47 @@ describe("AiAnalyzer pre-filter", () => {
     expect(statuses.some((t) => t.includes("3/3 批的回复无法解析"))).toBe(true);
     expect(statuses.some((t) => t.includes("过滤结果不可信"))).toBe(true);
     expect(statuses.some((t) => t.includes("过滤完成"))).toBe(false);
+  });
+});
+
+describe("AiAnalyzer evidence check", () => {
+  it("records claims it cannot back up, alongside the spec", async () => {
+    // 报告引用了不存在的 #99（fixture 里只有 #1 #2）
+    routerBehaviour.structured = async () => ({
+      ...sampleSpec,
+      endpoints: [
+        { ...sampleSpec.endpoints[0], id: "ghost", method: "POST", urlTemplate: "https://api.example.com/v1/admin/wipe", exampleSeqs: [] },
+      ],
+    });
+    const { analyzer, reports } = makeAnalyzer();
+
+    const report = await analyzer.analyze("s1", config);
+
+    const evidence = JSON.parse(report.evidence_json!);
+    expect(evidence.unknownCitations).toEqual([99]);
+    expect(evidence.endpointsWithoutEvidence).toEqual(["ghost"]);
+    expect(evidence.endpointsNotInCapture).toEqual(["ghost"]);
+    // 落库的那份要和返回的一致
+    expect(reports.get(report.id)!.evidence_json).toBe(report.evidence_json);
+  });
+
+  it("still checks the report's citations when extraction failed", async () => {
+    routerBehaviour.structured = async () => { throw new Error("relay refused"); };
+    const { analyzer } = makeAnalyzer();
+
+    const report = await analyzer.analyze("s1", config);
+
+    expect(report.spec_error).toContain("relay refused");
+    expect(JSON.parse(report.evidence_json!).unknownCitations).toEqual([99]);
+  });
+
+  it("stores nothing when every claim checks out", async () => {
+    routerBehaviour.analysisText = "# 报告\n登录接口 [#1]，资料接口 [#2]。";
+    routerBehaviour.structured = async () => ({ ...sampleSpec, endpoints: [], authChain: [], storage: [], crypto: [] });
+    const { analyzer } = makeAnalyzer();
+
+    const report = await analyzer.analyze("s1", config);
+
+    expect(report.evidence_json).toBeNull();
   });
 });

@@ -97,6 +97,30 @@ describe("request tools", () => {
   });
 });
 
+  it("reports the real hit total and offers a continuation when search is capped", () => {
+    const many = new Map(
+      Array.from({ length: 30 }, (_, i) => {
+        const request = req({ seq: i + 1, url: `https://api.example.com/item/${i + 1}`, responseBody: '{"t":"needle"}' });
+        return [request.seq, request] as const;
+      }),
+    );
+
+    const first = handleSearchRequests({ query: "needle", limit: 5 }, many);
+    // 上限是 5，但模型必须看得出后面还有 25 条
+    expect(first.result).toContain("命中 30 条，返回 5 条");
+    expect(first.result).toContain("offset: 5");
+    expect(first.result).toContain("#1 ");
+    expect(first.result).not.toContain("#6 ");
+
+    const next = handleSearchRequests({ query: "needle", limit: 5, offset: 5 }, many);
+    expect(next.result).toContain("#6 ");
+    expect(next.result).toContain("offset=5");
+    expect(next.refLine).toContain("matched=30");
+
+    const past = handleSearchRequests({ query: "needle", limit: 5, offset: 99 }, many);
+    expect(past.result).toContain("已越过全部结果");
+  });
+
   it("supports offset/page pagination for list_requests", () => {
     const many = Array.from({ length: 30 }, (_, i) =>
       summary({ seq: i + 1, method: "GET", url: `https://api.example.com/item/${i + 1}` }),

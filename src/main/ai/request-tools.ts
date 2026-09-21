@@ -47,6 +47,7 @@ export const BUILTIN_REQUEST_TOOLS: MCPToolInfo[] = [
           description: "搜索范围，默认 all",
         },
         limit: { type: "number", description: "返回条数上限，默认 20，最大 50" },
+        offset: { type: "number", description: "偏移量（从 0 开始），用于翻看超出上限的命中" },
       },
       required: ["query"],
     },
@@ -295,17 +296,18 @@ export function handleSearchRequests(
   }
   if (scopes.size === 0) scopes.add("all");
 
+  const rawOffset = typeof args.offset === "number" ? args.offset : Number(args.offset);
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.floor(rawOffset) : 0;
+
   const q = query.toLowerCase();
+  // 先数全，再切片：只截断不报总数的话，模型会把上限当成命中总数
   const hits: string[] = [];
-  const hitSeqs: number[] = [];
 
   const ordered = [...requestMap.values()].sort((a, b) => a.seq - b.seq);
   for (const req of ordered) {
-    if (hits.length >= limit) break;
     const haystacks = collectSearchHaystacks(req, scopes);
     for (const item of haystacks) {
       if (!item.text.toLowerCase().includes(q)) continue;
-      hitSeqs.push(req.seq);
       hits.push(
         `#${req.seq} ${req.method} ${req.url} [${item.field}] ${excerptAround(item.text, query)}`,
       );
@@ -313,12 +315,19 @@ export function handleSearchRequests(
     }
   }
 
+  const sliced = hits.slice(offset, offset + limit);
+  const more = offset + sliced.length < hits.length
+    ? `\n...还有 ${hits.length - offset - sliced.length} 条，可用 search_requests({ query: ${JSON.stringify(query)}, offset: ${offset + sliced.length}, limit: ${limit} }) 继续`
+    : "";
+
   return {
-    result: hits.length
-      ? `命中 ${hits.length} 条（limit=${limit}）：\n${hits.join("\n")}`
-      : `未找到包含 “${query}” 的请求`,
+    result: sliced.length
+      ? `命中 ${hits.length} 条，返回 ${sliced.length} 条（offset=${offset}, limit=${limit}）：\n${sliced.join("\n")}${more}`
+      : hits.length
+        ? `命中 ${hits.length} 条，但 offset=${offset} 已越过全部结果`
+        : `未找到包含 “${query}” 的请求`,
     fetchedSeqs: [],
-    refLine: `[search_requests](query=${JSON.stringify(query)},hits=${hits.length})`,
+    refLine: `[search_requests](query=${JSON.stringify(query)},matched=${hits.length},returned=${sliced.length},offset=${offset})`,
   };
 }
 
